@@ -16,7 +16,7 @@ use ai_memory_wiki::{Wiki, WritePageRequest};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::types::{ConsolidatedPage, ConsolidationOutcome};
+use crate::types::{ConsolidatedBatch, ConsolidatedPage, ConsolidationOutcome};
 
 /// Errors raised by the consolidator.
 #[derive(Debug, Error)]
@@ -147,6 +147,7 @@ impl Consolidator {
                 body: page.body_markdown.clone(),
                 tier: Tier::Episodic,
                 pinned: false,
+                title: None,
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -182,7 +183,149 @@ impl Consolidator {
     pub fn writer(&self) -> &WriterHandle {
         &self.writer
     }
+
+    /// M7b multi-page consolidation: ask the LLM for a batch of page
+    /// updates spanning sessions/, concepts/, decisions/, then write
+    /// them all atomically (one SQL transaction).
+    ///
+    /// # Errors
+    /// Returns [`ConsolidatorError`] for any store, wiki, or LLM
+    /// failure. On error, no pages are written and no files moved.
+    pub async fn consolidate_session_multi(
+        &self,
+        session_id: SessionId,
+        dry_run: bool,
+    ) -> ConsolidatorResult<Vec<ConsolidationOutcome>> {
+        let observations = self.reader.observations_for_session(session_id).await?;
+        if observations.is_empty() {
+            return Err(ConsolidatorError::EmptySession(session_id));
+        }
+        let request = build_batch_request(session_id, &observations);
+        debug!(
+            session = %session_id,
+            provider = self.llm.name(),
+            "consolidating session (multi-page)",
+        );
+        let batch: ConsolidatedBatch =
+            ai_memory_llm::complete_structured(&*self.llm, request).await?;
+
+        let mut requests = Vec::with_capacity(batch.updates.len());
+        let mut outcomes_preview = Vec::with_capacity(batch.updates.len());
+        for upd in &batch.updates {
+            let path = PagePath::new(upd.path.clone())?;
+            let tier = upd.tier.parse::<Tier>().unwrap_or(Tier::Semantic);
+            let mut fm = serde_json::Map::new();
+            fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+            fm.insert(
+                "tier".into(),
+                serde_json::Value::String(tier_as_str(tier).into()),
+            );
+            if !upd.tags.is_empty() {
+                fm.insert(
+                    "tags".into(),
+                    serde_json::Value::Array(
+                        upd.tags
+                            .iter()
+                            .map(|t| serde_json::Value::String(t.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            fm.insert("consolidated".into(), serde_json::Value::Bool(true));
+            requests.push(WritePageRequest {
+                workspace_id: self.workspace_id,
+                project_id: self.project_id,
+                path: path.clone(),
+                frontmatter: serde_json::Value::Object(fm),
+                body: upd.body_markdown.clone(),
+                tier,
+                pinned: false,
+                title: Some(upd.title.clone()),
+            });
+            outcomes_preview.push(ConsolidationOutcome {
+                path,
+                dry_run,
+                new_title: upd.title.clone(),
+                new_body_markdown: upd.body_markdown.clone(),
+                page_id: None,
+                tags: upd.tags.clone(),
+            });
+        }
+
+        if dry_run {
+            return Ok(outcomes_preview);
+        }
+
+        let ids = self.wiki.apply_batch(requests).await?;
+        let rationale_short = batch.rationale.chars().take(60).collect::<String>();
+        let _ = self.wiki.commit_all(&format!(
+            "consolidate-batch(session {}): {} page(s) — {}",
+            short_id(&session_id.to_string()),
+            ids.len(),
+            rationale_short,
+        ));
+
+        let outcomes = outcomes_preview
+            .into_iter()
+            .zip(ids)
+            .map(|(mut o, id)| {
+                o.dry_run = false;
+                o.page_id = Some(id);
+                o
+            })
+            .collect();
+        Ok(outcomes)
+    }
 }
+
+const fn tier_as_str(t: Tier) -> &'static str {
+    match t {
+        Tier::Working => "working",
+        Tier::Episodic => "episodic",
+        Tier::Semantic => "semantic",
+        Tier::Procedural => "procedural",
+    }
+}
+
+fn build_batch_request(session_id: SessionId, observations: &[Observation]) -> ChatRequest {
+    let mut buf = String::new();
+    buf.push_str(
+        "You are compiling a Karpathy-style multi-page wiki update. Given the \
+         session's observation log, produce a ConsolidatedBatch:\n\n",
+    );
+    buf.push_str("Session id: ");
+    buf.push_str(&session_id.to_string());
+    buf.push_str("\n\nObservations:\n");
+    for o in observations {
+        buf.push_str(&format!("- {} | {}\n", o.kind.as_str(), one_line(&o.title)));
+        if !o.body.trim().is_empty() {
+            buf.push_str(&format!("    body: {}\n", one_line(&o.body)));
+        }
+    }
+    buf.push_str(
+        "\nProduce up to 5 page updates. Use these path conventions:\n\
+         - sessions/<session_id>.md  (episodic, this run's narrative)\n\
+         - concepts/<slug>.md         (semantic, evergreen concept pages)\n\
+         - decisions/<short>.md       (semantic, ADR-style records)\n\
+         - gotchas/<slug>.md          (semantic, failure modes / surprises)\n\
+         \nEach update must include a title, markdown body, tier, and tags.\n",
+    );
+    ChatRequest {
+        system: Some(BATCH_SYSTEM_PROMPT.into()),
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: buf,
+        }],
+        max_tokens: 4000,
+        temperature: Some(0.2),
+    }
+}
+
+const BATCH_SYSTEM_PROMPT: &str = "You are the maintainer of a Karpathy-style LLM wiki \
+for a software engineer. Your job is to compile *durable* knowledge -- not just \
+restate the session log. Produce a ConsolidatedBatch with 1-5 page updates. Favour \
+extracting concept / decision / gotcha pages alongside the session summary when the \
+session yields reusable insight; otherwise return only the session page.";
 
 fn build_request(
     session_id: SessionId,

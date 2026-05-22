@@ -75,6 +75,9 @@ struct ConsolidateArgs {
     /// If true, preview without writing. Default false.
     #[serde(default)]
     dry_run: Option<bool>,
+    /// If true, M7b multi-page atomic fan-out. Default false (single page).
+    #[serde(default)]
+    multi_page: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -179,13 +182,14 @@ impl AiMemoryServer {
         ok_json(&response)
     }
 
-    /// LLM-driven consolidation of a session into a refreshed
-    /// `sessions/<id>.md` page (M7a single-page variant).
-    #[tool(description = "LLM-driven consolidation: rewrite the \
-        sessions/<id>.md page for the given session_id using the \
-        observation log + the current heuristic body. Off by default; \
-        requires AI_MEMORY_LLM_PROVIDER / AI_MEMORY_LLM_MODEL set on \
-        the server. Pass dry_run=true to preview without writing.")]
+    /// LLM-driven consolidation of a session.
+    #[tool(description = "LLM-driven consolidation. Default mode \
+        (single-page) rewrites sessions/<id>.md from the observation \
+        log. multi_page=true fans out into a batch of concept/decision/\
+        gotcha pages plus the session page, all written in one atomic \
+        SQL transaction. Off by default; requires \
+        AI_MEMORY_LLM_PROVIDER + AI_MEMORY_LLM_MODEL set on the server. \
+        Pass dry_run=true to preview without writing.")]
     async fn memory_consolidate(
         &self,
         Parameters(args): Parameters<ConsolidateArgs>,
@@ -198,11 +202,20 @@ impl AiMemoryServer {
         };
         let session_id = SessionId::from_str(&args.session_id)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let outcome = consolidator
-            .consolidate_session(session_id, args.dry_run.unwrap_or(false))
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        ok_json(&outcome)
+        let dry = args.dry_run.unwrap_or(false);
+        if args.multi_page.unwrap_or(false) {
+            let outcomes = consolidator
+                .consolidate_session_multi(session_id, dry)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            ok_json(&serde_json::json!({ "outcomes": outcomes }))
+        } else {
+            let outcome = consolidator
+                .consolidate_session(session_id, dry)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            ok_json(&outcome)
+        }
     }
 
     /// Create a handoff snapshot for the next agent CLI.

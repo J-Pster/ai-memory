@@ -73,6 +73,7 @@ pub async fn run(config: &Config, args: WritePageArgs) -> Result<()> {
             body,
             tier,
             pinned: args.pinned,
+            title: None,
         })
         .await?;
 

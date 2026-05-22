@@ -36,6 +36,10 @@ pub(crate) enum WriteCmd {
         page: NewPage,
         reply: oneshot::Sender<StoreResult<PageId>>,
     },
+    UpsertPageBatch {
+        pages: Vec<NewPage>,
+        reply: oneshot::Sender<StoreResult<Vec<PageId>>>,
+    },
     BeginSession {
         session: NewSession,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -204,6 +208,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Upsert a batch of pages atomically (one SQL transaction).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down,
+    /// or propagates the SQL error from [`ops::upsert_pages_batch`].
+    pub async fn upsert_pages_batch(&self, pages: Vec<NewPage>) -> StoreResult<Vec<PageId>> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::UpsertPageBatch { pages, reply: tx })
+            .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Upsert a page (creating it or superseding the existing latest
     /// version when the body has changed).
     ///
@@ -258,6 +274,10 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             }
             WriteCmd::UpsertPage { page, reply } => {
                 let result = ops::upsert_page(&mut conn, &page);
+                let _ = reply.send(result);
+            }
+            WriteCmd::UpsertPageBatch { pages, reply } => {
+                let result = ops::upsert_pages_batch(&mut conn, &pages);
                 let _ = reply.send(result);
             }
             WriteCmd::BeginSession { session, reply } => {

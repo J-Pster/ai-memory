@@ -12,4 +12,6 @@ pub mod consolidator;
 pub mod types;
 
 pub use consolidator::{Consolidator, ConsolidatorError, ConsolidatorResult};
-pub use types::{ConsolidatedPage, ConsolidationOutcome};
+pub use types::{
+    ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome,
+};

@@ -116,6 +116,74 @@ impl Wiki {
         Ok(id)
     }
 
+    /// Atomically apply a batch of page writes. Either all pages land
+    /// (one SQL transaction) and their files are renamed into place,
+    /// or no DB row changes and tempfiles are dropped.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] for any filesystem, parsing, or store
+    /// error.
+    pub async fn apply_batch(&self, requests: Vec<WritePageRequest>) -> WikiResult<Vec<PageId>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Pre-compute markdown + tempfile for each request.
+        let mut staged: Vec<(
+            WritePageRequest,
+            tempfile::NamedTempFile,
+            std::path::PathBuf,
+        )> = Vec::with_capacity(requests.len());
+        for req in requests {
+            let title = derive_title(&req.frontmatter, &req.body, &req.path);
+            let markdown = Markdown {
+                frontmatter: req.frontmatter.clone(),
+                body: req.body.clone(),
+            };
+            let emitted = emit(&markdown)?;
+            let abs = self.abs_path(&req.path);
+            let parent = abs.parent().ok_or_else(|| {
+                ai_memory_wiki_error("page path has no parent (cannot stage tempfile)")
+            })?;
+            std::fs::create_dir_all(parent)?;
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".ai-memory-tmp.")
+                .tempfile_in(parent)?;
+            use std::io::Write as _;
+            tmp.write_all(emitted.as_bytes())?;
+            tmp.as_file().sync_data()?;
+            let req_with_title = WritePageRequest {
+                title: Some(title),
+                ..req
+            };
+            staged.push((req_with_title, tmp, abs));
+        }
+
+        // Build NewPage batch with the precomputed titles.
+        let pages: Vec<ai_memory_core::NewPage> = staged
+            .iter()
+            .map(|(req, _, _)| ai_memory_core::NewPage {
+                workspace_id: req.workspace_id,
+                project_id: req.project_id,
+                path: req.path.clone(),
+                title: req.title.clone().unwrap_or_default(),
+                body: req.body.clone(),
+                tier: req.tier,
+                frontmatter_json: req.frontmatter.clone(),
+                pinned: req.pinned,
+            })
+            .collect();
+
+        let ids = self.writer.upsert_pages_batch(pages).await?;
+
+        // SQL succeeded; rename tempfiles into place.
+        for (_, tmp, abs) in staged {
+            let persisted = tmp.persist(&abs)?;
+            persisted.sync_data()?;
+        }
+
+        Ok(ids)
+    }
+
     /// Write `body` (with optional `frontmatter`) atomically to
     /// `<wiki_root>/<path>` and upsert the matching page row in the store.
     ///
@@ -133,9 +201,12 @@ impl Wiki {
             body,
             tier,
             pinned,
+            title: explicit_title,
         } = req;
 
-        let title = derive_title(&frontmatter, &body, &path);
+        let title = explicit_title
+            .clone()
+            .unwrap_or_else(|| derive_title(&frontmatter, &body, &path));
         let markdown = Markdown {
             frontmatter: frontmatter.clone(),
             body: body.clone(),
@@ -179,6 +250,14 @@ pub struct WritePageRequest {
     pub tier: Tier,
     /// `true` if the user has pinned this page.
     pub pinned: bool,
+    /// Optional pre-derived title (used by `apply_batch` to share the
+    /// title between the staged markdown file + the store row).
+    #[doc(hidden)]
+    pub title: Option<String>,
+}
+
+fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
+    crate::WikiError::Io(std::io::Error::other(msg.to_string()))
 }
 
 #[cfg(test)]
@@ -202,6 +281,7 @@ mod tests {
             body: body.into(),
             tier: Tier::Semantic,
             pinned: false,
+            title: None,
         }
     }
 
@@ -248,6 +328,47 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Karpathy LLM Wiki");
         assert!(hits[0].snippet.contains("compile"));
+    }
+
+    #[tokio::test]
+    async fn apply_batch_persists_all_pages_in_one_transaction() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let batch: Vec<_> = (0..5)
+            .map(|i| WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new(format!("batch/{i}.md")).unwrap(),
+                frontmatter: serde_json::json!({"title": format!("Page {i}")}),
+                body: format!("batch page {i} body line"),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: None,
+            })
+            .collect();
+        let ids = wiki.apply_batch(batch).await.unwrap();
+        assert_eq!(ids.len(), 5);
+        for i in 0..5 {
+            let path = tmp.path().join(format!("wiki/batch/{i}.md"));
+            assert!(path.is_file(), "missing file {i}");
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(body.contains(&format!("Page {i}")));
+        }
+        let counts = store.reader.status_counts().await.unwrap();
+        assert_eq!(counts.pages_latest, 5);
+        let hits = store.reader.search_pages("batch".into(), 10).await.unwrap();
+        assert_eq!(hits.len(), 5);
     }
 
     #[tokio::test]

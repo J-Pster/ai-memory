@@ -12,7 +12,7 @@ use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use crate::error::StoreResult;
+use crate::error::{StoreError, StoreResult};
 
 /// Upsert a page by path, superseding any existing latest version when the
 /// content (sha256 of body) has changed.
@@ -185,6 +185,124 @@ pub fn get_or_create_project(
     };
     tx.commit()?;
     Ok(id)
+}
+
+/// Upsert a batch of pages inside one transaction. Either *all* pages
+/// land (each becoming the new `is_latest=true` version) or none do.
+///
+/// This is the M7b atomic-fan-out path: the consolidator can hand a
+/// list of {sessions, concepts, decisions} pages and trust that
+/// either the whole batch supersedes or the wiki is unchanged.
+pub fn upsert_pages_batch(conn: &mut Connection, pages: &[NewPage]) -> StoreResult<Vec<PageId>> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    let mut out = Vec::with_capacity(pages.len());
+    for page in pages {
+        let id = upsert_page_in_tx(&tx, page, now)?;
+        out.push(id);
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
+fn upsert_page_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+    now: i64,
+) -> StoreResult<PageId> {
+    let body_sha256: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(page.body.as_bytes());
+        hasher.finalize().into()
+    };
+    let frontmatter_str = serde_json::to_string(&page.frontmatter_json)?;
+    let tier_str = page.tier.as_str();
+
+    let existing: Option<(Vec<u8>, Vec<u8>)> = tx
+        .query_row(
+            "SELECT id, body_sha256 FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    if let Some((existing_id, existing_sha)) = existing {
+        if existing_sha == body_sha256 {
+            tx.execute(
+                "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
+                params![now, existing_id],
+            )?;
+            return PageId::from_slice(&existing_id).map_err(StoreError::from);
+        }
+        let new_id = PageId::new();
+        tx.execute(
+            "UPDATE pages SET is_latest = 0 WHERE id = ?1",
+            params![existing_id],
+        )?;
+        tx.execute(
+            "INSERT INTO pages \
+             (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+              frontmatter_json, is_latest, supersedes, pinned, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+            params![
+                new_id.as_bytes(),
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                page.path.as_str(),
+                page.title,
+                tier_str,
+                page.body,
+                body_sha256.as_slice(),
+                frontmatter_str,
+                existing_id,
+                i64::from(page.pinned),
+                now,
+            ],
+        )?;
+        audit(
+            tx,
+            "supersede_page",
+            Some(page.workspace_id.as_bytes()),
+            Some(page.project_id.as_bytes()),
+            Some(new_id.as_bytes()),
+            now,
+        )?;
+        return Ok(new_id);
+    }
+    let new_id = PageId::new();
+    tx.execute(
+        "INSERT INTO pages \
+         (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
+          frontmatter_json, is_latest, pinned, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
+        params![
+            new_id.as_bytes(),
+            page.workspace_id.as_bytes(),
+            page.project_id.as_bytes(),
+            page.path.as_str(),
+            page.title,
+            tier_str,
+            page.body,
+            body_sha256.as_slice(),
+            frontmatter_str,
+            i64::from(page.pinned),
+            now,
+        ],
+    )?;
+    audit(
+        tx,
+        "create_page",
+        Some(page.workspace_id.as_bytes()),
+        Some(page.project_id.as_bytes()),
+        Some(new_id.as_bytes()),
+        now,
+    )?;
+    Ok(new_id)
 }
 
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.

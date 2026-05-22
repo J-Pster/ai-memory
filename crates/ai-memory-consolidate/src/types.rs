@@ -18,6 +18,33 @@ pub struct ConsolidatedPage {
     pub tags: Vec<String>,
 }
 
+/// One update inside a multi-page consolidation batch (M7b).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ConsolidatedPageUpdate {
+    /// Relative wiki path (`concepts/foo.md`, `decisions/0001.md`, …).
+    pub path: String,
+    /// Tier (`semantic`, `episodic`, `procedural`, `working`).
+    pub tier: String,
+    /// New page title.
+    pub title: String,
+    /// New markdown body.
+    pub body_markdown: String,
+    /// Optional tags surfaced into frontmatter.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Batch produced by [`ConsolidatorMulti`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ConsolidatedBatch {
+    /// Pages to create / update.
+    pub updates: Vec<ConsolidatedPageUpdate>,
+    /// Brief LLM-authored note about *why* this batch was produced.
+    /// Surfaced in the auto-commit message.
+    #[serde(default)]
+    pub rationale: String,
+}
+
 /// Outcome of a single consolidation call.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConsolidationOutcome {
