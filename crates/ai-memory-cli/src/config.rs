@@ -25,6 +25,12 @@ pub struct Config {
     pub bind: String,
     /// Per-subsystem log filter (overridable by `RUST_LOG`).
     pub log_level: String,
+    /// M8 retention-sweep parameters. The defaults give an ~80-day
+    /// "survival floor" for unused episodic content (above the cold
+    /// threshold), followed by ~180 days of soft-delete buffer before
+    /// hard-deletion. Tune `decay.lambda` down to slow decay or
+    /// `decay.cold_threshold` to evict more / less aggressively.
+    pub decay: ai_memory_store::DecayParams,
 }
 
 impl Default for Config {
@@ -33,6 +39,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             bind: "127.0.0.1:7777".into(),
             log_level: "info".into(),
+            decay: ai_memory_store::DecayParams::default(),
         }
     }
 }

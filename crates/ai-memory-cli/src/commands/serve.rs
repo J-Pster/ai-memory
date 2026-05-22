@@ -50,7 +50,8 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     };
 
     let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
-        .with_wiki(wiki.clone());
+        .with_wiki(wiki.clone())
+        .with_decay_params(config.decay);
     if let Some(cfg) = provider_from_env()? {
         let llm = ai_memory_llm::build_provider(cfg).context("building LLM provider from env")?;
         info!(

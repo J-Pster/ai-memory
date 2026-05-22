@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
 use ai_memory_core::{AgentKind, NewHandoff, PageId, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::LlmProvider;
-use ai_memory_store::{ReaderPool, WriterHandle};
+use ai_memory_store::{DecayParams, ReaderPool, WriterHandle};
 use ai_memory_wiki::Wiki;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -42,6 +42,9 @@ pub struct AiMemoryServer {
     /// write the lint report). `None` when the server was built
     /// without one — older `new()` callers stay safe.
     wiki: Option<Wiki>,
+    /// M8 retention parameters. Defaults if not overridden by the
+    /// caller (typically from the user's config.toml `[decay]` block).
+    decay_params: DecayParams,
     // Read by the `#[tool_handler]` macro expansion; rustc's dead-code
     // analysis can't see that, so the lint must be allowed explicitly.
     #[allow(dead_code)]
@@ -147,8 +150,17 @@ impl AiMemoryServer {
             consolidator: None,
             llm: None,
             wiki: None,
+            decay_params: DecayParams::default(),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Override the retention-sweep parameters (typically populated
+    /// from the user's config.toml `[decay]` table).
+    #[must_use]
+    pub fn with_decay_params(mut self, params: DecayParams) -> Self {
+        self.decay_params = params;
+        self
     }
 
     /// Attach the wiki handle. Without this, `memory_forget_sweep`
@@ -230,13 +242,12 @@ impl AiMemoryServer {
         &self,
         Parameters(args): Parameters<SweepArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let params = ai_memory_store::DecayParams::default();
         let report = run_sweep(
             &self.reader,
             &self.writer,
             self.workspace_id,
             self.project_id,
-            &params,
+            &self.decay_params,
             args.dry_run.unwrap_or(false),
         )
         .await

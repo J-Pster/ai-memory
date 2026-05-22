@@ -56,8 +56,7 @@ mod tests {
     fn cfg_in(dir: &std::path::Path) -> Config {
         Config {
             data_dir: dir.to_path_buf(),
-            bind: "127.0.0.1:7777".into(),
-            log_level: "info".into(),
+            ..Config::default()
         }
     }
 

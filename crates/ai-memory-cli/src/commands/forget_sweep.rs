@@ -1,7 +1,7 @@
 //! `ai-memory forget-sweep` — run the M8 retention sweep manually.
 
 use ai_memory_consolidate::run_sweep;
-use ai_memory_store::{DecayParams, Store};
+use ai_memory_store::Store;
 use anyhow::{Context, Result};
 
 use crate::cli::ForgetSweepArgs;
@@ -19,13 +19,12 @@ pub async fn run(config: &Config, args: ForgetSweepArgs) -> Result<()> {
         .writer
         .get_or_create_project(ws, "scratch", None)
         .await?;
-    let params = DecayParams::default();
     let report = run_sweep(
         &store.reader,
         &store.writer,
         ws,
         proj,
-        &params,
+        &config.decay,
         args.dry_run,
     )
     .await?;

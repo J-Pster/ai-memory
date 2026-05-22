@@ -11,3 +11,25 @@ bind = "127.0.0.1:7777"
 
 # Default tracing filter (overridable by RUST_LOG).
 log_level = "info"
+
+# M8 retention-sweep parameters.
+#
+# Formula:
+#   retention = salience * exp(-lambda * age_days)
+#             + sigma * log(1 + access_count) * exp(-mu * days_since_access)
+#
+# With the defaults below, an unused episodic page drops below
+# `cold_threshold = 0.20` at ~80 days; recent accesses bump it back up.
+# Semantic / pinned pages are exempt from decay entirely. Tune to taste:
+#
+#   - Slow decay (forget less aggressively): lambda = 0.01 (~140d floor)
+#   - Faster decay (clean up more aggressively): lambda = 0.04 (~40d floor)
+#   - Bigger access boost (frequently-used stuff lasts longer): sigma = 1.0
+#   - Bigger time-pressure on access: mu = 0.08
+[decay]
+lambda = 0.02
+sigma = 0.6
+mu = 0.04
+salience_default = 1.0
+cold_threshold = 0.20
+hard_delete_after_days = 180
