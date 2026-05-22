@@ -59,3 +59,20 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers every commit reachable
+          # from the pushed ref, not just the last one.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Exit nonzero if any secret is found; config lives at the
+          # repo root so the same rules apply locally if you also
+          # install gitleaks.
+          GITLEAKS_CONFIG: .gitleaks.toml
