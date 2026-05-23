@@ -45,4 +45,4 @@ EXPOSE 49374
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/ai-memory", "status"]
 ENTRYPOINT ["/usr/local/bin/ai-memory"]
-CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374"]
+CMD ["serve", "--transport", "http", "--bind", "0.0.0.0:49374", "--enable-web"]
