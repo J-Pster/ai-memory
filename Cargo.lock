@@ -43,6 +43,7 @@ dependencies = [
  "ai-memory-wiki",
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "dirs",
  "figment",

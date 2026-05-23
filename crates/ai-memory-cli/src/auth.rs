@@ -1,8 +1,17 @@
-//! Bearer-token authorization middleware for the HTTP server.
+//! Authorization middleware for the HTTP server.
 //!
 //! When `[auth].bearer_token` (or the `AI_MEMORY_AUTH_TOKEN` env var)
-//! is set, every request to `/mcp`, `/hook`, and `/handoff` must
-//! carry an `Authorization: Bearer <token>` header that matches.
+//! is set, every request to `/mcp`, `/hook`, `/handoff`, and `/web/*`
+//! must present the token via one of three transports:
+//!
+//! - **Bearer header** (any method): MCP clients + hooks. Required
+//!   on all non-GET methods.
+//! - **Basic auth** (GET only): browsers — username ignored, token
+//!   in the password field. Triggers the native credential dialog
+//!   via the `WWW-Authenticate: Basic` challenge in 401 responses.
+//! - **Session cookie** (GET only): set automatically after a
+//!   successful Basic auth so the browser doesn't re-prompt every
+//!   session.
 //!
 //! When the token is *unset*, the middleware is a no-op — preserving
 //! the zero-config local-development experience and keeping the
@@ -16,8 +25,9 @@
 //!
 //! Wire shape matches the MCP authorization spec
 //! (modelcontextprotocol.io/specification/.../basic/authorization):
-//! 401 responses include a `WWW-Authenticate: Bearer …` header so
-//! conformant clients can detect missing/expired credentials.
+//! 401 responses include `WWW-Authenticate: Bearer …` so MCP clients
+//! detect missing/expired credentials. GET 401s ALSO include `Basic
+//! …` so browsers dialog-prompt automatically.
 //!
 //! ## Why not OAuth
 //!
@@ -41,13 +51,12 @@ use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 use tracing::debug;
 
-/// Cookie name used by the browser-friendly `?_token=` flow.
+/// Cookie name used for browser session persistence after a
+/// successful Basic auth handshake.
 const AUTH_COOKIE: &str = "ai_memory_auth";
-/// Query-param the browser flow accepts ONCE — middleware verifies
-/// the value, sets the cookie, then redirects to the same URL with
-/// `_token` stripped so the secret doesn't linger in history /
-/// bookmarks / referer headers.
-const AUTH_QUERY_PARAM: &str = "_token";
+/// Realm advertised in `WWW-Authenticate` challenges. Shows up in
+/// the browser's credential prompt as "Server says: <realm>".
+const AUTH_REALM: &str = "ai-memory";
 
 /// Shared auth state. Cheap to clone — just an `Arc` wrapping the
 /// optional configured token.
@@ -78,21 +87,23 @@ impl AuthState {
 ///
 /// Token sources, in priority order:
 /// 1. `Authorization: Bearer <token>` header. Works for any method.
-///    This is what the MCP + hook clients send.
-/// 2. **GET only:** `ai_memory_auth` cookie. Set automatically by
-///    the redirect path below; persists across navigation so the
-///    browser doesn't need a header-rewriting extension.
-/// 3. **GET only:** `?_token=<token>` query parameter. On match the
-///    middleware sets the cookie + 303-redirects to the same URL
-///    with `_token` stripped, so the secret doesn't get bookmarked,
-///    logged in referer headers, or sit in browser history.
+///    This is what MCP + hook clients send.
+/// 2. **GET only:** `Authorization: Basic <base64(user:token)>`.
+///    Username is ignored; the password portion is the token.
+///    Browsers send this automatically after the native credential
+///    prompt fires on a 401 + `WWW-Authenticate: Basic`. On success
+///    we also set the `ai_memory_auth` cookie so subsequent visits
+///    (including from a fresh browser session) skip the prompt.
+/// 3. **GET only:** `ai_memory_auth` cookie set by the Basic handshake.
 ///
-/// POST / PUT / DELETE / etc. require the header — that confines
-/// cookie-bearing requests to read-only operations and keeps the
-/// CSRF surface of cookie auth small (a malicious page on another
-/// origin can ride the cookie into GETs, but `/mcp` and `/hook` are
-/// POST-only, so the worst it can do is render /web pages the user
-/// could already see).
+/// POST / PUT / DELETE / etc. require the Bearer header. Cookie and
+/// Basic auth are GET-only, which confines cookie-CSRF to read-only
+/// pages — `/mcp` + `/hook` are POST-only and stay header-gated.
+///
+/// On 401 for GET requests the response includes both `Basic` and
+/// `Bearer` challenges in `WWW-Authenticate`. Browsers honour the
+/// `Basic` challenge (native dialog); MCP clients honour the `Bearer`
+/// challenge.
 pub async fn require_bearer(
     State(state): State<Arc<AuthState>>,
     req: Request<axum::body::Body>,
@@ -102,33 +113,35 @@ pub async fn require_bearer(
         return next.run(req).await;
     };
 
-    let from_header = extract_bearer_header(&req);
     let is_get = req.method() == Method::GET;
-    let from_cookie = if is_get { extract_cookie(&req) } else { None };
-    let from_query = if is_get {
-        extract_query_token(&req)
+    let from_bearer = extract_bearer_header(&req);
+    let from_basic = if is_get {
+        extract_basic_header(&req)
     } else {
         None
     };
+    let from_cookie = if is_get { extract_cookie(&req) } else { None };
 
-    let provided = from_header
+    let provided = from_bearer
         .as_deref()
+        .or(from_basic.as_deref())
         .or(from_cookie.as_deref())
-        .or(from_query.as_deref())
         .unwrap_or("");
 
     if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
-        debug!("auth rejected: invalid or missing bearer token");
-        return unauthorized();
+        debug!("auth rejected: invalid or missing token");
+        return unauthorized(is_get);
     }
 
-    // Browser-friendly handoff: when the token arrived ONLY via the
-    // query string, swap it for a cookie + redirect. Subsequent
-    // navigation (and inlined assets like /static/tailwind.css) ride
-    // the cookie, so the token never appears in the visible URL bar
-    // after the first hop.
-    if from_header.is_none() && from_cookie.is_none() && from_query.is_some() {
-        return redirect_with_cookie(&req, provided);
+    // First successful Basic-auth hit (no cookie yet) → also stamp the
+    // cookie so the user doesn't get the dialog again next browser
+    // session. Subsequent navigations ride the cookie alone.
+    if from_basic.is_some() && from_cookie.is_none() {
+        let mut resp = next.run(req).await;
+        if let Ok(cookie) = build_session_cookie(provided).parse() {
+            resp.headers_mut().insert(header::SET_COOKIE, cookie);
+        }
+        return resp;
     }
 
     next.run(req).await
@@ -146,6 +159,24 @@ fn extract_bearer_header(req: &Request<axum::body::Body>) -> Option<String> {
     }
 }
 
+fn extract_basic_header(req: &Request<axum::body::Body>) -> Option<String> {
+    use base64::Engine;
+    let h = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, value) = h.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.trim_start())
+        .ok()?;
+    let s = std::str::from_utf8(&decoded).ok()?;
+    // Standard form: `user:password`. We ignore the username (the
+    // browser dialog always asks for one but we don't have multi-user
+    // accounts — only the password = bearer token matters).
+    let (_user, pass) = s.split_once(':')?;
+    Some(pass.to_string())
+}
+
 fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
     let h = req.headers().get(header::COOKIE)?.to_str().ok()?;
     for pair in h.split(';') {
@@ -157,63 +188,38 @@ fn extract_cookie(req: &Request<axum::body::Body>) -> Option<String> {
     None
 }
 
-fn extract_query_token(req: &Request<axum::body::Body>) -> Option<String> {
-    let q = req.uri().query()?;
-    for pair in q.split('&') {
-        if let Some(val) = pair.strip_prefix(&format!("{AUTH_QUERY_PARAM}=")) {
-            return Some(val.to_string());
-        }
-    }
-    None
-}
-
-fn redirect_with_cookie(req: &Request<axum::body::Body>, token: &str) -> Response {
-    let path = req.uri().path();
-    let cleaned_query: String = req
-        .uri()
-        .query()
-        .unwrap_or("")
-        .split('&')
-        .filter(|p| !p.starts_with(&format!("{AUTH_QUERY_PARAM}=")) && !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("&");
-    let target = if cleaned_query.is_empty() {
-        path.to_string()
-    } else {
-        format!("{path}?{cleaned_query}")
-    };
-    // 30-day Max-Age — long enough that re-typing the bookmark URL
+fn build_session_cookie(token: &str) -> String {
+    // 30-day Max-Age — long enough that re-entering the credential
     // every month is rare. HttpOnly hides it from any inline JS;
     // SameSite=Lax keeps cross-site POSTs from riding it.
-    // We deliberately don't set Secure: homelab deployments are
-    // often plain HTTP on a LAN. A reverse proxy that terminates
-    // TLS upstream is the right place to add Secure if exposed
-    // publicly.
-    let cookie = format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000");
-    let mut resp = (StatusCode::SEE_OTHER, "").into_response();
-    resp.headers_mut().insert(
-        header::LOCATION,
-        target.parse().expect("target path is a valid header value"),
-    );
-    resp.headers_mut().insert(
-        header::SET_COOKIE,
-        cookie
-            .parse()
-            .expect("cookie value is a valid header value"),
-    );
-    resp
+    // No Secure attribute: homelab deployments are often plain HTTP
+    // on a LAN. A TLS-terminating reverse proxy is the right place to
+    // add Secure if the service is exposed publicly.
+    format!("{AUTH_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000")
 }
 
-fn unauthorized() -> Response {
+fn unauthorized(include_basic_challenge: bool) -> Response {
     let mut resp = (StatusCode::UNAUTHORIZED, "auth required\n").into_response();
+    // Order of challenges matters: browsers parse the first challenge
+    // they understand and show the dialog for it. Putting `Basic`
+    // first ensures GET-from-browser triggers the native prompt; MCP
+    // clients (which speak only Bearer) ignore the Basic and read
+    // their challenge from the second value.
+    //
+    // Non-GET 401s skip the Basic challenge — sending it on a POST
+    // would invite the browser to dialog-prompt for an endpoint
+    // it can't authenticate this way anyway.
+    let value = if include_basic_challenge {
+        format!(
+            "Basic realm=\"{AUTH_REALM}\", \
+             Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\""
+        )
+    } else {
+        format!("Bearer realm=\"{AUTH_REALM}\", error=\"invalid_token\"")
+    };
     resp.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        // MCP spec wants this header; clients use it to disambiguate
-        // "missing token" from "wrong token" and surface a helpful
-        // diagnostic. The `realm` is informational.
-        "Bearer realm=\"ai-memory\", error=\"invalid_token\""
-            .parse()
-            .expect("static header value is valid"),
+        value.parse().expect("static header value is valid"),
     );
     resp
 }
@@ -286,7 +292,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
-        assert!(www.to_str().unwrap().contains("Bearer"));
+        let www = www.to_str().unwrap();
+        // GET 401 advertises BOTH challenges so browsers (Basic) and
+        // MCP clients (Bearer) each see what they understand.
+        assert!(www.contains("Bearer"));
+        assert!(www.contains("Basic"));
     }
 
     #[tokio::test]
@@ -338,13 +348,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_bearer_scheme_is_rejected() {
+    async fn unknown_scheme_is_rejected() {
+        // `Digest`, `OAuth`, etc. are not handled.
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
                 Request::builder()
                     .uri("/probe")
-                    .header("Authorization", "Basic dXNlcjpwYXNz")
+                    .header("Authorization", "Digest username=foo,response=bar")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -407,30 +418,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Helper: build a Basic-auth header value (any username, token as password).
+    fn basic_auth(token: &str) -> String {
+        use base64::Engine;
+        let creds = format!("any:{token}");
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(creds)
+        )
+    }
+
     #[tokio::test]
-    async fn query_token_redirects_and_sets_cookie() {
+    async fn basic_auth_with_right_token_passes_get_and_sets_cookie() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
                 Request::builder()
-                    .uri("/probe?_token=right-token")
+                    .uri("/probe")
+                    .header("Authorization", basic_auth("right-token"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let loc = resp
-            .headers()
-            .get(header::LOCATION)
-            .expect("redirect target")
-            .to_str()
-            .unwrap();
-        assert_eq!(loc, "/probe");
+        assert_eq!(resp.status(), StatusCode::OK);
+        // First successful Basic hit also stamps the cookie so the
+        // browser doesn't dialog-prompt every session.
         let cookie = resp
             .headers()
             .get(header::SET_COOKIE)
-            .expect("set-cookie")
+            .expect("set-cookie on first Basic-auth success")
             .to_str()
             .unwrap();
         assert!(cookie.contains("ai_memory_auth=right-token"));
@@ -440,42 +457,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_token_preserves_other_params() {
+    async fn basic_auth_with_wrong_password_returns_401() {
         let r = router_with_auth(Some("right-token"));
         let resp = r
             .oneshot(
                 Request::builder()
-                    .uri("/probe?foo=bar&_token=right-token&baz=qux")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let loc = resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        // _token stripped; foo + baz preserved (order doesn't matter
-        // but we filter sequentially so order is stable).
-        assert_eq!(loc, "/probe?foo=bar&baz=qux");
-    }
-
-    #[tokio::test]
-    async fn query_token_wrong_value_returns_401() {
-        let r = router_with_auth(Some("right-token"));
-        let resp = r
-            .oneshot(
-                Request::builder()
-                    .uri("/probe?_token=wrong-token")
+                    .uri("/probe")
+                    .header("Authorization", basic_auth("wrong-token"))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn basic_auth_ignored_on_post() {
+        // POST routes must use Bearer header; Basic auth is GET-only.
+        let state = Arc::new(AuthState::new(Some("right-token".to_string())));
+        let r = Router::new()
+            .route("/probe", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(state, require_bearer));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header("Authorization", basic_auth("right-token"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // POST 401 must NOT advertise Basic — browsers would dialog
+        // for a route they can't authenticate this way.
+        let www = resp.headers().get(header::WWW_AUTHENTICATE).unwrap();
+        let www = www.to_str().unwrap();
+        assert!(www.contains("Bearer"));
+        assert!(!www.contains("Basic"));
+    }
+
+    #[tokio::test]
+    async fn cookie_request_does_not_re_set_cookie() {
+        // Already-authed-by-cookie requests don't need a Set-Cookie
+        // refresh; that's a waste of bandwidth on every navigation.
+        let r = router_with_auth(Some("right-token"));
+        let resp = r
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .header("Cookie", "ai_memory_auth=right-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[test]
