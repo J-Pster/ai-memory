@@ -335,6 +335,13 @@ pub enum AgentChoice {
     /// OpenCode (open-source coding agent) — TypeScript plugin hooks
     /// under `~/.config/opencode/plugins/`. Print-only for now; the
     /// plugin generator lands in a follow-up commit.
+    ///
+    /// The `opencode` (no hyphen) alias matches both the staged hook
+    /// dir on disk (`~/.local/share/ai-memory/hooks/opencode/`) and
+    /// what users commonly type. Without it, `ai-memory upgrade`'s
+    /// hook-refresh loop iterates the staged dir names and passes
+    /// them straight to `--agent`, which used to fail on this one.
+    #[value(alias = "opencode")]
     OpenCode,
     /// OpenClaw personal AI gateway — **no lifecycle hooks**;
     /// `install-hooks --apply --agent openclaw` prints an
@@ -352,7 +359,10 @@ pub enum McpClient {
     ClaudeCode,
     /// OpenAI Codex CLI — `~/.codex/config.toml`.
     Codex,
-    /// OpenCode — `opencode.json`.
+    /// OpenCode — `opencode.json`. Accepts `opencode` (no hyphen) as
+    /// an alias for symmetry with `AgentChoice` and the on-disk
+    /// hook-staging dir name.
+    #[value(alias = "opencode")]
     OpenCode,
     /// Cursor IDE — `~/.cursor/mcp.json` or `.cursor/mcp.json`.
     Cursor,
