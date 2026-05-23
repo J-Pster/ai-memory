@@ -970,6 +970,10 @@ pub struct PurgeProjectReport {
     pub embeddings_deleted: u64,
     /// Paths of wiki files that were removed from disk.
     pub files_deleted: Vec<String>,
+    /// Paths whose wiki file was kept because another project still
+    /// references the same path. The wiki is flat on disk so the file
+    /// is shared between projects — deleting it would 404 the sibling.
+    pub files_skipped_shared: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
 }
@@ -984,6 +988,7 @@ impl From<&PurgeSummary> for PurgeProjectReport {
             handoffs_deleted: s.handoffs_deleted,
             embeddings_deleted: s.embeddings_deleted,
             files_deleted: Vec::new(),
+            files_skipped_shared: Vec::new(),
             files_failed: Vec::new(),
         }
     }
@@ -1053,12 +1058,30 @@ async fn handle_purge_project(
         }
     };
 
-    // Remove wiki files. Partial failures are accumulated but never abort
-    // the response — the DB rows are already gone; partial file cleanup is
-    // better than returning an error and leaving the caller confused.
+    // Remove wiki files — but ONLY when no other project still has an
+    // is_latest=1 page row pointing at the same path. The wiki is flat
+    // on disk (`wiki/concepts/foo.md` is shared across all projects
+    // with that path), so naïvely deleting every purged page's file
+    // would clobber files still owned by sibling projects. The DB-row
+    // purge already happened (cascaded by FK); this loop only fixes
+    // the on-disk side. Partial failures are accumulated but never
+    // abort the response.
     let mut files_deleted: Vec<String> = Vec::new();
+    let mut files_skipped_shared: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
     for raw_path in &summary.page_paths {
+        let still_referenced = match state.reader.path_still_referenced(raw_path.clone()).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(path = %raw_path, error = %e, "purge-project: cross-project ref check failed; skipping delete defensively");
+                files_skipped_shared.push(raw_path.clone());
+                continue;
+            }
+        };
+        if still_referenced {
+            files_skipped_shared.push(raw_path.clone());
+            continue;
+        }
         match ai_memory_core::PagePath::new(raw_path.clone()) {
             Ok(pp) => match state.wiki.delete_page(&pp) {
                 Ok(()) => files_deleted.push(raw_path.clone()),
@@ -1076,6 +1099,7 @@ async fn handle_purge_project(
 
     let mut report = PurgeProjectReport::from(&summary);
     report.files_deleted = files_deleted;
+    report.files_skipped_shared = files_skipped_shared;
     report.files_failed = files_failed;
 
     (

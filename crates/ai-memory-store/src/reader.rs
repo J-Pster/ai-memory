@@ -328,6 +328,26 @@ impl ReaderPool {
         .await
     }
 
+    /// True when any `is_latest = 1` page row anywhere in the store
+    /// still references the given wiki path. Used by purge-project to
+    /// avoid deleting a wiki file on disk when another project still
+    /// has a page row pointing at the same path (the wiki is flat on
+    /// disk, so paths can collide across projects).
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn path_still_referenced(&self, path: String) -> StoreResult<bool> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pages WHERE path = ?1 AND is_latest = 1)",
+                params![path],
+                |row| row.get(0),
+            )?;
+            Ok(n != 0)
+        })
+        .await
+    }
+
     /// Look up the `(workspace_id, project_id)` a session belongs to.
     /// Returns `None` when no such session row exists.
     ///
