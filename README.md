@@ -12,7 +12,7 @@
 
 [![status: v0.2 milestones complete](https://img.shields.io/badge/status-v0.2--complete-green)](docs/ARCHITECTURE.md)
 [![Rust](https://img.shields.io/badge/rust-1.95+-blue)](rust-toolchain.toml)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 ## What it is
 
@@ -381,8 +381,12 @@ solves that by LLM-summarising your existing `git log`, README,
 # Requires an LLM provider configured on the server. Budget caps at
 # 50k input tokens (~$0.05 with Claude Haiku 4.5).
 export AI_MEMORY_SERVER_URL="http://localhost:49374"
-ai-memory bootstrap --workspace homelab --project myproj
+ai-memory bootstrap
 ```
+
+The workspace defaults to `default` and the project defaults to the
+current directory's basename — that's almost always what you want, so
+omit `--workspace` / `--project` unless you're deliberately overriding.
 
 Bootstrap produces a per-project `bootstrap.md` manifest (under
 `<wiki>/<workspace>/<project>/`) listing every page generated + a
@@ -706,7 +710,7 @@ data-flow diagram + crate breakdown + cross-cutting invariants.
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0.
+MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgements
 

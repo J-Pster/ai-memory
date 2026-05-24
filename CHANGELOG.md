@@ -1,0 +1,83 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- Wiki-structure migration framework: `wiki_migrations` SQL table (V06),
+  `WikiMigration` trait, migration registry, and `run_pending` runner
+  invoked at server startup before the watcher starts.
+- MCP read tools (`memory_query`, `memory_recent`, `memory_status`,
+  `memory_briefing`, `memory_explore`) accept an optional `project`
+  argument to target a specific project on a shared server.
+
+### Fixed
+- OpenCode hook events (`tool.execute.*`, `session.*`) were rejected with
+  "missing session_id" because OpenCode sends `sessionID` (capital `ID`)
+  and the extractor only matched `sessionId`. All spellings are now
+  accepted ([#1]).
+- MCP read tools were locked to the server's static `--project` (default
+  `scratch`), so on a shared HTTP server they returned empty memory even
+  while hooks populated the correct per-cwd project. The hook router now
+  publishes the active project to a shared pointer that the read tools
+  use as their default; an explicit `project` argument overrides it ([#2]).
+
+## [0.1.0] - 2026-XX-XX
+
+### Added
+- Per-project UUID-namespaced wiki layout: pages live at
+  `<wiki_root>/<workspace_id>/<project_id>/<page-path>`. Rename is now
+  a single column update; purge is `remove_dir_all` on the project dir.
+- CLI becomes a thin HTTP client: `bootstrap`, `status`, `search`,
+  `reorg`, `lint`, `forget-sweep`, `embed`, `commit`, `backup`,
+  `write-page` all delegate to the running server via `/admin/*` routes.
+  The server is the sole writer of wiki + SQLite.
+- `purge-project` command with cascade-delete indexes and per-project
+  isolation guard (refuses to delete files claimed by sibling projects).
+- `rename-project` command: column-only rename, no file moves.
+- `memory_install_self_routing` MCP tool: installs the agent-routing
+  snippet into CLAUDE.md / AGENTS.md / `.cursorrules` in one call.
+- Read-only HTTP wiki browser (`/web`) with project tree, page view,
+  and full-text search.
+- Bearer token auth (`AI_MEMORY_AUTH_TOKEN` / `generate-auth-token`),
+  Host-header allowlist, and 10 MB body cap for the HTTP server.
+- `backup` / `restore` commands using `.tar.gz` archives with live-process
+  guard (refuses to run if another `ai-memory` is active on the same data dir).
+- Per-cwd project routing in hooks: observations route to the project
+  matching the agent's working directory, not the server default.
+- `opencode` / `openclaw` aliases for the OpenCode MCP client.
+- Dockerised CLI wrapper (`bin/ai-memory`) with auto-restart for the
+  local container and nudge for remote upgrades.
+- `bootstrap` serialises parallel runs to prevent duplicate project creation
+  and handles the case where the CWD has no git repo.
+- Monthly log-md rotation to keep `log.md` from growing unbounded.
+- `memory_consolidate` PreCompact checkpointing falls back to rule-based
+  summarisation when no LLM is configured.
+- `docs/lifecycle-ops.md`: safety matrix for state-touching commands
+  (reset, restore, purge-project, rename-project).
+- `docs/wiki-migrations.md`: when and how to write a wiki migration.
+
+### Changed
+- `bin/ai-memory` forwards `AI_MEMORY_SERVER_URL` and no longer creates
+  `-w` mount-conflict directories.
+- `bootstrap` resolves the repo root via `libgit2`, removing the
+  `git` binary dependency.
+- Admin routes consolidated: dry-run support, correct status codes,
+  deduplicated handlers.
+- Host-header allowlist sourced from `Config.allowed_hosts`; logged at
+  startup so operators can verify the effective list.
+
+### Fixed
+- `AI_MEMORY_HOST_CWD` handling and dry-run no-project side effects.
+- Web page view: strip leading H1 from body to prevent title duplication.
+- `install-mcp` Codex config key was `bearer_token`, not
+  `http_headers` / `headers`.
+- Consolidator used server startup default project instead of the
+  session's actual project.
+
+[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/akitaonrails/ai-memory/releases/tag/v0.1.0

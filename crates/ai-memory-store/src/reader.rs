@@ -1431,6 +1431,24 @@ impl ReaderPool {
         })
         .await
     }
+
+    /// Return all migration names recorded in the `wiki_migrations` table.
+    ///
+    /// Used by the wiki migration runner to determine which migrations have
+    /// already been applied to this data directory.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn wiki_migration_names(&self) -> StoreResult<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT name FROM wiki_migrations ORDER BY name")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .await
+    }
 }
 
 fn page_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreResult<PageMeta>> {

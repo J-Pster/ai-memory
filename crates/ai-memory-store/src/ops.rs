@@ -692,6 +692,23 @@ pub fn rename_project(
     }
 }
 
+/// Record a successfully-applied wiki-structure migration.
+///
+/// Uses `INSERT OR IGNORE` so re-running the same name is a no-op
+/// (idempotent by design — the runner already skips known names, but
+/// this guards against any concurrent writes).
+pub fn insert_wiki_migration(
+    conn: &mut Connection,
+    name: &str,
+    applied_at: i64,
+) -> StoreResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO wiki_migrations (name, applied_at) VALUES (?1, ?2)",
+        params![name, applied_at],
+    )?;
+    Ok(())
+}
+
 /// Delete a project and all its data inside one transaction.
 ///
 /// Execution order:

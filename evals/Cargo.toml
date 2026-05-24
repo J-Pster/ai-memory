@@ -1,8 +1,8 @@
 [package]
 name = "ai-memory-eval"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.95"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "MIT OR Apache-2.0"
 publish = false
 

@@ -109,6 +109,13 @@ pub(crate) enum WriteCmd {
         new_name: String,
         reply: oneshot::Sender<StoreResult<()>>,
     },
+    /// Record a successfully-applied wiki-structure migration.
+    InsertWikiMigration {
+        name: String,
+        /// Unix microseconds UTC.
+        applied_at: i64,
+        reply: oneshot::Sender<StoreResult<()>>,
+    },
     Shutdown,
 }
 
@@ -373,6 +380,26 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Record a wiki-structure migration as successfully applied.
+    ///
+    /// Called by the wiki migration runner immediately after [`WikiMigration::up`]
+    /// returns `Ok`. `applied_at` is unix microseconds UTC. If the name is
+    /// already present the call is a no-op (idempotent insert-or-ignore).
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WriterClosed`] if the actor has shut down, or
+    /// propagates the SQL error.
+    pub async fn insert_wiki_migration(&self, name: String, applied_at: i64) -> StoreResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::InsertWikiMigration {
+            name,
+            applied_at,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Retro-fit sessions and their observations to per-cwd projects and
     /// graveyard any mash-up pages. The `plan` slice contains
     /// `(session_id, new_project_id)` pairs. Everything runs in one
@@ -565,6 +592,14 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
             } => {
                 let result = ops::rename_project(&mut conn, &workspace_id, &project_id, &new_name);
                 send_or_warn(reply, result, "rename_project");
+            }
+            WriteCmd::InsertWikiMigration {
+                name,
+                applied_at,
+                reply,
+            } => {
+                let result = ops::insert_wiki_migration(&mut conn, &name, applied_at);
+                send_or_warn(reply, result, "insert_wiki_migration");
             }
         }
     }

@@ -237,6 +237,7 @@ dependencies = [
  "ai-memory-llm",
  "ai-memory-store",
  "anyhow",
+ "async-trait",
  "git2",
  "jiff",
  "notify",
