@@ -111,6 +111,14 @@ path.write_text(new_text)
 print(f"  version -> $VERSION")
 PYEOF
 
+# Sync Cargo.lock to the bumped workspace-member versions. Without this the
+# lockfile keeps the old version and the very next `cargo build` dirties the
+# tree right after the release commit. `--workspace` touches only our crates;
+# external deps are left pinned. `--offline` first so a release doesn't depend
+# on network, falling back to a networked update if the cache is incomplete.
+echo "==> Syncing Cargo.lock"
+cargo update --workspace --offline 2>/dev/null || cargo update --workspace
+
 # ── update CHANGELOG.md ────────────────────────────────────────────────────
 
 echo "==> Updating CHANGELOG.md"
@@ -146,14 +154,14 @@ new_text = unreleased_pattern.sub(new_block + r"\n## [", text, count=1)
 # Replace the Unreleased compare link to point from this version to HEAD.
 new_text = re.sub(
     r'^\[Unreleased\]:.*$',
-    f"[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/{TAG}...HEAD\n"
-    f"[$VERSION]: https://github.com/akitaonrails/ai-memory/releases/tag/{TAG}",
+    "[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/$TAG...HEAD\n"
+    "[$VERSION]: https://github.com/akitaonrails/ai-memory/releases/tag/$TAG",
     new_text,
     flags=re.MULTILINE,
 )
 
 path.write_text(new_text)
-print(f"  moved [Unreleased] entries to [{VERSION}] - $TODAY")
+print("  moved [Unreleased] entries to [$VERSION] - $TODAY")
 PYEOF
 
 # ── commit + tag ───────────────────────────────────────────────────────────

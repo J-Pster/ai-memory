@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publishes the active project to a shared pointer that the read tools
   use as their default; an explicit `project` argument overrides it ([#2]).
 
-## [0.1.0] - 2026-XX-XX
+## [0.1.0] - 2026-05-23
 
 ### Added
 - Per-project UUID-namespaced wiki layout: pages live at
