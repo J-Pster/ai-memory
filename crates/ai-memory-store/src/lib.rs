@@ -23,8 +23,9 @@ pub use decay::{DecayParams, retention_score};
 pub use error::{StoreError, StoreResult};
 pub use ops::{PurgeSummary, ReorgSummary};
 pub use reader::{
-    ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, PageHit, PageMeta, PageSummary,
-    ProjectSummary, ReaderPool, StatusCounts, StoredEmbedding, f32_vec_to_bytes,
+    ActivityWindow, BriefingPage, BriefingSnapshot, DecayCandidate, DerivedIndexStatus,
+    EmbeddingTripleCount, ObservationHit, PageHit, PageMeta, PageSummary, ProjectSummary,
+    ReaderPool, StatusCounts, StoredEmbedding, f32_vec_to_bytes,
 };
 pub use writer::WriterHandle;
 
@@ -83,7 +84,10 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{NewPage, PagePath, ProjectId, Tier, WorkspaceId};
+    use ai_memory_core::{
+        AgentKind, NewObservation, NewPage, NewSession, ObservationKind, PagePath, ProjectId,
+        SessionId, Tier, WorkspaceId,
+    };
     use tempfile::TempDir;
 
     fn sample_page(ws: WorkspaceId, proj: ProjectId, path: &str, body: &str) -> NewPage {
@@ -96,6 +100,7 @@ mod tests {
             tier: Tier::Semantic,
             frontmatter_json: serde_json::json!({}),
             pinned: false,
+            links: Vec::new(),
         }
     }
 
@@ -306,6 +311,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_quotes_hyphenated_tokens_for_fts5() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(
+                ws,
+                proj,
+                "hyphen.md",
+                "the ai-memory token should be searchable",
+            ))
+            .await
+            .unwrap();
+
+        let hits = store
+            .reader
+            .search_pages_for_project(ws, proj, "ai-memory".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path.as_str(), "hyphen.md");
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_includes_linked_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+
+        store
+            .writer
+            .upsert_page(sample_page(ws, proj, "target.md", "neighbor-only content"))
+            .await
+            .unwrap();
+        let mut source = sample_page(ws, proj, "source.md", "needle source content");
+        source.links = vec![PagePath::new("target.md").unwrap()];
+        store.writer.upsert_page(source).await.unwrap();
+
+        let hits = store
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                "needle".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"source.md"));
+        assert!(
+            paths.contains(&"target.md"),
+            "linked neighbor should be included"
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_fts_finds_raw_fallback_hits() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "ai-memory", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                title: "prompt".into(),
+                body: "the raw-only zebra detail lives here".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let hits = store
+            .reader
+            .search_observations_for_project(ws, proj, "zebra".into(), 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, session_id);
+        assert!(hits[0].snippet.contains("<mark>zebra</mark>"));
+    }
+
+    #[tokio::test]
     async fn list_projects_with_stats_returns_aggregates() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -400,6 +536,7 @@ mod tests {
             tier: Tier::Semantic,
             frontmatter_json: serde_json::json!({"kind": "decision"}),
             pinned: true,
+            links: Vec::new(),
         };
         store.writer.upsert_page(page).await.unwrap();
 

@@ -41,6 +41,7 @@ pub fn synthesize_session_page(
             "tier": "episodic",
         }),
         pinned: false,
+        links: Vec::new(),
     }
 }
 

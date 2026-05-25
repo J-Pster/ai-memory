@@ -37,6 +37,25 @@ pub struct PageHit {
     pub rank: f64,
 }
 
+/// One raw observation fallback hit returned when compiled wiki pages miss.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObservationHit {
+    /// Stable observation identifier.
+    pub id: ObservationId,
+    /// Owning session identifier.
+    pub session_id: SessionId,
+    /// Observation kind as stored on the lifecycle row.
+    pub kind: String,
+    /// Observation title.
+    pub title: String,
+    /// FTS5 snippet of the raw observation body around the matched terms.
+    pub snippet: String,
+    /// FTS5 rank score (lower is better).
+    pub rank: f64,
+    /// ISO-8601 creation timestamp.
+    pub created_at: String,
+}
+
 /// Aggregate counts surfaced by [`ReaderPool::status_counts`] and consumed
 /// by `ai-memory status`.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -49,6 +68,44 @@ pub struct StatusCounts {
     pub sessions: u64,
     /// Total observations across all sessions.
     pub observations: u64,
+}
+
+/// Derived-index health counters surfaced by admin status.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DerivedIndexStatus {
+    /// All page rows in the source table. `pages_fts_rows` should match this.
+    pub pages_rows: u64,
+    /// Rows currently present in the page FTS5 index.
+    pub pages_fts_rows: u64,
+    /// All observation rows. `observations_fts_rows` should match this.
+    pub observations_rows: u64,
+    /// Rows currently present in the observation FTS5 index.
+    pub observations_fts_rows: u64,
+    /// Latest pages without any embedding row.
+    pub latest_pages_missing_embeddings: u64,
+    /// Stored embedding rows, regardless of provider/model/dim.
+    pub embedding_rows: u64,
+    /// Stored embedding triples and row counts.
+    pub embedding_triples: Vec<EmbeddingTripleCount>,
+    /// Outgoing links whose source page is latest.
+    pub links_from_latest_pages: u64,
+    /// Latest-page outgoing links whose target path has not resolved yet.
+    pub unresolved_links_from_latest_pages: u64,
+    /// Latest-page outgoing links pointing at a non-latest target row.
+    pub stale_links_from_latest_pages: u64,
+}
+
+/// Count of embedding rows sharing one `(provider, model, dim)` triple.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingTripleCount {
+    /// Embedding provider name.
+    pub provider: String,
+    /// Embedding model name.
+    pub model: String,
+    /// Vector dimension.
+    pub dim: u32,
+    /// Rows using this triple.
+    pub count: u64,
 }
 
 /// Rolling activity counters over a fixed time window. Surfaced by
@@ -89,6 +146,9 @@ pub struct BriefingSnapshot {
     /// All pages currently under `_rules/` — small, surfaced verbatim
     /// because they're the highest-signal type of memory.
     pub rules: Vec<BriefingPage>,
+    /// Small pinned pages under `_slots/` for active project context,
+    /// preferences, current focus, and pending items.
+    pub slots: Vec<BriefingPage>,
     /// Top-N most-recently-updated `is_latest = 1` pages.
     pub recent_pages: Vec<BriefingPage>,
 }
@@ -228,6 +288,7 @@ impl ReaderPool {
     /// # Errors
     /// Propagates any SQL or pool error.
     pub async fn search_pages(&self, query: String, limit: usize) -> StoreResult<Vec<PageHit>> {
+        let query = normalize_fts_query(&query);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT pages.id, pages.path, pages.title, \
@@ -276,6 +337,7 @@ impl ReaderPool {
         query: String,
         limit: usize,
     ) -> StoreResult<Vec<PageHit>> {
+        let query = normalize_fts_query(&query);
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT pages.id, pages.path, pages.title, \
@@ -317,6 +379,81 @@ impl ReaderPool {
                     title,
                     snippet,
                     rank,
+                });
+            }
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// Run a full-text search against raw observations scoped to one project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn search_observations_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        query: String,
+        limit: usize,
+    ) -> StoreResult<Vec<ObservationHit>> {
+        let query = normalize_fts_query(&query);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT observations.id, observations.session_id, observations.kind, \
+                        observations.title, \
+                        snippet(observations_fts, 1, '<mark>', '</mark>', '…', 24) AS snip, \
+                        observations_fts.rank, observations.created_at \
+                 FROM observations_fts \
+                 JOIN observations ON observations.rowid = observations_fts.rowid \
+                 WHERE observations_fts MATCH ?1 \
+                   AND observations.workspace_id = ?2 \
+                   AND observations.project_id = ?3 \
+                 ORDER BY observations_fts.rank \
+                 LIMIT ?4",
+            )?;
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = stmt.query_map(
+                params![
+                    query,
+                    workspace_id.as_bytes(),
+                    project_id.as_bytes(),
+                    limit as i64,
+                ],
+                |row| {
+                    let id_bytes: Vec<u8> = row.get(0)?;
+                    let session_bytes: Vec<u8> = row.get(1)?;
+                    let kind: String = row.get(2)?;
+                    let title: String = row.get(3)?;
+                    let snippet: String = row.get(4)?;
+                    let rank: f64 = row.get(5)?;
+                    let created_us: i64 = row.get(6)?;
+                    Ok((
+                        id_bytes,
+                        session_bytes,
+                        kind,
+                        title,
+                        snippet,
+                        rank,
+                        created_us,
+                    ))
+                },
+            )?;
+
+            let mut hits = Vec::new();
+            for row in rows {
+                let (id_bytes, session_bytes, kind, title, snippet, rank, created_us) = row?;
+                let created_at = jiff::Timestamp::from_microsecond(created_us)
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_default();
+                hits.push(ObservationHit {
+                    id: ObservationId::from_slice(&id_bytes)?,
+                    session_id: SessionId::from_slice(&session_bytes)?,
+                    kind,
+                    title,
+                    snippet,
+                    rank,
+                    created_at,
                 });
             }
             Ok(hits)
@@ -604,13 +741,124 @@ impl ReaderPool {
         .await
     }
 
+    /// Return pages linked to or from the seed pages, scoped to latest pages
+    /// in the same project.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn graph_neighbors_for_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        seed_ids: Vec<PageId>,
+        limit: usize,
+    ) -> StoreResult<Vec<PageHit>> {
+        if seed_ids.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.with_conn(move |conn| {
+            let seed_set: std::collections::HashSet<PageId> = seed_ids.iter().copied().collect();
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+
+            let mut outgoing = conn.prepare(
+                "SELECT tp.id, tp.path, tp.title, substr(tp.body, 1, 240) \
+                 FROM links l \
+                 JOIN pages tp ON tp.id = l.to_page_id \
+                 WHERE l.from_page_id = ?1 \
+                   AND tp.workspace_id = ?2 \
+                   AND tp.project_id = ?3 \
+                   AND tp.is_latest = 1 \
+                 ORDER BY tp.updated_at DESC",
+            )?;
+            let mut incoming = conn.prepare(
+                "SELECT fp.id, fp.path, fp.title, substr(fp.body, 1, 240) \
+                 FROM links l \
+                 JOIN pages fp ON fp.id = l.from_page_id \
+                 WHERE l.to_page_id = ?1 \
+                   AND fp.workspace_id = ?2 \
+                   AND fp.project_id = ?3 \
+                   AND fp.is_latest = 1 \
+                 ORDER BY fp.updated_at DESC",
+            )?;
+
+            for seed_id in &seed_ids {
+                let rows = outgoing.query_map(
+                    params![
+                        seed_id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes()
+                    ],
+                    |row| {
+                        let id_bytes: Vec<u8> = row.get(0)?;
+                        let path: String = row.get(1)?;
+                        let title: String = row.get(2)?;
+                        let snippet: String = row.get(3)?;
+                        Ok((id_bytes, path, title, snippet))
+                    },
+                )?;
+                for row in rows {
+                    let (id_bytes, path, title, snippet) = row?;
+                    let id = PageId::from_slice(&id_bytes)?;
+                    if seed_set.contains(&id) || !seen.insert(id) {
+                        continue;
+                    }
+                    out.push(PageHit {
+                        id,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    });
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+
+                let rows = incoming.query_map(
+                    params![
+                        seed_id.as_bytes(),
+                        workspace_id.as_bytes(),
+                        project_id.as_bytes()
+                    ],
+                    |row| {
+                        let id_bytes: Vec<u8> = row.get(0)?;
+                        let path: String = row.get(1)?;
+                        let title: String = row.get(2)?;
+                        let snippet: String = row.get(3)?;
+                        Ok((id_bytes, path, title, snippet))
+                    },
+                )?;
+                for row in rows {
+                    let (id_bytes, path, title, snippet) = row?;
+                    let id = PageId::from_slice(&id_bytes)?;
+                    if seed_set.contains(&id) || !seen.insert(id) {
+                        continue;
+                    }
+                    out.push(PageHit {
+                        id,
+                        path: PagePath::new(path)?,
+                        title,
+                        snippet,
+                        rank: 0.0,
+                    });
+                    if out.len() >= limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     /// Hybrid search: RRF-fuse FTS5 results with cosine-similarity
     /// over the stored embeddings of the matching `(provider, model,
-    /// dim)`. Returns the top-`limit` pages by fused score.
+    /// dim)`, then add link-neighbour expansion as a third RRF stream.
+    /// Returns the top-`limit` pages by fused score.
     ///
-    /// When `query_vec` is `None`, falls back to pure FTS5
-    /// (equivalent to [`Self::search_pages`]). When no embeddings
-    /// exist for the configured triple, also falls back to pure FTS5.
+    /// When `query_vec` is `None`, the vector stream is skipped but graph
+    /// expansion still runs from the FTS seeds.
     ///
     /// k=60 is the canonical RRF constant.
     ///
@@ -632,30 +880,37 @@ impl ReaderPool {
         let fts_hits = self
             .search_pages_for_project(workspace_id, project_id, query, limit * 2)
             .await?;
-        let Some(qv) = query_vec else {
-            // No query vector → pure FTS5.
-            let mut out = fts_hits;
-            out.truncate(limit);
-            return Ok(out);
-        };
-        // Compute cosines against all stored embeddings.
-        let stored = self
-            .load_embeddings(workspace_id, project_id, provider, model, dim)
-            .await?;
-        if stored.is_empty() {
-            let mut out = fts_hits;
-            out.truncate(limit);
-            return Ok(out);
+        let mut vec_hits: Vec<(PageId, PagePath, f32)> = Vec::new();
+        if let Some(qv) = query_vec {
+            // Compute cosines against all stored embeddings.
+            let stored = self
+                .load_embeddings(workspace_id, project_id, provider, model, dim)
+                .await?;
+            vec_hits = stored
+                .iter()
+                .map(|s| {
+                    let score = dot(&qv, &s.vector);
+                    (s.id, s.path.clone(), score)
+                })
+                .collect();
+            vec_hits.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            vec_hits.truncate(limit * 2);
         }
-        let mut vec_hits: Vec<(PageId, PagePath, f32)> = stored
+
+        let mut seed_seen = std::collections::HashSet::new();
+        let mut seed_ids = Vec::new();
+        for id in fts_hits
             .iter()
-            .map(|s| {
-                let score = dot(&qv, &s.vector);
-                (s.id, s.path.clone(), score)
-            })
-            .collect();
-        vec_hits.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        vec_hits.truncate(limit * 2);
+            .map(|h| h.id)
+            .chain(vec_hits.iter().map(|(id, _, _)| *id))
+        {
+            if seed_seen.insert(id) {
+                seed_ids.push(id);
+            }
+        }
+        let graph_hits = self
+            .graph_neighbors_for_project(workspace_id, project_id, seed_ids, limit * 2)
+            .await?;
 
         // RRF fuse: score(d) = Σ 1/(k + rank_i(d)) over rankers.
         let k = 60.0_f64;
@@ -681,6 +936,19 @@ impl ReaderPool {
                 .entry(*id)
                 .and_modify(|entry| entry.3 += contrib)
                 .or_insert((path.clone(), String::new(), String::new(), contrib, 0.0));
+        }
+        for (rank, h) in graph_hits.iter().enumerate() {
+            let contrib = 1.0 / (k + (rank + 1) as f64);
+            fused
+                .entry(h.id)
+                .and_modify(|entry| entry.3 += contrib)
+                .or_insert((
+                    h.path.clone(),
+                    h.title.clone(),
+                    h.snippet.clone(),
+                    contrib,
+                    h.rank,
+                ));
         }
 
         let mut out: Vec<PageHit> = fused
@@ -845,6 +1113,20 @@ impl ReaderPool {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let mut slots_stmt = conn.prepare(
+                "SELECT path, title, \
+                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE is_latest = 1 AND path LIKE '_slots/%' \
+                 ORDER BY path ASC",
+            )?;
+            let slots: Vec<BriefingPage> = slots_stmt
+                .query_map([], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
             let mut recent_stmt = conn.prepare(
                 "SELECT path, title, \
                         COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
@@ -867,6 +1149,7 @@ impl ReaderPool {
                 last_observation_at,
                 pending_handoff_count,
                 rules,
+                slots,
                 recent_pages,
             })
         })
@@ -954,6 +1237,20 @@ impl ReaderPool {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let mut slots_stmt = conn.prepare(
+                "SELECT path, title, \
+                        COALESCE(json_extract(frontmatter_json, '$.kind'), 'slot') AS kind, \
+                        updated_at \
+                 FROM pages \
+                 WHERE workspace_id = ?1 AND project_id = ?2 AND is_latest = 1 AND path LIKE '_slots/%' \
+                 ORDER BY path ASC",
+            )?;
+            let slots: Vec<BriefingPage> = slots_stmt
+                .query_map(params![workspace_id.as_bytes(), project_id.as_bytes()], briefing_page_from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
             let mut recent_stmt = conn.prepare(
                 "SELECT path, title, \
                         COALESCE(json_extract(frontmatter_json, '$.kind'), 'fact') AS kind, \
@@ -976,6 +1273,7 @@ impl ReaderPool {
                 last_observation_at,
                 pending_handoff_count,
                 rules,
+                slots,
                 recent_pages,
             })
         })
@@ -1241,6 +1539,80 @@ impl ReaderPool {
                 pages_all,
                 sessions,
                 observations,
+            })
+        })
+        .await
+    }
+
+    /// Return health counters for derived indexes and link/embedding state.
+    ///
+    /// These checks are intentionally read-only and derived-index-safe: they
+    /// report drift but do not repair it. Rebuild/backfill paths stay behind
+    /// explicit admin operations.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn derived_index_status(&self) -> StoreResult<DerivedIndexStatus> {
+        self.with_conn(|conn| {
+            let mut triples_stmt = conn.prepare(
+                "SELECT provider, model, dim, COUNT(*) \
+                 FROM page_embeddings \
+                 GROUP BY provider, model, dim \
+                 ORDER BY COUNT(*) DESC, provider, model, dim",
+            )?;
+            let embedding_triples = triples_stmt
+                .query_map([], |row| {
+                    let provider: String = row.get(0)?;
+                    let model: String = row.get(1)?;
+                    let dim: i64 = row.get(2)?;
+                    let count: i64 = row.get(3)?;
+                    Ok(EmbeddingTripleCount {
+                        provider,
+                        model,
+                        dim: u32::try_from(dim.max(0)).unwrap_or(0),
+                        count: u64::try_from(count.max(0)).unwrap_or(0),
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(DerivedIndexStatus {
+                pages_rows: count(conn, "SELECT COUNT(*) FROM pages")?,
+                pages_fts_rows: count(conn, "SELECT COUNT(*) FROM pages_fts")?,
+                observations_rows: count(conn, "SELECT COUNT(*) FROM observations")?,
+                observations_fts_rows: count(conn, "SELECT COUNT(*) FROM observations_fts")?,
+                latest_pages_missing_embeddings: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM pages pg \
+                     LEFT JOIN page_embeddings pe ON pe.page_id = pg.id \
+                     WHERE pg.is_latest = 1 AND pe.page_id IS NULL",
+                )?,
+                embedding_rows: count(conn, "SELECT COUNT(*) FROM page_embeddings")?,
+                embedding_triples,
+                links_from_latest_pages: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                     WHERE fp.is_latest = 1",
+                )?,
+                unresolved_links_from_latest_pages: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                     WHERE fp.is_latest = 1 AND l.to_page_id IS NULL",
+                )?,
+                stale_links_from_latest_pages: count(
+                    conn,
+                    "SELECT COUNT(*) \
+                     FROM links l \
+                     JOIN pages fp ON fp.id = l.from_page_id \
+                     LEFT JOIN pages tp ON tp.id = l.to_page_id \
+                     WHERE fp.is_latest = 1 \
+                       AND l.to_page_id IS NOT NULL \
+                       AND COALESCE(tp.is_latest, 0) != 1",
+                )?,
             })
         })
         .await
@@ -1647,6 +2019,24 @@ fn count_project(
         )
         .optional()?;
     Ok(u64::try_from(n.unwrap_or(0)).unwrap_or(0))
+}
+
+fn normalize_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|token| {
+            if should_quote_fts_token(token) {
+                format!("\"{}\"", token.replace('"', "\"\""))
+            } else {
+                token.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn should_quote_fts_token(token: &str) -> bool {
+    token.contains('-') && !(token.starts_with('"') && token.ends_with('"'))
 }
 
 /// Count rows in a time-bounded window. Used by [`ReaderPool::briefing`]

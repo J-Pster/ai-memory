@@ -85,14 +85,15 @@ markdown stays the source of truth.
 4. When `AI_MEMORY_LLM_PROVIDER` is set, `memory_consolidate` rewrites
    that summary into a richer durable page or fans out into a
    multi-page batch under `concepts/`, `decisions/`, `gotchas/`.
-5. `memory_query` answers via FTS5; when an embedder is configured,
-   via RRF fusion of FTS5 + cosine over `page_embeddings`. Every
-   query hit bumps `access_count` + `last_accessed_at` on the page -
-   the M8 reinforcement term.
-6. The forget sweep runs on demand (or on a future schedule): pages
-   with `retention < cold_threshold` are soft-deleted; soft-deletions
-   older than `hard_delete_after_days` with no subsequent access get
-   purged. Semantic / pinned / freshly-touched pages survive.
+5. `memory_query` answers via FTS5 + link-neighbour RRF; when an
+   embedder is configured, vector cosine over `page_embeddings` joins
+   the same RRF. If compiled wiki pages miss entirely, bounded raw
+   observation FTS returns fallback `raw_hits`. Page hits bump
+   `access_count` + `last_accessed_at` - the M8 reinforcement term.
+6. The forget sweep runs on demand and on the server's `[maintenance]`
+   schedule: pages with `retention < cold_threshold` are soft-deleted;
+   soft-deletions older than `hard_delete_after_days` with no subsequent
+   access get purged. Semantic / pinned / freshly-touched pages survive.
 7. Backups: `ai-memory backup --to <tarball>` uses SQLite's online
    backup API so the source stays writable; `ai-memory restore`
    reverses. Or: `git push` the wiki dir + `rsync` the data dir.
@@ -108,7 +109,8 @@ markdown stays the source of truth.
 * `<data_dir>/db/memory.sqlite` - derived index. WAL mode. One
   writer actor owns the writer `Connection`; reads go through a
   cloneable read-only pool.
-* `<data_dir>/raw/` - reserved for raw session log archives (future).
+* `<data_dir>/raw/` - reserved for raw session log archives; current raw
+  fallback recall searches the durable `observations` table via FTS5.
 * `<data_dir>/logs/` - rolling daily `tracing` output.
 * `<data_dir>/models/` - reserved for bundled embedding models
   (M9.5+, when local `ort` lands).
@@ -121,9 +123,10 @@ markdown stays the source of truth.
 | `pages` | Versioned wiki pages with `is_latest` + `supersedes` chain. M8 columns: `last_accessed_at`, `access_count`, `superseded_at`. M9 cols: `embedding_provider`, `embedding_model`, `embedding_dim`. |
 | `pages_fts` | FTS5 virtual table over `(title, body)`, auto-synced by triggers. |
 | `sessions`, `observations` | Hook capture, full audit log. |
-| `links` | Wiki cross-references with `to_page_id` nullable for unresolved. |
+| `observations_fts` | FTS5 virtual table over raw observation `(title, body)`, used only as bounded fallback. |
+| `links` | Wikilink / markdown cross-references with `to_page_id` nullable for unresolved forward links. |
 | `handoffs` | Typed cross-agent handoff records (open / accepted / expired). |
-| `page_embeddings` | One vector per latest page, with `(provider, model, dim)` denormalised for refuse-on-mismatch checks. |
+| `page_embeddings` | Optional vector rows for latest pages, with `(provider, model, dim)` denormalised for refuse-on-mismatch checks and missing-embedding diagnostics. |
 | `audit_log` | Every mutation, addressable by `at DESC`. |
 
 **Memory tiers (M8 policy):**
@@ -136,7 +139,8 @@ markdown stays the source of truth.
 | Procedural | Indefinite | Frequency-decay if not re-observed |
 
 Pinned pages (`pinned: true` in frontmatter) are exempt from all
-decay paths.
+decay paths. Pages under `_slots/` are pinned automatically and surfaced
+in briefing/explore snapshots as tiny editable memory slots.
 
 ## Crate layout
 
@@ -156,18 +160,21 @@ Each crate has a single responsibility and exposes a typed API. No
 circular deps. Inter-crate boundaries enforce the cross-cutting
 invariants below.
 
-## MCP tool surface (10 tools)
+## MCP tool surface (11 tools)
 
 | Tool | Hint | Purpose |
 |---|---|---|
-| `memory_query` | read-only | FTS5 or hybrid RRF search. Bumps access counters. |
+| `memory_query` | read-only | FTS5 + graph RRF + optional vector RRF search, with raw fallback. Bumps access counters for page hits. |
 | `memory_recent` | read-only | Most-recently-updated `is_latest=1` pages. |
 | `memory_status` | read-only | Counts, paths, version. |
+| `memory_briefing` | read-only | Structured counts/activity/rules/slots/recent snapshot. |
+| `memory_explore` | read-only | LLM prose digest over the briefing snapshot, degrading to JSON without a provider. |
 | `memory_handoff_begin` | destructive | Open a handoff for the next agent. |
 | `memory_handoff_accept` | destructive | Fetch + ack the latest open handoff (auto-cwd-matched). |
 | `memory_consolidate` | destructive | LLM-driven page rewrite. `multi_page=true` for atomic fan-out. |
 | `memory_forget_sweep` | destructive | M8 retention pass. `dry_run=true` for preview. |
 | `memory_lint` | destructive | Rule-based + LLM contradiction findings → `wiki/_lint/`. |
+| `memory_install_self_routing` | read-only | Return the canonical routing snippet for CLAUDE.md / AGENTS.md. |
 
 All MCP tools carry `readOnlyHint` / `destructiveHint` annotations so
 the calling agent can pick safely. Parameter aliases (`query|q|search`,

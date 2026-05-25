@@ -71,7 +71,7 @@ priors are at the [bottom](#influences-and-prior-art).
   terminal) - FTS5 over the wiki. Pages are LLM-consolidated, so
   the hit is a coherent decision page, not a raw chat log.
 - **"This new project has months of history before ai-memory."**
-  `cd ~/Projects/<that-project> && ai-memory bootstrap` collects
+  `cd /path/to/my-project && ai-memory bootstrap` collects
   `git log`, README, `docs/`, module headers, project rules and
   one-shot-summarises them into seed wiki pages. Future sessions
   build on top.
@@ -185,6 +185,13 @@ seven keys ai-memory owns and leaves every other hook the user has
 wired up alone. Set `AI_MEMORY_NO_VERSION_CHECK=1` to silence the
 daily check, or `AI_MEMORY_WRAPPER_URL=<url>` to pin the self-upgrade
 source (e.g. a fork or a tagged release).
+
+After the upgraded server starts, ai-memory applies SQLite schema
+migrations automatically (`Store::open`) and runs pending wiki-structure
+migrations before the watcher starts. No manual database reset or wiki
+rewrite is required for normal upgrades; derived indexes such as FTS
+tables are rebuilt/backfilled by migrations or the watcher reconciliation
+path.
 
 > **If your server runs on a different host** (scenarios C/D), `ai-memory upgrade`
 > only refreshes the local wrapper, your local image, and your hook scripts. You
@@ -476,7 +483,7 @@ snippet is installed (see "Nudge the agent" below):
 
 | You say… | Agent calls… | Effect |
 |---|---|---|
-| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 over consolidated wiki pages; returns ranked snippets with `<mark>`-highlighted hits. |
+| "Have we discussed X?" / "search memory for Y" | `memory_query` | FTS5 + link-neighbour RRF over compiled wiki pages, optional vector RRF, and bounded raw observation fallback when pages miss. |
 | (before proposing architecture) implicit | `memory_query` | The routing snippet tells the agent to check prior decisions / gotchas before proposing anything, so you don't get contradicted-by-its-own-history suggestions. |
 | "Catch me up" / "I've been away" | `memory_explore` | Prose digest. Verbosity auto-scales to time-since-last-activity: < 1 h → one line, > 30 days → full catchup. |
 | "Where did we leave off?" | (handoff already prepended) | SessionStart hook already prepended the handoff before your first prompt; the agent just reads from that block. |
@@ -656,8 +663,8 @@ OPENAI_API_KEY=ollama-local
 ```
 
 Skipping the embedding provider entirely is fine -
-`memory_query` falls back to pure FTS5 (BM25) and still
-works; you just lose vector re-ranking.
+`memory_query` still uses FTS5, link-neighbour expansion, and raw
+fallback; you just lose vector re-ranking.
 
 Per-tier feature breakdown + the openai-compat / Ollama setup
 is in [`docs/install.md`](docs/install.md#llm-provider-tiers).
@@ -682,10 +689,12 @@ ingress. The server queues writes through a single SQLite writer
 (no `database is locked`). On session end an optional LLM-driven pass
 rewrites pages atomically with supersession (`is_latest=false` +
 `supersedes` chain) and opens a typed handoff for the next agent.
-The retention sweep decays unused episodic content while semantic
-concept pages compound forever; pinned pages are exempt. Retrieval
-is FTS5 by default; when an embedder is configured, hybrid RRF over
-`page_embeddings` joins the FTS5 ranks.
+The scheduled retention sweep decays unused episodic content while
+semantic concept pages compound forever; pinned pages and `_slots/`
+memory slots are exempt. Retrieval is FTS5 + link-neighbour RRF by
+default; when an embedder is configured, vector RRF over
+`page_embeddings` joins the ranks. If compiled wiki search misses,
+bounded raw observation FTS provides exact-detail fallback.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the canonical
 data-flow diagram + crate breakdown + cross-cutting invariants.

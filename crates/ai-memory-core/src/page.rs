@@ -50,6 +50,11 @@ pub struct NewPage {
     pub frontmatter_json: serde_json::Value,
     /// `true` to mark the page as user-pinned (never decay).
     pub pinned: bool,
+    /// Outgoing links discovered in the page body.
+    ///
+    /// The store resolves these against the latest page rows in the same
+    /// project and keeps unresolved forward links as `to_page_id = NULL`.
+    pub links: Vec<PagePath>,
 }
 
 /// Materialised view of a page row.

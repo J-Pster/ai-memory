@@ -6,6 +6,8 @@
 //! basic-memory hit (#528). Going through `serde_yaml` directly keeps the
 //! round-trip predictable.
 
+use std::collections::BTreeSet;
+
 use ai_memory_core::PagePath;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +102,150 @@ pub fn derive_title(frontmatter: &serde_json::Value, body: &str, path: &PagePath
     stem.strip_suffix(".md").unwrap_or(stem).to_string()
 }
 
+/// Extract internal wiki links from a markdown body.
+///
+/// Supports `[[wiki links]]`, `[[wiki links|labels]]`, and ordinary
+/// markdown links such as `[label](../decisions/foo.md#anchor)`. External
+/// URLs, anchors, images, and non-markdown assets are ignored. Returned
+/// paths are normalised to wiki-root-relative [`PagePath`] values.
+#[must_use]
+pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<PagePath> {
+    let mut out = BTreeSet::new();
+    let mut in_fence = false;
+
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        extract_wikilinks(line, page_path, &mut out);
+        extract_markdown_links(line, page_path, &mut out);
+    }
+
+    out.into_iter()
+        .filter_map(|path| PagePath::new(path).ok())
+        .collect()
+}
+
+fn extract_wikilinks(line: &str, page_path: &PagePath, out: &mut BTreeSet<String>) {
+    let mut rest = line;
+    while let Some(start) = rest.find("[[") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("]]") else {
+            break;
+        };
+        let raw = &after_start[..end];
+        if let Some(path) = normalize_link_target(raw, page_path, true) {
+            out.insert(path);
+        }
+        rest = &after_start[end + 2..];
+    }
+}
+
+fn extract_markdown_links(line: &str, page_path: &PagePath, out: &mut BTreeSet<String>) {
+    let mut start_at = 0;
+    while let Some(rel_start) = line[start_at..].find('[') {
+        let start = start_at + rel_start;
+        if start > 0 && line.as_bytes()[start - 1] == b'!' {
+            start_at = start + 1;
+            continue;
+        }
+        let after_start = start + 1;
+        let Some(rel_close) = line[after_start..].find(']') else {
+            break;
+        };
+        let close = after_start + rel_close;
+        if !line[close + 1..].starts_with('(') {
+            start_at = close + 1;
+            continue;
+        }
+        let target_start = close + 2;
+        let Some(rel_end) = line[target_start..].find(')') else {
+            break;
+        };
+        let target_end = target_start + rel_end;
+        let raw = &line[target_start..target_end];
+        if let Some(path) = normalize_link_target(raw, page_path, false) {
+            out.insert(path);
+        }
+        start_at = target_end + 1;
+    }
+}
+
+fn normalize_link_target(raw: &str, page_path: &PagePath, wikilink: bool) -> Option<String> {
+    let target = raw
+        .split_once('|')
+        .map_or(raw, |(path, _)| path)
+        .trim()
+        .trim_matches('<')
+        .trim_matches('>');
+    if target.is_empty() || target.starts_with('#') || target.contains("://") {
+        return None;
+    }
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("mailto:")
+        || lower.starts_with("data:")
+        || lower.starts_with("javascript:")
+        || lower.starts_with("tel:")
+    {
+        return None;
+    }
+
+    let target = target.split_once('#').map_or(target, |(path, _)| path);
+    let target = target
+        .split_once('?')
+        .map_or(target, |(path, _)| path)
+        .trim();
+    if target.is_empty() || target.contains('\\') {
+        return None;
+    }
+
+    let mut target = target.to_string();
+    let last_segment = target.rsplit_once('/').map_or(target.as_str(), |(_, s)| s);
+    if last_segment.contains('.') {
+        if !target.ends_with(".md") {
+            return None;
+        }
+    } else if wikilink || !last_segment.is_empty() {
+        target.push_str(".md");
+    }
+
+    resolve_relative(page_path, &target, wikilink)
+}
+
+fn resolve_relative(page_path: &PagePath, target: &str, root_relative: bool) -> Option<String> {
+    let mut parts: Vec<&str> = if root_relative || target.starts_with('/') {
+        Vec::new()
+    } else {
+        page_path
+            .as_str()
+            .rsplit_once('/')
+            .map_or_else(Vec::new, |(dir, _)| {
+                dir.split('/').filter(|part| !part.is_empty()).collect()
+            })
+    };
+
+    for part in target.trim_start_matches('/').split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +326,28 @@ mod tests {
             derive_title(&serde_json::Value::Null, "no heading", &path),
             "foo"
         );
+    }
+
+    #[test]
+    fn extracts_internal_wiki_and_markdown_links() {
+        let path = PagePath::new("concepts/current.md").unwrap();
+        let body = "See [[decisions/0001-single-sqlite-file|SQLite]] and \
+                    [gotcha](../gotchas/hooks.md#details). Also \
+                    [external](https://example.com) and ![image](../img/logo.png).";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(PagePath::as_str).collect();
+        assert_eq!(
+            paths,
+            vec!["decisions/0001-single-sqlite-file.md", "gotchas/hooks.md"]
+        );
+    }
+
+    #[test]
+    fn extract_links_ignores_fenced_code_blocks() {
+        let path = PagePath::new("notes/a.md").unwrap();
+        let body = "```\n[[notes/ignored]]\n```\n[[notes/kept]]\n";
+        let links = extract_links(body, &path);
+        let paths: Vec<&str> = links.iter().map(PagePath::as_str).collect();
+        assert_eq!(paths, vec!["notes/kept.md"]);
     }
 }

@@ -35,6 +35,7 @@ fn new_page(
         tier: Tier::Semantic,
         frontmatter_json: serde_json::json!({"kind": "fact"}),
         pinned: false,
+        links: Vec::new(),
     }
 }
 

@@ -237,11 +237,11 @@ ai-memory purge-project --project experimental --confirm
 # Sibling projects (ai-memory, distrobox-gaming, …) untouched.
 ```
 
-### "Rename a project after `mv ~/Projects/old ~/Projects/new`"
+### "Rename a project after moving its directory"
 
 ```bash
 ai-memory rename-project --from old --to new
-# Future sessions in ~/Projects/new will append to the same project
+# Future sessions in /path/to/new will append to the same project
 # (the hook router stamps by basename(cwd) = "new"); past
 # observations stay under that project too because the project_id
 # is stable.

@@ -1,8 +1,8 @@
 # agentmemory - Research Report
 
-> Source project: `~/Projects/agentmemory` (TypeScript, MCP server built on `iii-engine`).
-> This is the user's own existing project. The Rust effort in this repo is a
-> spiritual successor: keep the *ideas*, replace the *substrate*.
+> Source project: `rohitg00/agentmemory` (TypeScript, MCP server built on `iii-engine`).
+> This repo builds on that earlier TypeScript project: keep the *ideas*, replace
+> the *substrate*.
 
 ## 1. Purpose & Scope
 

@@ -4,9 +4,11 @@
 //! the writer thread would violate the single-writer invariant (see
 //! [`crate::writer`]).
 
+use std::collections::BTreeSet;
+
 use ai_memory_core::{
     AgentKind, HandoffId, NewHandoff, NewObservation, NewPage, NewSession, ObservationId,
-    ObservationKind, PageId, ProjectId, SessionId, WorkspaceId,
+    ObservationKind, PageId, PagePath, ProjectId, SessionId, WorkspaceId,
 };
 
 /// Summary returned by [`reorg_sessions`] and exposed via
@@ -175,7 +177,10 @@ fn upsert_page_in_tx(
                 "UPDATE pages SET updated_at = ?1 WHERE id = ?2",
                 params![now, existing_id],
             )?;
-            return PageId::from_slice(&existing_id).map_err(StoreError::from);
+            let existing_page_id = PageId::from_slice(&existing_id).map_err(StoreError::from)?;
+            replace_links_in_tx(tx, &existing_page_id, page)?;
+            refresh_incoming_links_for_path(tx, page, &existing_page_id)?;
+            return Ok(existing_page_id);
         }
         let new_id = PageId::new();
         tx.execute(
@@ -202,6 +207,8 @@ fn upsert_page_in_tx(
                 now,
             ],
         )?;
+        replace_links_in_tx(tx, &new_id, page)?;
+        refresh_incoming_links_for_path(tx, page, &new_id)?;
         audit(
             tx,
             "supersede_page",
@@ -232,6 +239,8 @@ fn upsert_page_in_tx(
             now,
         ],
     )?;
+    replace_links_in_tx(tx, &new_id, page)?;
+    refresh_incoming_links_for_path(tx, page, &new_id)?;
     audit(
         tx,
         "create_page",
@@ -241,6 +250,79 @@ fn upsert_page_in_tx(
         now,
     )?;
     Ok(new_id)
+}
+
+fn replace_links_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    from_page_id: &PageId,
+    page: &NewPage,
+) -> StoreResult<()> {
+    tx.execute(
+        "DELETE FROM links WHERE from_page_id = ?1",
+        params![from_page_id.as_bytes()],
+    )?;
+
+    let mut seen = BTreeSet::new();
+    for to_path in &page.links {
+        if !seen.insert(to_path.as_str().to_string()) {
+            continue;
+        }
+        let to_page_id = latest_page_id_for_path(tx, page, to_path)?;
+        let to_page_blob = to_page_id.as_ref().map(|id| &id.as_bytes()[..]);
+        tx.execute(
+            "INSERT INTO links (from_page_id, to_page_id, to_path, link_type) \
+             VALUES (?1, ?2, ?3, 'references')",
+            params![from_page_id.as_bytes(), to_page_blob, to_path.as_str()],
+        )?;
+    }
+    Ok(())
+}
+
+fn latest_page_id_for_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+    to_path: &PagePath,
+) -> StoreResult<Option<PageId>> {
+    let bytes: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT id FROM pages \
+             WHERE workspace_id = ?1 AND project_id = ?2 AND path = ?3 AND is_latest = 1",
+            params![
+                page.workspace_id.as_bytes(),
+                page.project_id.as_bytes(),
+                to_path.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    bytes
+        .map(|bytes| PageId::from_slice(&bytes).map_err(StoreError::from))
+        .transpose()
+}
+
+fn refresh_incoming_links_for_path(
+    tx: &rusqlite::Transaction<'_>,
+    page: &NewPage,
+    latest_page_id: &PageId,
+) -> StoreResult<()> {
+    tx.execute(
+        "UPDATE links \
+         SET to_page_id = ?1 \
+         WHERE to_path = ?2 \
+           AND EXISTS ( \
+               SELECT 1 FROM pages from_page \
+               WHERE from_page.id = links.from_page_id \
+                 AND from_page.workspace_id = ?3 \
+                 AND from_page.project_id = ?4 \
+           )",
+        params![
+            latest_page_id.as_bytes(),
+            page.path.as_str(),
+            page.workspace_id.as_bytes(),
+            page.project_id.as_bytes(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Begin (or re-affirm) a session row keyed on the caller-supplied id.
@@ -749,6 +831,7 @@ mod tests {
             tier: Tier::Semantic,
             frontmatter_json: serde_json::json!({}),
             pinned: false,
+            links: Vec::new(),
         }
     }
 
@@ -814,6 +897,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 1, "no duplicate row for unchanged content");
+    }
+
+    #[test]
+    fn upsert_page_persists_and_resolves_links() {
+        let (_tmp, mut conn, ws, proj) = fresh_db();
+        let mut source = page(ws, proj, "concepts/source.md", "see target");
+        source.links = vec![PagePath::new("decisions/target.md").unwrap()];
+        let source_id = upsert_page(&mut conn, &source).unwrap();
+
+        let unresolved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM links \
+                 WHERE from_page_id = ?1 AND to_path = ?2 AND to_page_id IS NULL",
+                params![source_id.as_bytes(), "decisions/target.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 1, "forward link should persist unresolved");
+
+        let target_id = upsert_page(
+            &mut conn,
+            &page(ws, proj, "decisions/target.md", "target body"),
+        )
+        .unwrap();
+
+        let resolved: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT to_page_id FROM links WHERE from_page_id = ?1 AND to_path = ?2",
+                params![source_id.as_bytes(), "decisions/target.md"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some(&target_id.as_bytes()[..]));
     }
 
     /// Handoff state machine: insert → Open; accept_handoff → Accepted

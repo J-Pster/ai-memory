@@ -5,14 +5,14 @@
 //! the store directly — the server is the source of truth.
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::StatusArgs;
 use crate::config::Config;
 use crate::http_client::{ServerEndpoint, get_json};
 
 /// Server-shaped response. Mirrors `ai_memory_mcp::admin::StatusReport`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Report {
     /// Server binary version.
     version: String,
@@ -24,14 +24,39 @@ struct Report {
     db_path: String,
     /// Lifetime counts.
     counts: Counts,
+    /// Derived-index diagnostics.
+    #[serde(default)]
+    derived: Derived,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Counts {
     pages_latest: u64,
     pages_all: u64,
     sessions: u64,
     observations: u64,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Derived {
+    pages_rows: u64,
+    pages_fts_rows: u64,
+    observations_rows: u64,
+    observations_fts_rows: u64,
+    latest_pages_missing_embeddings: u64,
+    embedding_rows: u64,
+    embedding_triples: Vec<EmbeddingTriple>,
+    links_from_latest_pages: u64,
+    unresolved_links_from_latest_pages: u64,
+    stale_links_from_latest_pages: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EmbeddingTriple {
+    provider: String,
+    model: String,
+    dim: u32,
+    count: u64,
 }
 
 /// Run the `status` subcommand.
@@ -57,6 +82,7 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
                     "sessions": report.counts.sessions,
                     "observations": report.counts.observations,
                 },
+                "derived": report.derived,
                 "client": { "server_url": ep.url, "auth": ep.auth_token.is_some() },
             }))?
         );
@@ -72,6 +98,23 @@ pub async fn run(config: &Config, args: StatusArgs) -> Result<()> {
         );
         println!("  sessions:     {}", report.counts.sessions);
         println!("  observations: {}", report.counts.observations);
+        println!(
+            "  fts:          pages {}/{}; observations {}/{}",
+            report.derived.pages_fts_rows,
+            report.derived.pages_rows,
+            report.derived.observations_fts_rows,
+            report.derived.observations_rows
+        );
+        println!(
+            "  embeddings:   {} rows; {} latest pages missing",
+            report.derived.embedding_rows, report.derived.latest_pages_missing_embeddings
+        );
+        println!(
+            "  links:        {} latest-page links (unresolved: {}, stale: {})",
+            report.derived.links_from_latest_pages,
+            report.derived.unresolved_links_from_latest_pages,
+            report.derived.stale_links_from_latest_pages
+        );
     }
     Ok(())
 }

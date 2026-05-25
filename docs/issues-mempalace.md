@@ -1,9 +1,9 @@
 # MemPalace - Issue & Architecture Synthesis
 
-> Source: GitHub `MemPalace/mempalace` + local checkout at `~/Projects/mempalace`.
+> Source: GitHub `MemPalace/mempalace`.
 > Captured 2026-05-24. Repo: 52.7k stars, MIT, Python, created 2026-04-05,
-> v3.3.5, 241 open issues, ~1600 PRs in ~7 weeks. Extremely active, unusually
-> transparent maintainers (see `docs/HISTORY.md` — they publicly retract
+> v3.3.5, 241 open issues, ~1600 PRs in ~7 weeks. The maintainers publish
+> unusually candid history notes (see `docs/HISTORY.md` — they publicly retract
 > overclaims). Dominant themes: **ChromaDB/HNSW/FTS5 corruption under
 > concurrent writes**, **silent persistence failures**, **repair tooling that
 > destroys data**, **embedding-model drift**.

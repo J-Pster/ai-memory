@@ -52,6 +52,7 @@ async fn seed_page(store: &Store, title: &str, path: &str, body: &str) {
         tier: Tier::Semantic,
         frontmatter_json: serde_json::json!({}),
         pinned: false,
+        links: Vec::new(),
     };
     store.writer.upsert_page(page).await.unwrap();
 }
@@ -102,6 +103,14 @@ async fn status_returns_counts_and_paths() {
     assert!(body["db_path"].as_str().unwrap().ends_with(".sqlite"));
     assert_eq!(body["counts"]["pages_latest"].as_u64().unwrap(), 1);
     assert_eq!(body["counts"]["pages_all"].as_u64().unwrap(), 1);
+    assert_eq!(body["derived"]["pages_rows"].as_u64().unwrap(), 1);
+    assert_eq!(body["derived"]["pages_fts_rows"].as_u64().unwrap(), 1);
+    assert_eq!(
+        body["derived"]["latest_pages_missing_embeddings"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -154,6 +154,13 @@ struct QueryResponse<T: Serialize> {
 }
 
 #[derive(Debug, Serialize)]
+struct MemoryQueryResponse {
+    hits: Vec<ai_memory_store::PageHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    raw_hits: Vec<ai_memory_store::ObservationHit>,
+}
+
+#[derive(Debug, Serialize)]
 struct StatusResponse {
     counts: ai_memory_store::StatusCounts,
 }
@@ -371,22 +378,25 @@ impl AiMemoryServer {
         self
     }
 
-    /// Full-text search the wiki via FTS5. Returns up to `limit` hits with
-    /// HTML-marked snippets and a rank score.
+    /// Search the compiled wiki via FTS5/vector/graph retrieval. Falls back
+    /// to bounded raw observation search when no compiled page matches.
     #[tool(description = "Search the project's long-term memory wiki — \
         prior sessions, decisions, gotchas, architecture notes captured \
         by ai-memory across earlier runs. Call this BEFORE proposing \
         designs, BEFORE answering 'why does X work this way', and \
         whenever the user references prior work you don't recognise. \
-        FTS5 + (when configured) hybrid RRF re-ranking. Returns up to \
-        `limit` pages with HTML-marked snippets and a rank score \
-        (lower rank = better match). Only latest page versions.")]
+        FTS5 + graph RRF + (when configured) vector RRF re-ranking. \
+        Returns up to `limit` pages with HTML-marked snippets and a rank \
+        score (lower rank = better match). Only latest page versions. \
+        If compiled wiki search misses, `raw_hits` contains bounded raw \
+        observation fallback matches.")]
     async fn memory_query(
         &self,
         Parameters(args): Parameters<QueryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let limit = args.limit.unwrap_or(self.default_limit).clamp(1, 100);
         let (ws, proj) = self.effective_ids(args.project.as_deref()).await;
+        let query = args.query.clone();
         // Hybrid path: try to embed the query; if it fails (provider
         // outage, cold-start timeout, billing, etc.) degrade to BM25
         // instead of erroring the whole query — losing semantic
@@ -398,7 +408,7 @@ impl AiMemoryServer {
                         .hybrid_search(
                             ws,
                             proj,
-                            args.query.clone(),
+                            query.clone(),
                             Some(qv),
                             embedder.provider().to_string(),
                             embedder.model().to_string(),
@@ -415,18 +425,44 @@ impl AiMemoryServer {
                         "embedder failed; degrading memory_query to BM25-only"
                     );
                     self.reader
-                        .search_pages_for_project(ws, proj, args.query, limit)
+                        .hybrid_search(
+                            ws,
+                            proj,
+                            query.clone(),
+                            None,
+                            String::new(),
+                            String::new(),
+                            0,
+                            limit,
+                        )
                         .await
                 }
             }
         } else {
             self.reader
-                .search_pages_for_project(ws, proj, args.query, limit)
+                .hybrid_search(
+                    ws,
+                    proj,
+                    query.clone(),
+                    None,
+                    String::new(),
+                    String::new(),
+                    0,
+                    limit,
+                )
                 .await
         };
         let hits = hits.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.spawn_access_bump(hits.iter().map(|h| h.id).collect());
-        let response = QueryResponse { hits };
+        let raw_hits = if hits.is_empty() {
+            self.reader
+                .search_observations_for_project(ws, proj, query, limit)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?
+        } else {
+            Vec::new()
+        };
+        let response = MemoryQueryResponse { hits, raw_hits };
         ok_json(&response)
     }
 
@@ -920,7 +956,7 @@ const EXPLORE_SYSTEM_PROMPT: &str = include_str!("../prompts/explore_system.md")
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{NewPage, PagePath, Tier};
+    use ai_memory_core::{NewObservation, NewPage, NewSession, ObservationKind, PagePath, Tier};
     use ai_memory_store::Store;
     use tempfile::TempDir;
 
@@ -948,6 +984,7 @@ mod tests {
                 tier: Tier::Semantic,
                 frontmatter_json: serde_json::json!({}),
                 pinned: false,
+                links: Vec::new(),
             })
             .await
             .unwrap();
@@ -1020,6 +1057,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_query_returns_raw_hits_when_pages_miss() {
+        let (_tmp, store, server, ws, proj) = setup_server().await;
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::OpenCode,
+                cwd: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(NewObservation {
+                session_id,
+                workspace_id: ws,
+                project_id: proj,
+                kind: ObservationKind::UserPrompt,
+                title: "raw prompt".into(),
+                body: "raw fallback contains quokka only detail".into(),
+                importance: 5,
+            })
+            .await
+            .unwrap();
+
+        let result = server
+            .memory_query(Parameters(QueryArgs {
+                query: "quokka".into(),
+                limit: Some(5),
+                project: None,
+            }))
+            .await
+            .unwrap();
+        let text = match result.content.first().and_then(|c| c.as_text()) {
+            Some(t) => t.text.clone(),
+            None => panic!("expected text content"),
+        };
+        assert!(
+            text.contains("\"hits\": []"),
+            "expected no page hits; got {text}"
+        );
+        assert!(
+            text.contains("raw_hits"),
+            "expected raw fallback; got {text}"
+        );
+        assert!(text.contains("quokka"), "expected raw snippet; got {text}");
+    }
+
+    #[tokio::test]
     async fn memory_status_returns_counts() {
         let (_tmp, _store, server, _ws, _pj) = setup_server().await;
         let result = server
@@ -1060,12 +1149,13 @@ mod tests {
             "\"last_observation_at\":",
             "\"pending_handoff_count\":",
             "\"rules\":",
+            "\"slots\":",
             "\"recent_pages\":",
         ] {
             assert!(text.contains(key), "missing {key} in briefing:\n{text}");
         }
         // setup_server inserts one page, no sessions/observations,
-        // no rules. The activity windows therefore observe zero.
+        // no rules/slots. The activity windows therefore observe zero.
         assert!(
             text.contains("\"sessions\": 0"),
             "expected lifetime sessions: 0\n{text}"

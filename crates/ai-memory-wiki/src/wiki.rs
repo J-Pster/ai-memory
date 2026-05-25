@@ -10,7 +10,7 @@ use ai_memory_store::{WriterHandle, f32_vec_to_bytes};
 use crate::atomic;
 use crate::error::WikiResult;
 use crate::git::GitAdapter;
-use crate::markdown::{Markdown, derive_title, emit, parse};
+use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
 
 /// Wiki filesystem handle.
 ///
@@ -67,10 +67,12 @@ impl Wiki {
         self
     }
 
-    /// Attach an embedder. When set, every successful `write_page` /
-    /// `apply_batch` also computes + stores an embedding for the new
-    /// version. Without this, vector search is unavailable and
-    /// `ReaderPool::hybrid_search` falls back to pure FTS5.
+    /// Attach an embedder. When set, `write_page` computes + stores an
+    /// embedding for the new version synchronously. `apply_batch` keeps
+    /// the SQL/file fan-out atomic and leaves vector completeness to
+    /// admin or scheduled embedding backfill. Without an embedder,
+    /// vector search is skipped and `ReaderPool::hybrid_search` uses
+    /// FTS5 + graph expansion.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -189,6 +191,8 @@ impl Wiki {
     ) -> WikiResult<PageId> {
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
+        let links = extract_links(&md.body, &path);
+        let pinned = is_slot_path(&path);
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -199,7 +203,8 @@ impl Wiki {
                 body: md.body,
                 tier: Tier::Semantic,
                 frontmatter_json: md.frontmatter,
-                pinned: false,
+                pinned,
+                links,
             })
             .await?;
         Ok(id)
@@ -263,7 +268,8 @@ impl Wiki {
                 body: req.body.clone(),
                 tier: req.tier,
                 frontmatter_json: req.frontmatter.clone(),
-                pinned: req.pinned,
+                pinned: req.pinned || is_slot_path(&req.path),
+                links: extract_links(&req.body, &req.path),
             })
             .collect();
 
@@ -310,6 +316,8 @@ impl Wiki {
             .clone()
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&frontmatter, &body, &path));
+        let links = extract_links(&body, &path);
+        let pinned = pinned || is_slot_path(&path);
         let markdown = Markdown {
             frontmatter: frontmatter.clone(),
             body: body.clone(),
@@ -332,6 +340,7 @@ impl Wiki {
                 tier,
                 frontmatter_json: frontmatter,
                 pinned,
+                links,
             })
             .await?;
         // Embed if configured. We do this on the caller's task so the
@@ -387,6 +396,10 @@ pub struct WritePageRequest {
 
 fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
     crate::WikiError::Io(std::io::Error::other(msg.to_string()))
+}
+
+fn is_slot_path(path: &PagePath) -> bool {
+    path.as_str().starts_with("_slots/")
 }
 
 #[cfg(test)]
@@ -548,6 +561,37 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(!hits[0].snippet.contains("sk-ant-leak"));
         assert!(!hits[0].snippet.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn slot_pages_are_pinned_automatically() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "_slots/current_focus.md",
+            "Keep this tiny and durable.",
+            serde_json::json!({ "title": "Current focus", "kind": "slot" }),
+        ))
+        .await
+        .unwrap();
+
+        let candidates = store.reader.decay_candidates(ws, proj).await.unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].pinned, "slot pages should be decay-immune");
     }
 
     #[tokio::test]

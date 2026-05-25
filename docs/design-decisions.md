@@ -57,7 +57,7 @@ Three options surveyed:
 
 ## 4. Database choice - single SQLite file
 
-**Decision: one SQLite file with FTS5 + `sqlite-vec` extension + JSON columns for graph edges.**
+**Decision: one SQLite file with FTS5, packed-vector embeddings, and SQL tables for graph edges.**
 
 Why not Postgres/pgvector? Cognee's #2717 and basic-memory's #830/#831 show Postgres is a real-deployment-only pain. v1 ships embedded.
 
@@ -66,13 +66,13 @@ Why not LanceDB/Qdrant/Kuzu/CozoDB/SurrealDB?
 - Kuzu / Ladybug: cognee #2098/#2768 (upstream archived, fork-risk realized).
 - CozoDB: small bus factor.
 - SurrealDB: heavy, multi-mode storage; we'd inherit a lot of surface we don't need.
-- Embedded `sqlite-vec` is well-maintained, single dependency, fits in one file with FTS5 + relational tables.
+- Packed vectors in SQLite keep v1 dependency-light; `sqlite-vec` remains the scale-up path once brute-force cosine stops being enough.
 
 **The graph is just SQL tables.** A `wiki_pages` table, a `wiki_links (from_id, to_id, link_type)` table, optional `wiki_concepts (page_id, concept)`. Graph queries are recursive CTEs in SQLite. Petgraph in-memory for batch traversals. Avoids the entire "embedded graph DB" footgun cognee fell into.
 
 **Crates** (research-backed picks):
-- `rusqlite` + `rusqlite-extension` for sqlite-vec loading. `bundled-sqlcipher` if we want encryption later.
-- `sqlx` for migrations (`sqlx::migrate!`). Async, type-checked.
+- `rusqlite` for embedded SQLite access. `bundled-sqlcipher` if we want encryption later.
+- `refinery` for SQL migrations.
 - `tantivy` *not* used initially - sqlite FTS5 is sufficient at the corpus sizes we expect (hundreds to low-thousands of pages per project). Revisit only if FTS5 ranking proves inadequate.
 - `petgraph` for in-memory graph algorithms during consolidation.
 

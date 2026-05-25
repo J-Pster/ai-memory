@@ -1,8 +1,9 @@
 //! Recall@5 eval harness.
 //!
 //! Loads a small hand-crafted corpus + a probe set, measures recall@5
-//! against both the pure-FTS5 path and the hybrid (FTS5 + RRF + vector)
-//! path, and asserts a baseline. The point is *the framework*: once the
+//! against both the pure-FTS5 path and the hybrid (FTS5 + graph RRF +
+//! vector) path, and asserts a baseline. It also pins graph-neighbor
+//! expansion and raw observation fallback. The point is *the framework*: once the
 //! harness is in CI, anyone can drop in real embeddings (set the
 //! `AI_MEMORY_EMBEDDING_PROVIDER` env vars + plug in a real model) and
 //! watch the numbers move. The synthetic embedder shipped for tests is
@@ -15,7 +16,9 @@
 
 use std::sync::Arc;
 
-use ai_memory_core::{PagePath, Tier};
+use ai_memory_core::{
+    AgentKind, NewObservation, NewSession, ObservationKind, PagePath, SessionId, Tier,
+};
 use ai_memory_llm::{Embedder, SyntheticEmbedder};
 use ai_memory_store::Store;
 use ai_memory_wiki::{Wiki, WritePageRequest};
@@ -159,6 +162,139 @@ async fn recall_at_5_baseline() {
         hybrid_recall + 1e-6 >= fts_recall,
         "hybrid should never regress vs FTS5: FTS5={fts_recall:.3} hybrid={hybrid_recall:.3}",
     );
+}
+
+#[tokio::test]
+async fn graph_neighbor_expansion_recovers_linked_page() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let wiki = Wiki::new(tmp.path(), store.writer.clone()).expect("wiki");
+
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("notes/hidden_target.md").expect("path"),
+        frontmatter: serde_json::json!({"title": "Hidden target"}),
+        body: "This page contains implementation detail but not the seed term.".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+    })
+    .await
+    .expect("write target");
+    wiki.write_page(WritePageRequest {
+        workspace_id: ws,
+        project_id: proj,
+        path: PagePath::new("notes/source.md").expect("path"),
+        frontmatter: serde_json::json!({"title": "Source"}),
+        body: "graphseed points to [[notes/hidden_target]].".into(),
+        tier: Tier::Semantic,
+        pinned: false,
+        title: None,
+    })
+    .await
+    .expect("write source");
+
+    let fts_hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "graphseed".into(), 5)
+        .await
+        .expect("fts search");
+    assert!(
+        !fts_hits
+            .iter()
+            .any(|hit| hit.path.as_str() == "notes/hidden_target.md"),
+        "pure FTS should not find the target without the seed term"
+    );
+
+    let hybrid_hits = store
+        .reader
+        .hybrid_search(
+            ws,
+            proj,
+            "graphseed".into(),
+            None,
+            String::new(),
+            String::new(),
+            0,
+            5,
+        )
+        .await
+        .expect("hybrid search");
+    assert!(
+        hybrid_hits
+            .iter()
+            .any(|hit| hit.path.as_str() == "notes/hidden_target.md"),
+        "graph expansion should include the linked target"
+    );
+}
+
+#[tokio::test]
+async fn raw_observation_fallback_recovers_detail_when_wiki_misses() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = Store::open(tmp.path()).expect("open store");
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .expect("ws");
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "eval", None)
+        .await
+        .expect("proj");
+    let session_id = SessionId::new();
+
+    store
+        .writer
+        .begin_session(NewSession {
+            id: session_id,
+            workspace_id: ws,
+            project_id: proj,
+            agent_kind: AgentKind::OpenCode,
+            cwd: None,
+        })
+        .await
+        .expect("begin session");
+    store
+        .writer
+        .insert_observation(NewObservation {
+            session_id,
+            workspace_id: ws,
+            project_id: proj,
+            kind: ObservationKind::UserPrompt,
+            title: "raw prompt".into(),
+            body: "raw fallback detail mentions capybara exactly once".into(),
+            importance: 5,
+        })
+        .await
+        .expect("insert observation");
+
+    let page_hits = store
+        .reader
+        .search_pages_for_project(ws, proj, "capybara".into(), 5)
+        .await
+        .expect("page search");
+    assert!(page_hits.is_empty(), "compiled wiki should miss");
+
+    let raw_hits = store
+        .reader
+        .search_observations_for_project(ws, proj, "capybara".into(), 5)
+        .await
+        .expect("raw search");
+    assert_eq!(raw_hits.len(), 1);
+    assert_eq!(raw_hits[0].session_id, session_id);
+    assert!(raw_hits[0].snippet.contains("<mark>capybara</mark>"));
 }
 
 async fn measure_recall(

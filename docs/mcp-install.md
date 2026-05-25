@@ -235,8 +235,9 @@ You: List the MCP tools you can call. Use one of them to check
      ai-memory's status.
 
 Model (any client): I can call: memory_query, memory_recent,
-     memory_status, memory_handoff_accept, memory_handoff_begin,
-     memory_consolidate, memory_lint, memory_forget_sweep.
+     memory_status, memory_briefing, memory_explore,
+     memory_handoff_accept, memory_handoff_begin, memory_consolidate,
+     memory_lint, memory_forget_sweep, memory_install_self_routing.
      memory_status reports: 0 pages, 0 observations, 0 sessions.
 ```
 

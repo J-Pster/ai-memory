@@ -344,11 +344,11 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | Subcommand | Pattern | What it does |
 |---|---|---|
 | `serve` | `docker compose up -d` (already done) | Run the HTTP MCP server |
-| `status` | `docker exec` | Counts + paths + provider config |
-| `search "<query>"` | `docker exec` | FTS5 query against the wiki |
+| `status` | `docker exec` | Counts, paths, and derived-index diagnostics |
+| `search "<query>"` | `docker exec` | Wiki search with FTS5 + graph/vector RRF |
 | `write-page` | `docker exec` | Manual page write (atomic + indexed) |
 | `backup --to` / `restore --from` | `docker exec` | Snapshot or restore the data dir |
-| `forget-sweep` / `lint` / `embed` | `docker exec` | Periodic maintenance |
+| `forget-sweep` / `lint` / `embed` | `docker exec` | Manual maintenance; sweep + lint also run on the server schedule by default |
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
@@ -359,6 +359,12 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 
 Data dir inside the container is `/data` (mounted via the compose
 volume). Outside docker, override with `AI_MEMORY_DATA_DIR=/path`.
+
+Scheduled maintenance is configured in `[maintenance]` in `config.toml`.
+By default, rule-based lint and forget sweep run daily outside hook
+latency. Embedding backfill is supported but defaults to off because it
+can call a paid provider; enable it with
+`embedding_backfill_interval_secs` after configuring an embedder.
 
 ---
 

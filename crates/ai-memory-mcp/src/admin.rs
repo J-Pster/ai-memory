@@ -235,23 +235,32 @@ pub struct StatusReport {
     pub db_path: String,
     /// Lifetime counts: pages_latest, pages_all, sessions, observations.
     pub counts: ai_memory_store::StatusCounts,
+    /// Derived-index and retrieval-readiness diagnostics.
+    pub derived: ai_memory_store::DerivedIndexStatus,
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     match state.reader.status_counts().await {
-        Ok(counts) => {
-            let report = StatusReport {
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                data_dir: state.data_dir.display().to_string(),
-                bind: state.bind.clone(),
-                db_path: state.db_path.display().to_string(),
-                counts,
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-            )
-        }
+        Ok(counts) => match state.reader.derived_index_status().await {
+            Ok(derived) => {
+                let report = StatusReport {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    data_dir: state.data_dir.display().to_string(),
+                    bind: state.bind.clone(),
+                    db_path: state.db_path.display().to_string(),
+                    counts,
+                    derived,
+                };
+                (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+                )
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

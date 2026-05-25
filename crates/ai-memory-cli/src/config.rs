@@ -72,6 +72,8 @@ pub struct Config {
     /// hard-deletion. Tune `decay.lambda` down to slow decay or
     /// `decay.cold_threshold` to evict more / less aggressively.
     pub decay: ai_memory_store::DecayParams,
+    /// Server-side scheduled maintenance. Jobs run outside hook latency.
+    pub maintenance: MaintenanceSettings,
     /// Privacy-strip tuning. Built-in patterns always run; this section
     /// lets the operator extend or punch holes in them.
     pub sanitize: ai_memory_core::SanitizeConfig,
@@ -190,10 +192,37 @@ impl Default for Config {
             embedding_dim: None,
             embedding_base_url: None,
             decay: ai_memory_store::DecayParams::default(),
+            maintenance: MaintenanceSettings::default(),
             sanitize: ai_memory_core::SanitizeConfig::default(),
             auth: AuthSettings::default(),
             allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
             runtime_env: RuntimeEnv::default(),
+        }
+    }
+}
+
+/// `[maintenance]` scheduled server jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceSettings {
+    /// Master switch for scheduled jobs.
+    pub enabled: bool,
+    /// Interval for the retention forget sweep. `0` disables this job.
+    pub forget_sweep_interval_secs: u64,
+    /// Interval for rule-based wiki lint. `0` disables this job.
+    pub lint_interval_secs: u64,
+    /// Interval for embedding backfill. `0` disables this job.
+    /// Defaults to off because it may call a paid provider.
+    pub embedding_backfill_interval_secs: u64,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            forget_sweep_interval_secs: 86_400,
+            lint_interval_secs: 86_400,
+            embedding_backfill_interval_secs: 0,
         }
     }
 }
@@ -421,6 +450,10 @@ mod tests {
         assert_eq!(cfg.bind, DEFAULT_BIND);
         assert_eq!(cfg.server_url, DEFAULT_SERVER_URL);
         assert_eq!(cfg.log_level, "info");
+        assert!(cfg.maintenance.enabled);
+        assert_eq!(cfg.maintenance.forget_sweep_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.lint_interval_secs, 86_400);
+        assert_eq!(cfg.maintenance.embedding_backfill_interval_secs, 0);
     }
 
     #[test]
@@ -449,6 +482,10 @@ mod tests {
             r#"
             bind = "0.0.0.0:9999"
             log_level = "debug"
+
+            [maintenance]
+            enabled = false
+            lint_interval_secs = 3600
             "#,
         )
         .unwrap();
@@ -458,5 +495,7 @@ mod tests {
         let cfg = Config::load(Some(&cfg_path), Some(tmp.path().to_path_buf())).unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:9999");
         assert_eq!(cfg.log_level, "debug");
+        assert!(!cfg.maintenance.enabled);
+        assert_eq!(cfg.maintenance.lint_interval_secs, 3600);
     }
 }

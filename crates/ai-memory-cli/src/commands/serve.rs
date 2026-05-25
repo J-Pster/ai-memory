@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
-use ai_memory_consolidate::Consolidator;
+use ai_memory_consolidate::{Consolidator, run_lint, run_sweep};
 use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{HookState, hook_router};
 use ai_memory_llm::{Embedder, LlmProvider, build_embedder, build_provider};
 use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
-use ai_memory_store::{ReaderPool, Store};
+use ai_memory_store::{ReaderPool, Store, WriterHandle, f32_vec_to_bytes};
 use ai_memory_web;
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
@@ -26,7 +26,7 @@ use tracing::info;
 
 use crate::auth::{AuthState, require_bearer};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::Config;
+use crate::config::{Config, MaintenanceSettings};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
 /// agent's raw payload which can include a tool output excerpt
@@ -101,6 +101,17 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     let server = consolidator_setup.server;
     let consolidator = consolidator_setup.consolidator;
     let admin_llm = consolidator_setup.admin_llm;
+    let _maintenance_tasks = start_maintenance_scheduler(
+        config.maintenance.clone(),
+        store.reader.clone(),
+        store.writer.clone(),
+        wiki.clone(),
+        embedder.clone(),
+        admin_llm.clone(),
+        ws,
+        proj,
+        config.decay,
+    );
 
     match args.transport {
         TransportKind::Stdio => {
@@ -209,6 +220,183 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_maintenance_scheduler(
+    settings: MaintenanceSettings,
+    reader: ReaderPool,
+    writer: WriterHandle,
+    wiki: Wiki,
+    embedder: Option<Arc<dyn Embedder>>,
+    llm: Option<Arc<dyn LlmProvider>>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    decay: ai_memory_store::DecayParams,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    if !settings.enabled {
+        info!("scheduled maintenance disabled");
+        return Vec::new();
+    }
+
+    let forget_sweep_interval_secs = settings.forget_sweep_interval_secs;
+    let lint_interval_secs = settings.lint_interval_secs;
+    let embedding_backfill_interval_secs = settings.embedding_backfill_interval_secs;
+
+    let mut tasks = Vec::new();
+    if forget_sweep_interval_secs > 0 {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        tasks.push(tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
+            loop {
+                tokio::time::sleep(interval).await;
+                match run_sweep(&reader, &writer, workspace_id, project_id, &decay, false).await {
+                    Ok(report) => info!(
+                        evicted = report.evicted.len(),
+                        hard_deleted = report.hard_deleted,
+                        "scheduled forget sweep completed"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "scheduled forget sweep failed"),
+                }
+            }
+        }));
+    }
+
+    if lint_interval_secs > 0 {
+        let reader = reader.clone();
+        let wiki = wiki.clone();
+        let llm = llm.clone();
+        tasks.push(tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(lint_interval_secs);
+            loop {
+                tokio::time::sleep(interval).await;
+                match run_lint(
+                    &reader,
+                    &wiki,
+                    llm.as_ref(),
+                    workspace_id,
+                    project_id,
+                    false,
+                    false,
+                )
+                .await
+                {
+                    Ok(report) => info!(
+                        findings = report.findings.len(),
+                        "scheduled rule-based lint completed"
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "scheduled lint failed"),
+                }
+            }
+        }));
+    }
+
+    if embedding_backfill_interval_secs > 0 {
+        if let Some(embedder) = embedder {
+            let reader = reader.clone();
+            let writer = writer.clone();
+            let wiki = wiki.clone();
+            tasks.push(tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(embedding_backfill_interval_secs);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    match run_embedding_backfill(
+                        &reader,
+                        &writer,
+                        &wiki,
+                        &embedder,
+                        workspace_id,
+                        project_id,
+                    )
+                    .await
+                    {
+                        Ok((embedded, failed)) => {
+                            info!(embedded, failed, "scheduled embedding backfill completed")
+                        }
+                        Err(e) => tracing::warn!(error = %e, "scheduled embedding backfill failed"),
+                    }
+                }
+            }));
+        } else {
+            tracing::warn!(
+                "maintenance.embedding_backfill_interval_secs is set but no embedder is configured"
+            );
+        }
+    }
+
+    if tasks.is_empty() {
+        info!("scheduled maintenance enabled but all intervals are disabled");
+    } else {
+        info!(jobs = tasks.len(), "scheduled maintenance started");
+    }
+    tasks
+}
+
+async fn run_embedding_backfill(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    embedder: &Arc<dyn Embedder>,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> Result<(usize, usize)> {
+    let provider = embedder.provider().to_string();
+    let model = embedder.model().to_string();
+    let dim = embedder.dim();
+    let candidates = reader.decay_candidates(workspace_id, project_id).await?;
+    let already: std::collections::HashSet<_> = reader
+        .load_embeddings(
+            workspace_id,
+            project_id,
+            provider.clone(),
+            model.clone(),
+            dim,
+        )
+        .await?
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+
+    let mut embedded = 0usize;
+    let mut failed = 0usize;
+    for cand in candidates {
+        if already.contains(&cand.id) {
+            continue;
+        }
+        let md = match wiki.read_page(workspace_id, project_id, &cand.path) {
+            Ok(md) => md,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(path = %cand.path, error = %e, "scheduled embed: unreadable page");
+                continue;
+            }
+        };
+        let vec = match embedder.embed(&md.body).await {
+            Ok(vec) => vec,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(path = %cand.path, error = %e, "scheduled embed: provider failed");
+                continue;
+            }
+        };
+        if let Err(e) = writer
+            .store_embedding(
+                cand.id,
+                f32_vec_to_bytes(&vec),
+                provider.clone(),
+                model.clone(),
+                dim,
+            )
+            .await
+        {
+            failed += 1;
+            tracing::warn!(path = %cand.path, error = %e, "scheduled embed: store failed");
+            continue;
+        }
+        embedded += 1;
+    }
+    Ok((embedded, failed))
 }
 
 async fn configure_embedder(

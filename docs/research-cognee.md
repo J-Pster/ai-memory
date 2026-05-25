@@ -1,6 +1,6 @@
 # cognee - Research Report
 
-> Source project: `~/Projects/cognee` (Python, knowledge-graph + vector + relational, MCP server).
+> Source project: `topoteretes/cognee` (Python, knowledge-graph + vector + relational, MCP server).
 
 ## 1. Purpose & Scope
 

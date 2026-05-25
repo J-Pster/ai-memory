@@ -1,6 +1,6 @@
 # basic-memory - Research Report
 
-> Source project: `~/Projects/basic-memory` (Python, MCP-native, markdown-on-disk).
+> Source project: `basicmachines-co/basic-memory` (Python, MCP-native, markdown-on-disk).
 > Studied as inspiration *and* as the manual-write-note model we explicitly
 > diverge from.
 

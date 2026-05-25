@@ -225,6 +225,7 @@ async fn lint_dry_run_returns_lint_report_shape() {
             tier: Tier::Semantic,
             frontmatter_json: serde_json::json!({}),
             pinned: false,
+            links: Vec::new(),
         })
         .await
         .unwrap();
