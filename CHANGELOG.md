@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ai-memory uninstall` — removes ai-memory's hooks, MCP registration, and
+  CLAUDE.md/AGENTS.md instruction block across all detected agents (dry-run by
+  default; `--apply` to execute, with timestamped backups). `--purge-data`
+  wipes wiki/db/raw via the reset guard. `--only hooks|mcp|instructions` to
+  narrow. Docker/volume teardown is printed as a hint, not executed.
+
 ## [0.1.3] - 2026-05-24
 
 ### Added
