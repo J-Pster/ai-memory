@@ -188,8 +188,9 @@ rules into a project's `CLAUDE.md` / `AGENTS.md`. The narrow-surface
 discipline still holds — every new tool has to earn its slot — but the
 v1 count is 11, not 10.
 
-All MCP tools accept verbal-variance parameter aliases (`query|q|search`,
-`workspace|ws`) so the calling agent can phrase arguments naturally.
+MCP parameter aliases are intentionally sparse: `memory_query.query` accepts
+`q|search`, and limit fields accept `n` / `top_k` where shipped. Project and
+cwd parameters use their canonical names.
 
 ## CLI subcommand surface (17 commands)
 

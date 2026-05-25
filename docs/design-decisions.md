@@ -170,7 +170,9 @@ basic-memory has ~25 tools, agentmemory has 53. Both have user confusion as a re
 | `memory_lint` | Rule-based + optional LLM contradiction findings → `wiki/_lint/<date>.md` | destructive |
 | `memory_install_self_routing` | Returns the canonical CLAUDE.md / AGENTS.md routing block + per-agent filename hints | read-only |
 
-Tool param aliases: accept `query|q|search`, `project|workspace`, `dir|directory` - basic-memory's `AliasChoices` pattern works for LLM resilience.
+Tool param aliases stay narrow: shipped aliases cover `query|q|search` and
+`limit|n|top_k`; project and cwd parameters use canonical names unless the
+code adds a concrete alias.
 
 ## 11. Identity & project scoping (3-tuple from day one)
 
