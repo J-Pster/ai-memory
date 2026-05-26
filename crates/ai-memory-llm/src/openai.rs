@@ -346,6 +346,32 @@ impl OpenAiProvider {
 fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
+            // OpenAI's structured-output validator rejects any sibling
+            // keyword next to `$ref` with a 400 (per JSON Schema 2020-12
+            // §8.2.3.1, $ref siblings are ignored during validation —
+            // OpenAI hardens that into a hard error). schemars 1.x emits
+            // a field-level `description` next to `$ref` for every
+            // doc-commented field typed as an external enum (e.g.
+            // `tier: Tier` on `ConsolidatedPageUpdate`); without this
+            // strip, `memory_consolidate multi_page=true` 400s on every
+            // call. Dropping the siblings is semantically a no-op —
+            // only the documentation-only annotation is lost; the
+            // type's own description on the referenced `$defs` entry
+            // is what reaches the model.
+            if map.contains_key("$ref") {
+                map.retain(|k, _| k == "$ref");
+                return;
+            }
+            // OpenAI strict mode rejects `oneOf` outright but accepts
+            // `anyOf`. schemars 1.x emits `oneOf` for every Rust enum
+            // with tagged variants (closed sets where exactly one
+            // branch matches), e.g. `Tier` and `PageKind` under `$defs`
+            // in `ConsolidatedBatch`. For non-overlapping branches the
+            // rewrite is semantically lossless and unblocks every
+            // structured-output call that touches an enum.
+            if let Some(one_of) = map.remove("oneOf") {
+                map.insert("anyOf".to_string(), one_of);
+            }
             let is_object = map
                 .get("type")
                 .and_then(|t| t.as_str())
@@ -538,6 +564,92 @@ mod tests {
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn enforce_strict_strips_sibling_keywords_next_to_ref() {
+        // OpenAI's structured-output validator rejects any sibling
+        // keyword next to `$ref` with a 400. schemars 1.x emits a
+        // field-level `description` next to `$ref` whenever a
+        // doc-commented field is typed as an external enum (e.g.
+        // `tier: Tier` in `ConsolidatedPageUpdate`). Without this
+        // strip, `memory_consolidate multi_page=true` 400s on every
+        // call against gpt-4o-mini. JSON Schema 2020-12 §8.2.3.1 says
+        // siblings of `$ref` are ignored during validation, so
+        // dropping them is semantically a no-op — only the
+        // documentation-only field-level description is lost (the
+        // type's own description on the referenced definition stays).
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "tier": {
+                    "$ref": "#/$defs/Tier",
+                    "description": "Tier classification."
+                }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let tier = &schema["properties"]["tier"];
+        assert_eq!(tier["$ref"], json!("#/$defs/Tier"));
+        assert!(
+            tier.get("description").is_none(),
+            "description must be stripped from a $ref node"
+        );
+        assert_eq!(
+            tier.as_object().unwrap().len(),
+            1,
+            "only $ref should remain on the node"
+        );
+    }
+
+    #[test]
+    fn enforce_strict_renames_oneof_to_anyof() {
+        // OpenAI structured-output strict mode rejects `oneOf` outright
+        // ("In context=(), 'oneOf' is not permitted") while accepting
+        // `anyOf`. schemars 1.x emits `oneOf` for every Rust enum with
+        // tagged variants — e.g. the `Tier` and `PageKind` enums under
+        // `$defs` in `ConsolidatedBatch`. For closed enum sets where
+        // exactly one branch matches per value, `anyOf` is semantically
+        // equivalent (no two branches overlap), so the rewrite is
+        // lossless.
+        let mut schema = json!({
+            "type": "object",
+            "$defs": {
+                "Tier": {
+                    "oneOf": [
+                        { "type": "string", "const": "working" },
+                        { "type": "string", "const": "episodic" }
+                    ]
+                }
+            },
+            "properties": { "tier": { "$ref": "#/$defs/Tier" } }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let tier_def = &schema["$defs"]["Tier"];
+        assert!(
+            tier_def.get("oneOf").is_none(),
+            "oneOf must be rewritten away"
+        );
+        let any_of = tier_def.get("anyOf").expect("oneOf must become anyOf");
+        assert_eq!(any_of.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn enforce_strict_strips_ref_siblings_inside_array_items() {
+        // The same JSON-Schema-2020-12 rule applies anywhere $ref
+        // appears, not just on direct object properties — schemars
+        // emits it inside `items` for `Vec<EnumType>` too.
+        let mut schema = json!({
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/Tier",
+                "description": "Each element classified."
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        let items = &schema["items"];
+        assert_eq!(items["$ref"], json!("#/$defs/Tier"));
+        assert!(items.get("description").is_none());
     }
 
     #[test]
