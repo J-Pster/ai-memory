@@ -67,3 +67,9 @@ fn aur_packages_install_all_native_assets() {
     assert!(install.contains("sudo -u ai-memory ai-memory --data-dir /var/lib/ai-memory"));
     assert!(!install.contains("sudo ai-memory --data-dir /var/lib/ai-memory"));
 }
+
+#[test]
+fn docker_source_build_uses_vendored_tailwind() {
+    let dockerfile = read_repo("docker/Dockerfile");
+    assert!(dockerfile.contains("TAILWIND_SKIP=1 cargo build --release -p ai-memory-cli"));
+}
