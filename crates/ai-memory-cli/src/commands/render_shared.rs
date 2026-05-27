@@ -469,7 +469,24 @@ fn powershell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn build_posix_hook_payload(
+        events: &[(&str, &str)],
+        root: &Path,
+        server_url: &str,
+        auth_token: Option<&str>,
+        shape: HookShape,
+    ) -> serde_json::Value {
+        build_hook_payload_for_platform(
+            events,
+            root,
+            server_url,
+            auth_token,
+            shape,
+            HookCommandPlatform::Posix,
+        )
+    }
 
     #[test]
     fn bearer_header_is_none_when_no_token() {
@@ -496,13 +513,12 @@ mod tests {
     #[test]
     fn claude_code_payload_embeds_auth_token_when_provided() {
         let root = PathBuf::from("/host/hooks/claude-code");
-        let v = build_hook_payload_for_platform(
+        let v = build_posix_hook_payload(
             &CLAUDE_CODE_EVENTS,
             &root,
             "http://localhost:49374",
             Some("tok"),
             HookShape::Nested,
-            HookCommandPlatform::Posix,
         );
         // Env vars are inlined into the command string so CC's
         // hook runner sees them regardless of whether it honours
@@ -534,11 +550,12 @@ mod tests {
         // Flat shape: no inner `hooks: [...]` array; each event
         // maps to an array of {type, command, matcher} entries.
         let root = PathBuf::from("/host/hooks/cursor");
-        let v = build_profile_payload(
-            &CURSOR_PROFILE,
+        let v = build_posix_hook_payload(
+            CURSOR_PROFILE.events,
             &root,
             "http://localhost:49374",
             Some("tok"),
+            CURSOR_PROFILE.shape,
         );
         let session_start = v
             .pointer("/hooks/sessionStart/0")
@@ -685,13 +702,12 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("hooks")
             .join("claude-code");
-        let v = build_hook_payload_for_platform(
+        let v = build_posix_hook_payload(
             &CLAUDE_CODE_EVENTS,
             &root,
             "http://localhost:49374",
             None,
             HookShape::Nested,
-            HookCommandPlatform::Posix,
         );
         let cmd = v
             .pointer("/hooks/SessionStart/0/hooks/0/command")
@@ -758,7 +774,12 @@ mod tests {
     #[test]
     fn antigravity_payload_uses_named_groups_with_mixed_shape() {
         let root = PathBuf::from("/host/hooks/antigravity-cli");
-        let v = build_antigravity_payload(&root, "http://localhost:49374", Some("tok"));
+        let v = build_antigravity_payload_for_platform(
+            &root,
+            "http://localhost:49374",
+            Some("tok"),
+            HookCommandPlatform::Posix,
+        );
 
         // Top-level key is the named group "ai-memory", not "hooks"
         let group = v
