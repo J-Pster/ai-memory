@@ -173,6 +173,121 @@ async fn smoke_page_view_returns_200() {
     assert!(text.contains("Hello world"), "expected rendered body");
 }
 
+// ── /web HTML chrome for multi-user attribution ──────────────────────
+
+#[tokio::test]
+async fn web_page_view_omits_author_chrome_for_anonymous_pages() {
+    // Backward-compat gate: a page written without an actor (every
+    // pre-v0.8 caller built this shape, and every internal caller
+    // that isn't an HTTP request still does) must render with the
+    // exact "Updated · Created" metadata chip layout it had before
+    // multi-user landed — no "Last edited by …" chip, no email
+    // link, nothing.
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/anon.md", "anon body"))
+        .await
+        .unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/notes/anon.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        !text.contains("Last edited by"),
+        "anonymous page must NOT render the author chip — backward compat"
+    );
+}
+
+#[tokio::test]
+async fn web_page_view_renders_author_chip_for_attributed_pages() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
+    let token_hash = ai_memory_store::hash_token("t", &pepper);
+    let mut new_user = ai_memory_core::NewUser {
+        username: "alice".into(),
+        name: Some("Alice Smith".into()),
+        email: Some("alice@home".into()),
+    };
+    new_user.validate().unwrap();
+    let user_id = store
+        .writer
+        .create_user(new_user, token_hash)
+        .await
+        .unwrap();
+
+    let mut req = wiki_req(ws, proj, "notes/by-alice.md", "alice body");
+    req.author_id = Some(user_id);
+    req.actor = ai_memory_core::ActorContext {
+        user: Some("alice".into()),
+        name: Some("Alice Smith".into()),
+        email: Some("alice@home".into()),
+        ..ai_memory_core::ActorContext::default()
+    };
+    wiki.write_page(req).await.unwrap();
+
+    let app = router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/w/default/scratch/p/notes/by-alice.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("Last edited by"),
+        "attributed page must render the author chip"
+    );
+    assert!(text.contains("alice"), "username must appear in the chip");
+    assert!(
+        text.contains("Alice Smith"),
+        "display name must appear when set"
+    );
+    assert!(
+        text.contains("mailto:alice@home"),
+        "email must be a mailto: link"
+    );
+}
+
 #[tokio::test]
 async fn smoke_search_returns_200() {
     let (_tmp, store, wiki) = setup().await;
