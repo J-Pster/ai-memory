@@ -1695,3 +1695,199 @@ async fn api_error_responses_do_not_set_cache_control() {
         "error responses must not carry a Cache-Control header"
     );
 }
+
+// ── P1.7: /api/v1 page response surfaces author + ETag invalidation ──
+
+#[tokio::test]
+async fn api_v1_page_omits_author_for_anonymous_writes() {
+    // Backward-compat gate: writes built with the default anonymous
+    // ActorContext (every pre-multi-user caller) MUST leave the
+    // serialised ApiPage shape identical to v0.7.x — `author` is
+    // omitted, not serialised as `null`. Catches a regression where
+    // someone forgets the `skip_serializing_if` annotation.
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    wiki.write_page(wiki_req(ws, proj, "notes/anon.md", "anonymous body"))
+        .await
+        .unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/anon.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json.get("author").is_none(),
+        "anonymous page response must omit `author` (not null) — backward-compat regression: {json}"
+    );
+}
+
+#[tokio::test]
+async fn api_v1_page_surfaces_author_for_db_user_writes() {
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+
+    // Seed a `users` row and write a page attributed to that id.
+    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
+    let token_hash = ai_memory_store::hash_token("any-token", &pepper);
+    let mut new_user = ai_memory_core::NewUser {
+        username: "alice".into(),
+        name: Some("Alice Smith".into()),
+        email: Some("alice@home".into()),
+    };
+    new_user.validate().unwrap();
+    let user_id = store
+        .writer
+        .create_user(new_user, token_hash)
+        .await
+        .unwrap();
+
+    let mut req = wiki_req(ws, proj, "notes/by-alice.md", "alice wrote this");
+    req.author_id = Some(user_id);
+    req.actor = ai_memory_core::ActorContext {
+        user: Some("alice".into()),
+        name: Some("Alice Smith".into()),
+        email: Some("alice@home".into()),
+        ..ai_memory_core::ActorContext::default()
+    };
+    wiki.write_page(req).await.unwrap();
+
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/by-alice.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let author = json
+        .get("author")
+        .expect("identified write must surface `author`");
+    assert_eq!(author["username"], "alice");
+    assert_eq!(author["name"], "Alice Smith");
+    assert_eq!(author["email"], "alice@home");
+}
+
+#[tokio::test]
+async fn api_v1_etag_differs_between_anonymous_and_attributed_writes() {
+    // Regression guard: the ETag must invalidate when author changes
+    // even if the body stays the same. Otherwise a client cached the
+    // "anonymous" view of a page wouldn't see the attribution flip
+    // after the operator runs `rotate-token` + re-writes the page.
+    let (_tmp, store, wiki) = setup().await;
+    let ws = store
+        .writer
+        .get_or_create_workspace("default")
+        .await
+        .unwrap();
+    let proj = store
+        .writer
+        .get_or_create_project(ws, "scratch", None)
+        .await
+        .unwrap();
+    let pepper = ai_memory_store::TokenPepper::new("test-pepper");
+    let token_hash = ai_memory_store::hash_token("t", &pepper);
+    let mut new_user = ai_memory_core::NewUser {
+        username: "alice".into(),
+        name: None,
+        email: None,
+    };
+    new_user.validate().unwrap();
+    let user_id = store
+        .writer
+        .create_user(new_user, token_hash)
+        .await
+        .unwrap();
+
+    // First write: anonymous.
+    wiki.write_page(wiki_req(ws, proj, "notes/etag.md", "shared body"))
+        .await
+        .unwrap();
+    let app = api_router(store.reader.clone(), wiki.clone());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/etag.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag_anon = resp
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // Second write: same body, but attributed to alice. Same wiki path
+    // → supersession; the new latest version carries author_id.
+    let mut req = wiki_req(ws, proj, "notes/etag.md", "shared body");
+    req.author_id = Some(user_id);
+    req.actor = ai_memory_core::ActorContext {
+        user: Some("alice".into()),
+        ..ai_memory_core::ActorContext::default()
+    };
+    wiki.write_page(req).await.unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/workspaces/default/projects/scratch/pages/notes/etag.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let etag_with_author = resp
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        etag_anon, etag_with_author,
+        "ETag must invalidate when author changes — even when body is identical \
+         (would otherwise let stale caches hide attribution flips)"
+    );
+}
