@@ -449,6 +449,10 @@ impl Wiki {
         // (via the upsert below) atomically. See `crate::admission`.
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
+            // Single identity source: the webhook actor is the same
+            // `ActorContext` used for on-disk attribution (req.actor),
+            // populated by the auth layer — not a separate header bridge.
+            ctx.actor = actor.clone();
             // Resolve workspace + project names from the store reader (if
             // attached) so webhooks address pages by the human-readable
             // names the engine uses on disk and in the UI. Best-effort —

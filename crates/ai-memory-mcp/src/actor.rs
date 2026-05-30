@@ -35,7 +35,7 @@
 //! the actor is completely anonymous (the chain still runs with a
 //! default context — webhooks decide what to do with an empty actor).
 
-use ai_memory_wiki::ActorContext;
+use ai_memory_core::ActorContext;
 use axum::http::HeaderMap;
 
 fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -57,6 +57,10 @@ pub fn actor_from_headers(headers: &HeaderMap) -> ActorContext {
         sub: header_str(headers, "x-memory-actor-sub"),
         client: header_str(headers, "x-memory-actor-client"),
         session_id: header_str(headers, "x-memory-actor-session-id"),
+        // `name`/`email` aren't carried by the `X-Memory-Actor-*` bridge;
+        // the four-rung auth middleware fills those when it injects the
+        // canonical `Extension<ActorContext>` directly.
+        ..ActorContext::default()
     }
 }
 

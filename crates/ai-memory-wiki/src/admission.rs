@@ -106,40 +106,6 @@ pub struct WebhookConfig {
     pub events: Vec<AdmissionOp>,
 }
 
-/// Identity of the actor that triggered a write. Populated by the caller
-/// (MCP tool, admin endpoint, hook router) from validated JWT claims +
-/// injected headers (typically `X-Memory-Actor-*` from `mcp-auth`).
-///
-/// All fields are optional: internal callers (CLI bootstrap, tests) may
-/// leave them blank; webhooks must handle that gracefully.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ActorContext {
-    /// `claude-code` | `codex` | `opencode` | `hook` | `cli` | …
-    pub agent: Option<String>,
-    /// Keycloak `preferred_username` (e.g. `djalmajr`).
-    pub user: Option<String>,
-    /// JWT `sub` claim (stable user UUID).
-    pub sub: Option<String>,
-    /// DCR client UUID (identifies the agent install).
-    pub client: Option<String>,
-    /// Session id from the agent (if known).
-    pub session_id: Option<String>,
-}
-
-impl ActorContext {
-    /// `true` if at least one identity field is set. Useful for callers
-    /// that want to skip building an [`AdmissionContext`] entirely when
-    /// the actor is completely anonymous.
-    #[must_use]
-    pub fn has_any(&self) -> bool {
-        self.agent.is_some()
-            || self.user.is_some()
-            || self.sub.is_some()
-            || self.client.is_some()
-            || self.session_id.is_some()
-    }
-}
-
 /// Per-write context passed to each webhook. Cheap to construct
 /// (mostly references at the request layer, owned here for serialisation).
 #[derive(Debug, Clone, Default, Serialize)]
@@ -156,8 +122,12 @@ pub struct AdmissionContext {
     /// (auto-filled from `project_id` when the wiki has a store reader).
     #[serde(default)]
     pub project: String,
-    /// Identity of the actor that triggered the write.
-    pub actor: ActorContext,
+    /// Identity of the actor that triggered the write. The canonical
+    /// multi-user [`ai_memory_core::ActorContext`] (since the v0.8 merge);
+    /// `Wiki::write_page` fills it from `WritePageRequest::actor` so the
+    /// webhook payload and the on-disk `last_modified_by` block share one
+    /// identity source.
+    pub actor: ai_memory_core::ActorContext,
     /// Which lifecycle op fired the chain.
     pub op: AdmissionOp,
     /// Names from `X-Memory-Skip-Admission-Chain` (CSV at the request layer);

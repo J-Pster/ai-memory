@@ -1012,8 +1012,9 @@ impl AiMemoryServer {
         // skip list is present (a skip-only write still needs to carry it).
         let skip_webhooks = crate::actor::skip_webhooks_from_headers(&parts.headers);
         let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            // Actor is NOT carried here — `write_page` fills the webhook
+            // context from `req.actor` (single identity source).
             Some(ai_memory_wiki::AdmissionContext {
-                actor,
                 op: ai_memory_wiki::AdmissionOp::WritePage,
                 skip_webhooks,
                 ..ai_memory_wiki::AdmissionContext::default()
@@ -1034,7 +1035,7 @@ impl AiMemoryServer {
                 title: args.title,
                 admission_ctx,
                 author_id: None,
-                actor: ai_memory_core::ActorContext::anonymous(),
+                actor,
             })
             .await
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;

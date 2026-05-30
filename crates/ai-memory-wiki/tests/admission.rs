@@ -12,10 +12,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ai_memory_core::PagePath;
+use ai_memory_core::{ActorContext, PagePath};
 use ai_memory_wiki::{
-    ActorContext, AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, Markdown,
-    WebhookConfig,
+    AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, Markdown, WebhookConfig,
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -370,6 +369,7 @@ async fn actor_context_is_propagated_in_payload() {
             sub: Some("8f3a-uuid".into()),
             client: Some("72836f52-uuid".into()),
             session_id: Some("019e6d-session".into()),
+            ..ActorContext::default()
         },
         ..AdmissionContext::default()
     };

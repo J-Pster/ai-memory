@@ -15,8 +15,8 @@ mod watcher;
 mod wiki;
 
 pub use admission::{
-    ActorContext, AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy,
-    MAX_ADMISSION_WEBHOOKS, MAX_RESPONSE_BYTES, WebhookConfig,
+    AdmissionChain, AdmissionContext, AdmissionOp, FailurePolicy, MAX_ADMISSION_WEBHOOKS,
+    MAX_RESPONSE_BYTES, WebhookConfig,
 };
 pub use error::{WikiError, WikiResult};
 pub use git::{COMMIT_AUTHOR_EMAIL, COMMIT_AUTHOR_NAME, GitAdapter};
