@@ -90,6 +90,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         tier: Tier::Semantic,
         pinned: false,
         title: Some("Keep page".into()),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();
@@ -103,6 +105,8 @@ async fn seed_two_projects(store: &Store, wiki: &Wiki) -> (WorkspaceId, ProjectI
         tier: Tier::Semantic,
         pinned: false,
         title: Some("Doomed page".into()),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();

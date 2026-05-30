@@ -221,8 +221,9 @@ fn upsert_page_in_tx(
         tx.execute(
             "INSERT INTO pages \
              (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-              frontmatter_json, is_latest, supersedes, pinned, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
+              frontmatter_json, is_latest, supersedes, pinned, author_id, \
+              created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?13, ?13)",
             params![
                 new_id.as_bytes(),
                 page.workspace_id.as_bytes(),
@@ -235,6 +236,7 @@ fn upsert_page_in_tx(
                 frontmatter_str,
                 &existing.id,
                 i64::from(page.pinned),
+                page.author_id.map(|id| id.as_bytes().to_vec()),
                 now,
             ],
         )?;
@@ -254,8 +256,8 @@ fn upsert_page_in_tx(
     tx.execute(
         "INSERT INTO pages \
          (id, workspace_id, project_id, path, title, tier, body, body_sha256, \
-          frontmatter_json, is_latest, pinned, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?11)",
+          frontmatter_json, is_latest, pinned, author_id, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)",
         params![
             new_id.as_bytes(),
             page.workspace_id.as_bytes(),
@@ -267,6 +269,7 @@ fn upsert_page_in_tx(
             body_sha256.as_slice(),
             frontmatter_str,
             i64::from(page.pinned),
+            page.author_id.map(|id| id.as_bytes().to_vec()),
             now,
         ],
     )?;
@@ -1049,6 +1052,7 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
     }
 

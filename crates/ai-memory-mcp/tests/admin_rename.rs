@@ -79,6 +79,8 @@ async fn seed_page(store: &Store, wiki: &Wiki, project: &str) -> String {
         tier: Tier::Semantic,
         pinned: false,
         title: Some(project.into()),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();

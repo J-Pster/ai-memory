@@ -157,6 +157,8 @@ impl Consolidator {
                 tier: Tier::Episodic,
                 pinned: false,
                 title: None,
+                author_id: None,
+                actor: ai_memory_core::ActorContext::anonymous(),
             })
             .await?;
         // Auto-commit the result so the supersession lands in git.
@@ -390,6 +392,8 @@ fn build_update(
         tier,
         pinned: false,
         title: Some(upd.title.clone()),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     };
     let outcome = ConsolidationOutcome {
         path,

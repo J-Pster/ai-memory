@@ -313,6 +313,8 @@ async fn write_report_page(
         tier: Tier::Semantic,
         pinned: false,
         title: Some(title),
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await?;
     Ok(())

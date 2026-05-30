@@ -915,6 +915,8 @@ mod tests {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .unwrap();

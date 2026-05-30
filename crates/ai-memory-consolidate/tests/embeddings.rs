@@ -65,6 +65,8 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
             tier: Tier::Semantic,
             pinned: false,
             title: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .expect("write page");
@@ -182,6 +184,8 @@ async fn m9_embeddings_roundtrip_via_synthetic() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .expect("rewrite page");

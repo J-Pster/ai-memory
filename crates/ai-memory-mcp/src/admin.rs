@@ -1630,6 +1630,8 @@ async fn handle_write_page(
             tier,
             pinned: req.pinned,
             title: req.title,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;

@@ -37,6 +37,7 @@ fn new_page(
         frontmatter_json: serde_json::json!({"kind": "fact"}),
         pinned: false,
         links: Vec::new(),
+        author_id: None,
     }
 }
 
@@ -55,6 +56,8 @@ fn wiki_req(
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     }
 }
 
@@ -499,6 +502,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         })
         .await
         .unwrap();
@@ -517,6 +521,7 @@ async fn api_pages_derives_kind_from_path_when_frontmatter_absent() {
             frontmatter_json: serde_json::json!({"kind": "rule"}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         })
         .await
         .unwrap();
@@ -1518,6 +1523,8 @@ async fn api_page_handler_emits_etag_and_supports_if_none_match() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();
@@ -1596,6 +1603,8 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();
@@ -1608,6 +1617,8 @@ async fn api_page_handler_etag_differs_per_page() {
         tier: Tier::Semantic,
         pinned: false,
         title: None,
+        author_id: None,
+        actor: ai_memory_core::ActorContext::anonymous(),
     })
     .await
     .unwrap();

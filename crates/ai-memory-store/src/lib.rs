@@ -112,6 +112,7 @@ mod tests {
             frontmatter_json: serde_json::json!({}),
             pinned: false,
             links: Vec::new(),
+            author_id: None,
         }
     }
 
@@ -780,6 +781,7 @@ mod tests {
             frontmatter_json: serde_json::json!({"kind": "decision"}),
             pinned: true,
             links: Vec::new(),
+            author_id: None,
         };
         store.writer.upsert_page(page).await.unwrap();
 
