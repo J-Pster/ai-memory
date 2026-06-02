@@ -12,7 +12,7 @@
 | | What you can do | What you can't do |
 |---|---|---|
 | `/api/v1/*` | Browse workspaces, projects, pages; read full page markdown + frontmatter + back-links; FTS5 search (global or scoped, single or multi-project); aggregate "overview" snapshots; drill into stale / duplicate / orphan pages. | Write, delete, rename, lint, consolidate, run sweeps, manage handoffs. The `/api/v1` surface is **read-only by construction** — the handlers contain zero writer calls. Writes still go through `/admin/*` (used by the CLI) or MCP tools. |
-| `--web-ui-dir` | Host any SPA at `/web`, same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — there's no CORS layer yet (see §9). |
+| `--web-ui-dir` | Host any SPA at `/web` (or `--web-slug`), same-origin with the API, behind the same auth. The default built-in `/web` browser stays the fallback when the flag is absent. | Host the SPA on a *different* origin without a reverse proxy — use same-origin hosting or configure CORS deliberately (see §9). |
 
 ## 2. Auth model
 
@@ -341,7 +341,7 @@ across all projects in the workspace:
   on every request. If your UI polls aggressively, consider client-side
   debouncing; server-side caching is a planned iteration.
 
-## 6. Custom UI hosting (`--web-ui-dir`)
+## 6. Custom UI hosting and base paths
 
 ```bash
 ai-memory serve \
@@ -364,6 +364,26 @@ The static directory is served at `/web` via `tower-http::ServeDir`:
 - **Pre-startup validation:** the directory must exist *and* contain
   `index.html`, or `ai-memory serve` exits with a clear error before
   binding. Requires `--enable-web` to also be set.
+- **Base-path injection:** ai-memory injects `<base href="...">` and
+  `<meta name="ai-memory-base-path" content="...">` into the SPA shell. This
+  covers direct `/web`, `/web/index.html`, and client-router fallback paths;
+  static assets are served unchanged.
+
+When a reverse proxy keeps ai-memory under a URL subpath, set
+`--base-path` (or `AI_MEMORY_BASE_PATH`) so every HTTP surface moves together:
+
+```bash
+ai-memory serve \
+    --transport http \
+    --bind 127.0.0.1:49374 \
+    --enable-web \
+    --base-path /wiki
+```
+
+With `--base-path /wiki`, the API lives at `/wiki/api/v1`, MCP at
+`/wiki/mcp`, hooks at `/wiki/hook`, admin routes at `/wiki/admin/*`, and the
+default web UI at `/wiki/web`. Set `--web-slug /` to mount the web UI or custom
+SPA at the base root (`/wiki`) instead of `/wiki/web`.
 
 When `--web-ui-dir` is **absent**, the built-in server-side `/web`
 browser is the default (read-only HTML rendering, FTS5 search,
@@ -372,8 +392,12 @@ project tree). No regression.
 ## 7. Worked example: minimal SPA fetch
 
 ```js
-// Resolve the API base from the SPA's own origin (same-origin model).
-const API = `${location.origin}/api/v1`;
+// Resolve the API base from the SPA shell injected by ai-memory. The meta tag
+// is empty at host root and e.g. "/wiki" behind a subpath reverse proxy.
+const basePath = document
+  .querySelector('meta[name="ai-memory-base-path"]')
+  ?.getAttribute("content") ?? "";
+const API = `${location.origin}${basePath}/api/v1`;
 const TOKEN = localStorage.getItem("ai-memory-token"); // your storage choice
 
 async function apiGet(path, params) {

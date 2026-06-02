@@ -369,6 +369,13 @@ Useful entry points:
   screenshots and e2e tests — lives at
   [djalmajr/ai-memory-ui](https://github.com/djalmajr/ai-memory-ui).
 
+  When a reverse proxy hosts ai-memory under a URL subpath, set
+  `--base-path` (or `AI_MEMORY_BASE_PATH`) so every HTTP surface moves
+  together. Example: `--base-path /wiki` serves MCP at `/wiki/mcp`, hooks at
+  `/wiki/hook`, the API at `/wiki/api/v1`, and the default browser at
+  `/wiki/web`. Set `--web-slug /` if you want the browser or custom SPA at
+  `/wiki` itself.
+
 Install the routing snippet once so agents proactively call the right
 MCP tool for those prompts:
 

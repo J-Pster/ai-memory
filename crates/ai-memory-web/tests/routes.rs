@@ -369,9 +369,11 @@ async fn web_links_percent_encode_route_segments() {
         .await
         .unwrap();
     let text = std::str::from_utf8(&body).unwrap();
+    // Links are now relative (no leading `/web/`) so they resolve against the
+    // `<base href>` the server injects per the configured prefix.
     assert!(
-        text.contains("/web/w/default/scratch%20%231/p/notes/a%20b%2525.md"),
-        "expected encoded href in project response: {text}"
+        text.contains("\"w/default/scratch%20%231/p/notes/a%20b%2525.md\""),
+        "expected encoded relative href in project response: {text}"
     );
 }
 

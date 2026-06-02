@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `ai-memory serve --transport http` can host the entire HTTP surface under a
+  configurable subpath with `--base-path` / `AI_MEMORY_BASE_PATH`; `/mcp`,
+  `/hook`, `/admin/*`, `/api/v1`, and the web UI all move under that prefix.
+  The web UI mount can also be changed with `--web-slug`, and custom
+  `--web-ui-dir` SPAs receive injected `<base href>` plus
+  `ai-memory-base-path` metadata for same-origin API calls behind reverse
+  proxies ([#65]).
 - `ai-memory move-project` can move projects across workspaces via the admin
   API. Fresh destinations use a lossless true move that keeps the same
   `project_id`, sessions, observations, handoffs, embeddings, and page history;
@@ -24,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before removal ([#55]).
 
 ### Fixed
+- Custom `--web-ui-dir` frontends no longer serve raw `/index.html` without
+  base-path injection; direct index requests and SPA fallback routes now return
+  the injected shell, while static assets remain untouched ([#65]).
 - `move-project` true moves now run through a wiki mutation gate: normal
   page writes/reindexes validate the `(workspace_id, project_id)` pair before
   touching disk, while true moves hold the exclusive side across the directory

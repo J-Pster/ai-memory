@@ -6,11 +6,17 @@ use askama::Template;
 // URL helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `/web` project URL with path segments percent-encoded.
+/// Build a project URL with path segments percent-encoded.
+///
+/// The URL is **relative** (`w/{ws}/{proj}`, no leading slash) so it
+/// resolves against the page's injected `<base href>` — which the server
+/// sets to `{base_path}{web_slug}/`. That keeps every link correct whether
+/// the browser is served at the host root (`/web/…`) or under a reverse-proxy
+/// subpath (`/wiki/web/…`), without the templates knowing the prefix.
 #[must_use]
 pub(crate) fn project_href(workspace: &str, project: &str) -> String {
     format!(
-        "/web/w/{}/{}",
+        "w/{}/{}",
         encode_segment(workspace),
         encode_segment(project)
     )
@@ -102,7 +108,7 @@ pub(crate) struct ProjectCard {
     pub page_count: u64,
     /// Humanised timestamp (e.g. "3 hours ago"), or empty string.
     pub last_updated_relative: String,
-    /// Link target (`/web/w/{ws}/{proj}`).
+    /// Link target (`w/{ws}/{proj}`, relative to `<base href>`).
     pub href: String,
 }
 
@@ -249,13 +255,15 @@ mod tests {
 
     #[test]
     fn href_helpers_percent_encode_segments() {
+        // Relative (no leading slash) so they resolve against the injected
+        // `<base href>` — see `project_href` docs.
         assert_eq!(
             project_href("default space", "proj#one"),
-            "/web/w/default%20space/proj%23one"
+            "w/default%20space/proj%23one"
         );
         assert_eq!(
             page_href("default", "scratch", "notes/a b%25.md"),
-            "/web/w/default/scratch/p/notes/a%20b%2525.md"
+            "w/default/scratch/p/notes/a%20b%2525.md"
         );
     }
 }

@@ -127,6 +127,38 @@ The `AI_MEMORY_ALLOWED_HOSTS` must include the public hostname or
 ai-memory's DNS-rebinding guard will refuse Caddy's forwarded
 requests.
 
+### Hosting under a subpath
+
+If ai-memory shares a hostname with other apps, keep the prefix when proxying
+and tell ai-memory about it:
+
+```bash
+AI_MEMORY_BASE_PATH=/wiki
+```
+
+```caddyfile
+memory.example.com {
+    handle /wiki/* {
+        reverse_proxy ai-memory:49374
+    }
+}
+```
+
+Do **not** use `handle_path /wiki/*` for this deployment: it strips `/wiki`
+before forwarding, while ai-memory intentionally serves all routes under the
+configured prefix. With the example above, clients use:
+
+```bash
+ai-memory install-mcp   --client claude-code --apply \
+    --server-url "https://memory.example.com/wiki/mcp" --auth-token "$AI_MEMORY_AUTH_TOKEN"
+ai-memory install-hooks --agent  claude-code --apply \
+    --server-url "https://memory.example.com/wiki" --auth-token "$AI_MEMORY_AUTH_TOKEN"
+```
+
+The built-in browser is then at `https://memory.example.com/wiki/web`; add
+`AI_MEMORY_WEB_SLUG=/` if you want the browser or custom `--web-ui-dir` SPA at
+`https://memory.example.com/wiki` itself.
+
 ### MCP client config (Claude Code shown — others follow the same shape)
 
 ```bash
