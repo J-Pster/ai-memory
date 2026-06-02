@@ -1033,12 +1033,17 @@ async fn inject_web_base_href(
         return resp;
     }
     let (mut parts, body) = resp.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    // Bound the buffer at MAX_BODY_BYTES — same cap inbound bodies use.
+    // A custom-SPA `index.html` over the cap is misconfigured at the
+    // operator level; refusing here keeps a runaway template (or a
+    // hostile asset masquerading as text/html) from streaming
+    // unbounded into memory before injection.
+    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "response body read error\n",
+                "response body too large or read error\n",
             )
                 .into_response();
         }

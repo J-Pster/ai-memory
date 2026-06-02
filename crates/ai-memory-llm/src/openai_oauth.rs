@@ -42,6 +42,20 @@ pub const OAUTH_SCOPES: &str = "openid profile email offline_access";
 
 const REFRESH_MARGIN_MS: u64 = 60_000;
 
+/// Status code used when the Codex SSE stream carries a terminal error
+/// event (`response.failed`/`response.incomplete`/`response.cancelled`
+/// or a top-level `error` payload). 502 ("Bad Gateway") models the
+/// situation accurately: the upstream connected, but the response it
+/// sent was not a usable completion — the Codex backend, not
+/// ai-memory's HTTP layer, produced the failure.
+const SSE_TERMINAL_ERROR_STATUS: u16 = 502;
+
+/// Trim length for the body field of an SSE-terminal error so we
+/// don't echo a multi-megabyte upstream error into the logs / chain.
+/// Matches the 1024 used by `OpenAiProvider::post` for HTTP 4xx/5xx
+/// bodies — same defensive cap, same reasoning.
+const SSE_ERROR_BODY_TRIM: usize = 1024;
+
 /// Stored OpenAI OAuth token.
 #[derive(Clone)]
 pub struct OpenAiOAuthToken {
@@ -373,6 +387,18 @@ fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
         }
 
         let value = serde_json::from_str::<serde_json::Value>(trimmed)?;
+        // A bare `data: {"error": {...}}` event without a `type` field
+        // and without an `event:` header would otherwise fall through
+        // the `_ => {}` arm and silently disappear, leaving the caller
+        // with "stream closed before response.completed". Promote
+        // any top-level `error` payload to a terminal error so the real
+        // upstream failure reaches the caller verbatim.
+        if value.get("error").is_some() {
+            return Err(LlmError::Provider {
+                status: SSE_TERMINAL_ERROR_STATUS,
+                body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
+            });
+        }
         let kind = value
             .get("type")
             .and_then(|v| v.as_str())
@@ -390,8 +416,8 @@ fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
             }
             "response.failed" | "response.incomplete" | "response.cancelled" | "error" => {
                 return Err(LlmError::Provider {
-                    status: 502,
-                    body: truncate_with_ellipsis(trimmed, 1024),
+                    status: SSE_TERMINAL_ERROR_STATUS,
+                    body: truncate_with_ellipsis(trimmed, SSE_ERROR_BODY_TRIM),
                 });
             }
             _ => {}
@@ -413,7 +439,20 @@ fn parse_sse_response(body: &str) -> LlmResult<CodexResponsesResponse> {
             data_lines.push(rest.trim_start());
         }
     }
-    flush_event(current_event.as_deref(), &mut data_lines)?;
+    // Final flush. A stream that ended mid-`data:` chunk leaves the
+    // last partial JSON in `data_lines`; surface that as a
+    // truncated-stream error so the caller doesn't see a generic
+    // serde parse failure when the true cause is the upstream socket
+    // closing before sending the closing `}`.
+    if let Err(err) = flush_event(current_event.as_deref(), &mut data_lines) {
+        return match (&err, completed.is_some()) {
+            (LlmError::Serde(_), false) => Err(LlmError::UnexpectedShape(
+                "openai-oauth stream truncated before final event closed (incomplete JSON payload)"
+                    .into(),
+            )),
+            _ => Err(err),
+        };
+    }
 
     let mut response = completed.ok_or_else(|| {
         LlmError::UnexpectedShape("openai-oauth stream closed before response.completed".into())

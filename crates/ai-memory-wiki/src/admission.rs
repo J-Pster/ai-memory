@@ -89,6 +89,13 @@ pub enum FailurePolicy {
     Reject,
 }
 
+/// serde `skip_serializing_if` helper for `bool` fields that default
+/// to `false` — skip the field entirely when it carries no information
+/// so existing webhook consumers don't see an unknown extra key.
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 fn default_timeout_ms() -> u64 {
     2_000
 }
@@ -155,6 +162,16 @@ pub struct AdmissionContext {
     pub actor: ai_memory_core::ActorContext,
     /// Which lifecycle op fired the chain.
     pub op: AdmissionOp,
+    /// Set to `true` when the underlying op completed its durable DB
+    /// work but failed to complete a follow-on filesystem step (e.g.
+    /// `remove_project_dir` returned an io::Error during a purge).
+    /// The DB-side mutation is irrevocable; this flag lets mirrors that
+    /// track filesystem reality (a git-push mirror) refuse to drop their
+    /// own copy, while mirrors that track DB intent can ignore it.
+    /// Always `false` for write-page chains; only purge/move-source
+    /// callers set it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial_failure: bool,
     /// Names from `X-Memory-Skip-Admission-Chain` (CSV at the request layer);
     /// matched against [`WebhookConfig::name`] to short-circuit re-entrant writes.
     #[serde(default, skip_serializing)]

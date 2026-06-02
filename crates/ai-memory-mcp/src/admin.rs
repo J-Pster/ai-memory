@@ -1483,9 +1483,19 @@ async fn handle_purge_project(
             files_failed.push(proj_root_str);
         }
     }
-    state
-        .wiki
-        .dispatch_purge_project(resolved_purge_ctx.as_ref());
+    // Mirrors that track filesystem reality (a git-push mirror) want to
+    // know the on-disk dir is still present even though the DB rows are
+    // gone, so they can refuse to drop their own copy in violation of
+    // their source of truth. Mirrors that track DB intent can ignore
+    // `partial_failure`. Default-skipped on the wire so existing
+    // webhook consumers see no extra key.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
 
     let report = PurgeProjectReport {
         label: summary.label,
@@ -2213,23 +2223,36 @@ async fn handle_move_project(
     }
 
     // PURGE the source — only reached when every page copied successfully.
+    // Admission must run BEFORE the DB destruction so a `failure_policy =
+    // reject` webhook can still abort the second leg of the move while the
+    // source is intact (mirrors `handle_purge_project`'s ordering). The
+    // previous version called `Wiki::purge_project` AFTER `writer.purge_project`,
+    // which ran admit AFTER the rows were gone — reject came too late.
     let label = format!("{}/{}", req.from_workspace, req.project);
-    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
-        Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
-    };
-
-    // Remove the source's on-disk dir through Wiki::purge_project so the
-    // admission chain is notified (op=purge_project) before removal — a
-    // git-mirror drops its copy of the source project. The DB rows were
-    // just deleted above, so name-resolution would find nothing; pass the
-    // workspace/project NAMES explicitly (mirrors handle_purge_project).
     let purge_ctx = AdmissionContext {
         workspace: req.from_workspace.clone(),
         project: req.project.clone(),
         op: AdmissionOp::PurgeProject,
         ..Default::default()
     };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_project(src_ws, src_proj, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+        Ok(s) => s,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    // Remove the source's on-disk dir, then dispatch the non-blocking
+    // purge webhook. Pass the workspace/project NAMES we cached in
+    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
+    // name-resolution lookup at dispatch time would find nothing.
     let proj_root_str = state
         .wiki
         .project_root(src_ws, src_proj)
@@ -2237,17 +2260,21 @@ async fn handle_move_project(
         .to_string();
     let mut files_deleted: Vec<String> = Vec::new();
     let mut files_failed: Vec<String> = Vec::new();
-    match state
-        .wiki
-        .purge_project(src_ws, src_proj, Some(purge_ctx))
-        .await
-    {
+    match state.wiki.remove_project_dir(src_ws, src_proj) {
         Ok(()) => files_deleted.push(proj_root_str),
         Err(e) => {
             warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
             files_failed.push(proj_root_str);
         }
     }
+    // See `handle_purge_project` for the rationale on `partial_failure`.
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
 
     // The source project_id was just purged; if it was the published active
     // project, the pointer now dangles — clear it so the next hook re-resolves

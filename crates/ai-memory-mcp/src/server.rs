@@ -1773,13 +1773,18 @@ mod tests {
         }
     }
 
-    /// Both prompt surfaces must steer agents toward the H1-in-body
+    /// All three prompt surfaces must steer agents toward the H1-in-body
     /// convention instead of passing the `title` argument. The `title`
     /// argument is a known source of `JSON parsing` errors when the LLM
     /// fails to escape quotes (issue #67); routing every "remember this"
     /// call through the H1 path avoids the footgun entirely.
-    #[test]
-    fn prompts_steer_write_page_toward_h1_title_convention() {
+    ///
+    /// The three surfaces — `MEMORY_INSTRUCTIONS`, the routing snippet
+    /// (`SNIPPET_BODY`), and the per-tool `#[tool(description=...)]`
+    /// string surfaced via `tools/list` — are independent and must be
+    /// kept aligned per the CLAUDE.md "MCP tool surface changes" rule.
+    #[tokio::test]
+    async fn prompts_steer_write_page_toward_h1_title_convention() {
         for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
             assert!(
                 prompt.contains("H1"),
@@ -1790,6 +1795,31 @@ mod tests {
                 "prompt must tell the agent to omit the `title` argument"
             );
         }
+        // The third surface: the rmcp tool description sent to clients
+        // via `tools/list`. Spell-checked against the same keywords so
+        // that a future edit cannot silently drop the guidance from the
+        // tool the agent actually inspects when deciding how to call.
+        let (_tmp, _store, server, _ws, _pj) = setup_server().await;
+        let tools = server.tool_router.list_all();
+        let write_page = tools
+            .iter()
+            .find(|t| t.name == "memory_write_page")
+            .expect("memory_write_page must be registered");
+        let desc = write_page
+            .description
+            .as_deref()
+            .expect("memory_write_page must carry a description");
+        assert!(
+            desc.contains("H1"),
+            "tool description must mention the H1 title convention; got: {desc}"
+        );
+        assert!(
+            desc.contains("Do NOT pass")
+                || desc.contains("do NOT pass")
+                || desc.contains("omit")
+                || desc.contains("Omit"),
+            "tool description must explicitly tell the agent to omit `title`; got: {desc}"
+        );
     }
 
     /// Read tools resolve the project in the order: explicit `project`
