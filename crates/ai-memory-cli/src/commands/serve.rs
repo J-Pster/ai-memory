@@ -948,21 +948,79 @@ fn mount_web_router(
         };
     }
 
-    let web_router = ai_memory_web::router(reader, wiki);
-    info!(mount, "read-only wiki browser mounted");
+    // The built-in server-rendered browser emits RELATIVE asset/link URLs
+    // (`static/…`, `w/…`, `search`, `.`). Inject a `<base href>` into every
+    // HTML response so they resolve under `{base_path}{web_slug}/` — the same
+    // anchoring the custom SPA gets via its injected index. Default (`/web/`)
+    // is byte-equivalent to the previous absolute `/web/…` links.
+    let web_router = ai_memory_web::router(reader, wiki).layer(
+        axum::middleware::from_fn_with_state(
+            Arc::new(base_href.to_string()),
+            inject_web_base_href,
+        ),
+    );
+    info!(mount, base_href, "read-only wiki browser mounted");
     if slug.is_empty() {
         router.merge(web_router)
     } else {
-        let redirect_to = slug.clone();
+        // Strip-trailing-slash redirect. The target must carry the full
+        // external prefix (`{base_path}{slug}`), because the surrounding
+        // `nest(&base_path, …)` does NOT rewrite Location headers. Derive it
+        // from base_href (which already folds in base_path + slug).
+        let canonical = {
+            let trimmed = base_href.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
         router
             .route(
                 &format!("{slug}/"),
                 axum::routing::get(move || {
-                    let to = redirect_to.clone();
+                    let to = canonical.clone();
                     async move { axum::response::Redirect::permanent(&to) }
                 }),
             )
             .nest(&slug, web_router)
+    }
+}
+
+/// Response middleware: inject `<base href>` into `text/html` responses from
+/// the built-in server-rendered web browser, so its relative URLs resolve
+/// under the configured `{base_path}{web_slug}` prefix. Non-HTML responses
+/// (static assets, redirects) pass through untouched.
+async fn inject_web_base_href(
+    State(base_href): State<Arc<String>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let resp = next.run(req).await;
+    let is_html = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    if !is_html {
+        return resp;
+    }
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "response body read error\n")
+                .into_response();
+        }
+    };
+    match std::str::from_utf8(&bytes) {
+        Ok(html) => {
+            let injected = inject_base_href(html, &base_href);
+            // Stale length from the pre-injection body; let hyper recompute.
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(injected))
+        }
+        Err(_) => Response::from_parts(parts, Body::from(bytes)),
     }
 }
 
