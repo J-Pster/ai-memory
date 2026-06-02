@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before removal ([#55]).
 
 ### Fixed
+- `memory_write_page` tool description and routing prompts now steer agents
+  toward writing the page title as a `# H1` on the first line of `body` and
+  omitting the `title` argument. ai-memory already auto-derived the title from
+  `# H1` (or path stem) when `title` was missing — the change is documentation
+  only, but it eliminates a known source of MCP `JSON parsing` errors when the
+  LLM failed to escape quotes/colons in `title` ([#67]).
 - Custom `--web-ui-dir` frontends no longer serve raw `/index.html` without
   base-path injection; direct index requests and SPA fallback routes now return
   the injected shell, while static assets remain untouched ([#65]).

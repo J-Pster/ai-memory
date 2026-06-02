@@ -78,7 +78,10 @@ the conversation calls for them:\n\
   session end only when AI_MEMORY_CONSOLIDATE_ON_SESSION_END is set.\n\
 - `memory_write_page` — when the user explicitly asks to remember, \
   save, or annotate durable project knowledge. This writes a wiki page; \
-  do NOT use `memory_handoff_begin` for permanent annotations.\n\
+  do NOT use `memory_handoff_begin` for permanent annotations. \
+  Put the title as a `# H1` on the first line of `body` and omit the \
+  `title` argument — ai-memory derives the title automatically and \
+  passing `title` is a known JSON-escape footgun (issue #67).\n\
 - `memory_read_page` — when the user asks to read, open, or show the \
   full content of a specific page. Accepts a `query` (searches FTS5 and \
   returns the top hit's full body) or a `path` (direct lookup). Pass \
@@ -409,9 +412,18 @@ struct DeletePageArgs {
 struct WritePageArgs {
     /// Relative wiki path to write, for example `notes/santander-2025.md`.
     path: String,
-    /// Markdown body. Pass the durable fact/note content, not a handoff summary.
+    /// Markdown body. Pass the durable fact/note content, not a handoff
+    /// summary. Start the body with `# Some Title` — ai-memory derives the
+    /// page title from that H1 automatically, so you do not need (and should
+    /// not pass) the `title` argument.
     body: String,
-    /// Optional page title; otherwise derived from the first H1 or path stem.
+    /// **Prefer omitting this.** ai-memory derives the title from the first
+    /// `# H1` in `body` (or the path stem if there is no heading), so the
+    /// safest call is to leave this out and put the title as a markdown H1
+    /// on the first line of `body`. Passing a title here forces the agent
+    /// to JSON-escape the string correctly — a known source of `JSON parsing`
+    /// errors when the title contains quotes, colons, or other punctuation
+    /// (issue #67). Only set this when there's no usable H1 in the body.
     #[serde(default)]
     title: Option<String>,
     /// Tier (`working`, `episodic`, `semantic`, `procedural`). Default semantic.
@@ -983,7 +995,14 @@ impl AiMemoryServer {
         memory_handoff_begin for permanent annotations. Choose a stable \
         relative path such as `notes/<topic>.md`, `concepts/<topic>.md`, \
         `decisions/<topic>.md`, or `_rules/<topic>.md`. `tier` defaults \
-        to `semantic`; set `pinned=true` for facts that should never decay.")]
+        to `semantic`; set `pinned=true` for facts that should never decay. \
+        \
+        **Title convention:** start `body` with a `# Some Title` line — \
+        ai-memory derives the title from that H1 automatically. Do NOT \
+        pass the `title` argument; passing it forces correct JSON-escaping \
+        of the string and is a known source of `JSON parsing` errors when \
+        the title contains quotes or punctuation (issue #67). Use `title` \
+        only when there's no usable H1 in the body.")]
     async fn memory_write_page(
         &self,
         Parameters(args): Parameters<WritePageArgs>,
@@ -1750,6 +1769,25 @@ mod tests {
             assert!(
                 prompt.contains("do NOT use") || prompt.contains("do **not** use"),
                 "prompt must explicitly disallow handoffs for permanent notes"
+            );
+        }
+    }
+
+    /// Both prompt surfaces must steer agents toward the H1-in-body
+    /// convention instead of passing the `title` argument. The `title`
+    /// argument is a known source of `JSON parsing` errors when the LLM
+    /// fails to escape quotes (issue #67); routing every "remember this"
+    /// call through the H1 path avoids the footgun entirely.
+    #[test]
+    fn prompts_steer_write_page_toward_h1_title_convention() {
+        for prompt in [MEMORY_INSTRUCTIONS, ai_memory_core::SNIPPET_BODY] {
+            assert!(
+                prompt.contains("H1"),
+                "prompt must mention the H1 title convention for memory_write_page"
+            );
+            assert!(
+                prompt.contains("omit") || prompt.contains("Omit"),
+                "prompt must tell the agent to omit the `title` argument"
             );
         }
     }
