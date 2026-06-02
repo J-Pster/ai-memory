@@ -2,6 +2,7 @@
 //!
 //! Stub at scaffold time; full implementation in the next step.
 
+use ai_memory_core::PagePath;
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, html};
 
 /// Render a markdown body to HTML using GFM-ish defaults.
@@ -139,18 +140,25 @@ fn wikilink_href_label(raw: &str, workspace: &str, project: &str) -> Option<(Str
     // Optional `[workspace/]project:` scope qualifier.
     let (ws, proj, path_part) = split_scope(target, workspace, project);
 
-    // Strip anchor/query, reject traversal, normalise the `.md` suffix.
+    // Strip anchor/query, reject non-page extensions, normalise the `.md`
+    // suffix, then rely on the canonical page-path validator for traversal,
+    // absolute paths, Windows prefixes, backslashes, and empty segments.
     let path = path_part.split(['#', '?']).next().unwrap_or("").trim();
-    if path.is_empty() || path.contains('\\') || path.contains("..") {
+    if path.is_empty() {
         return None;
     }
-    let path = if path.rsplit('/').next().is_some_and(|seg| seg.contains('.')) {
+    let last_segment = path.rsplit('/').next().unwrap_or("");
+    let path = if last_segment.contains('.') {
+        if !path.ends_with(".md") {
+            return None;
+        }
         path.to_string()
     } else {
         format!("{path}.md")
     };
+    let path = PagePath::new(path).ok()?;
 
-    let href = crate::templates::page_href(ws, proj, &path);
+    let href = crate::templates::page_href(ws, proj, path.as_str());
     let display = label
         .filter(|l| !l.is_empty())
         .unwrap_or(target)
@@ -363,7 +371,7 @@ mod tests {
     fn wikilink_resolves_against_current_project() {
         let html = render("see [[notes/foo]] here", "default", "scratch");
         assert!(
-            html.contains(r#"<a href="/web/w/default/scratch/p/notes/foo.md">notes/foo</a>"#),
+            html.contains(r#"<a href="w/default/scratch/p/notes/foo.md">notes/foo</a>"#),
             "got: {html}"
         );
     }
@@ -374,11 +382,11 @@ mod tests {
         let html = render("[[notes/foo|the foo]] and [[bar.md]]", "default", "scratch");
         assert!(html.contains(r#">the foo</a>"#), "label: {html}");
         assert!(
-            html.contains(r#"href="/web/w/default/scratch/p/notes/foo.md""#),
+            html.contains(r#"href="w/default/scratch/p/notes/foo.md""#),
             "suffix add: {html}"
         );
         assert!(
-            html.contains(r#"href="/web/w/default/scratch/p/bar.md""#),
+            html.contains(r#"href="w/default/scratch/p/bar.md""#),
             "suffix keep: {html}"
         );
     }
@@ -391,11 +399,11 @@ mod tests {
             "scratch",
         );
         assert!(
-            html.contains(r#"href="/web/w/default/otherproj/p/notes/x.md""#),
+            html.contains(r#"href="w/default/otherproj/p/notes/x.md""#),
             "project scope: {html}"
         );
         assert!(
-            html.contains(r#"href="/web/w/ws2/proj2/p/y.md""#),
+            html.contains(r#"href="w/ws2/proj2/p/y.md""#),
             "workspace/project scope: {html}"
         );
     }
@@ -421,5 +429,12 @@ mod tests {
         // path traversal rejected
         let c = render("[[../etc/passwd]]", "default", "scratch");
         assert!(!c.contains("<a href"), "traversal: {c}");
+        // non-page extensions and invalid page paths are rejected
+        let d = render(
+            "[[notes/foo.txt]] [[/absolute]] [[notes/./foo]]",
+            "default",
+            "scratch",
+        );
+        assert!(!d.contains("<a href"), "invalid page path: {d}");
     }
 }
