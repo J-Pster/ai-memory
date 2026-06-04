@@ -1090,11 +1090,28 @@ fn mount_custom_spa(
         .with_context(|| format!("reading custom web UI index at {}", dir.display()))?;
     let injected = inject_base_path_meta(&inject_base_href(&raw, base_href), base_path);
     info!(mount, base_href, base_path, "custom web UI mounted");
-    let spa = custom_spa_router(dir, injected);
+    let spa = custom_spa_router(dir, injected.clone());
     Ok(if slug.is_empty() {
         router.merge(spa)
     } else {
-        router.nest(slug, spa)
+        // `nest(slug, …)` routes `{slug}` (→ inner `/`) and `{slug}/<path>`
+        // (→ inner `/{*path}`), but NOT the bare trailing-slash root
+        // `{slug}/` — that empty sub-path matches neither, so it 404s. The
+        // SPA router normalises its home to exactly that URL, so a refresh on
+        // the app root returned a hard 404 (`custom_spa_trailing_slash_root_*`).
+        // Serve the injected shell there too. Unlike the builtin browser —
+        // which redirects `{slug}/` → `{slug}` — a SPA is happier staying put
+        // on a 200 than bouncing through a redirect on every root refresh.
+        let slash_index = Arc::new(injected);
+        router
+            .route(
+                &format!("{slug}/"),
+                axum::routing::get(move || {
+                    let body = slash_index.clone();
+                    async move { axum::response::Html((*body).clone()) }
+                }),
+            )
+            .nest(slug, spa)
     })
 }
 
@@ -1673,6 +1690,7 @@ mod tests {
 
         for uri in [
             "/wiki/web",
+            "/wiki/web/", // trailing-slash root: SPA home after router normalises it
             "/wiki/web/index.html",
             "/wiki/web/client/route",
         ] {
@@ -1712,6 +1730,67 @@ mod tests {
             .unwrap();
         let js = std::str::from_utf8(&body).unwrap();
         assert_eq!(js, "console.log('asset');");
+    }
+
+    /// Regression for the prod 404: with `base_path=""` (host root) the custom
+    /// SPA mounts at slug `/web`. `nest("/web", …)` served `/web` and
+    /// `/web/<route>` but left the bare trailing-slash root `/web/` unrouted →
+    /// hard 404. The SPA normalises its home to exactly `/web/`, so refreshing
+    /// the app root broke (memory.djalmajr.dev + serpro.cithyper.click/wiki).
+    #[tokio::test]
+    async fn custom_spa_trailing_slash_root_serves_shell() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ui = TempDir::new().unwrap();
+        std::fs::write(
+            ui.path().join("index.html"),
+            "<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+        )
+        .unwrap();
+
+        let base_href = web_base_href("", "/web");
+        let router = mount_web_router(
+            axum::Router::new(),
+            true,
+            store.reader.clone(),
+            wiki,
+            WebMountSpec {
+                web_ui_dir: Some(ui.path()),
+                cors_origins: &[],
+                web_slug: "/web",
+                base_href: &base_href,
+                base_path: "",
+            },
+        )
+        .unwrap();
+
+        // `/web`, the trailing-slash root `/web/`, and a deep client route all
+        // serve the injected shell — none may 404.
+        for uri in ["/web", "/web/", "/web/projects/x"] {
+            let resp = router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must serve the SPA shell, not 404"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let html = std::str::from_utf8(&body).unwrap();
+            assert!(
+                html.contains("shell"),
+                "{uri} returns the SPA shell: {html}"
+            );
+            assert!(
+                html.contains(r#"<base href="/web/">"#),
+                "{uri} must receive the injected base href: {html}"
+            );
+        }
     }
 
     #[tokio::test]

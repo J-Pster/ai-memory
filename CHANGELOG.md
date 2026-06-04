@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete-single-page surface for the first time.
 
 ### Fixed
+- Custom `--web-ui-dir` SPAs mounted at a non-root `--web-slug` now serve the
+  injected shell at the trailing-slash root too (for example `/web/`), matching
+  `/web` and deep client routes instead of returning a refresh-only 404.
 - OpenCode and OMP generated hooks now derive `project_strategy = "repo-root"`
   project names from the host-visible `.ai-memory.toml` marker directory before
   sending hook payloads, so dockerized servers no longer fall back to git
