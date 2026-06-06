@@ -61,7 +61,18 @@ fn has_unknown_bare_column(token: &str) -> bool {
 }
 
 fn should_quote_fts5_token(token: &str) -> bool {
-    token.contains('-') && !(token.starts_with('"') && token.ends_with('"'))
+    if token.starts_with('"') && token.ends_with('"') {
+        return false;
+    }
+    // Quote any token carrying ASCII punctuation so FTS5 treats it as a literal
+    // phrase instead of erroring on its query grammar — e.g. a filename like
+    // `current.md` otherwise yields `fts5: syntax error near "."`. A trailing
+    // `*` (the FTS5 prefix operator) is allowed through bare; accented letters
+    // and digits are unicode (not ASCII punctuation) so recall keeps accents.
+    let core = token.strip_suffix('*').unwrap_or(token);
+    // `:` is column syntax (handled by `has_unknown_bare_column`, or preserved
+    // for known `title:`/`body:` columns) — it must not trigger quoting here.
+    core.chars().any(|c| c.is_ascii_punctuation() && c != ':')
 }
 
 fn quote_fts5_token(token: &str) -> String {
@@ -103,6 +114,24 @@ mod tests {
     #[test]
     fn single_word_has_no_or() {
         assert_eq!(prepare_fts5_query("handoff"), "handoff");
+    }
+
+    /// Regression: a filename like `current.md` used to pass through bare and
+    /// FTS5 errored with `syntax error near "."`. Quoting it as a phrase both
+    /// avoids the error and matches `architecture-current.md` (the tokens
+    /// `current` + `md` are adjacent in the indexed path).
+    #[test]
+    fn dotted_filename_token_is_quoted() {
+        assert_eq!(prepare_fts5_query("current.md"), "\"current.md\"");
+        assert_eq!(prepare_fts5_query("00-index.md"), "\"00-index.md\"");
+        assert_eq!(prepare_fts5_query("a/b/c.md"), "\"a/b/c.md\"");
+    }
+
+    /// The FTS5 prefix operator (`term*`) must survive — a trailing `*` is not
+    /// quoted away.
+    #[test]
+    fn prefix_star_token_stays_bare() {
+        assert_eq!(prepare_fts5_query("curr*"), "curr*");
     }
 
     #[test]
