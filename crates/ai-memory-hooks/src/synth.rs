@@ -71,7 +71,13 @@ fn render_body(session_id: SessionId, observations: &[Observation], title: &str)
             ObservationKind::SessionStart => start = Some(obs),
             ObservationKind::SessionEnd => end = Some(obs),
             ObservationKind::UserPrompt => prompts.push(obs),
-            ObservationKind::PostToolUse | ObservationKind::PreToolUse if !obs.title.is_empty() => {
+            // Count only PostToolUse — each tool call produces both a
+            // PreToolUse and a PostToolUse observation, so counting both
+            // doubles every reported number ("Bash: 4" for two real calls).
+            // PostToolUse is the "completed call" event; pre-only calls
+            // that never produced a post (cancellations) are intentionally
+            // excluded.
+            ObservationKind::PostToolUse if !obs.title.is_empty() => {
                 *tool_counts.entry(obs.title.as_str()).or_insert(0) += 1;
             }
             _ => {}
@@ -176,11 +182,17 @@ mod tests {
 
     #[test]
     fn body_includes_tool_counts_and_prompts() {
+        // Each real tool call produces a Pre+Post pair. The render must
+        // report one entry per call (not one per observation), so two
+        // Edit calls = 2 (not 4) and one Bash call = 1 (not 2).
         let observations = vec![
             obs(ObservationKind::SessionStart, "session"),
             obs(ObservationKind::UserPrompt, "build the thing"),
+            obs(ObservationKind::PreToolUse, "Edit"),
             obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::PreToolUse, "Edit"),
             obs(ObservationKind::PostToolUse, "Edit"),
+            obs(ObservationKind::PreToolUse, "Bash"),
             obs(ObservationKind::PostToolUse, "Bash"),
             obs(ObservationKind::SessionEnd, "session"),
         ];
@@ -194,6 +206,25 @@ mod tests {
         assert!(page.body.contains("`Edit`: 2"));
         assert!(page.body.contains("`Bash`: 1"));
         assert!(page.body.contains("build the thing"));
+    }
+
+    #[test]
+    fn pre_only_tool_calls_are_not_counted() {
+        // A PreToolUse without a matching PostToolUse (cancelled / crashed
+        // mid-call) intentionally drops out of the count rather than
+        // inflating it.
+        let observations = vec![
+            obs(ObservationKind::PreToolUse, "Bash"),
+            obs(ObservationKind::PreToolUse, "Bash"),
+            obs(ObservationKind::PostToolUse, "Bash"),
+        ];
+        let page = synthesize_session_page(
+            WorkspaceId::new(),
+            ProjectId::new(),
+            SessionId::new(),
+            &observations,
+        );
+        assert!(page.body.contains("`Bash`: 1"));
     }
 
     #[test]

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- Session-page tool-call counts no longer double every entry. The
+  no-LLM synthesizer was counting both `PreToolUse` and `PostToolUse`
+  observations into the same bucket, so a single Bash call rendered
+  as `Bash: 2` and two real calls as `Bash: 4`. It now counts only
+  `PostToolUse` (the "completed call" event), matching the user-facing
+  meaning of the heading.
 
 ## [1.0.1] - 2026-06-12
 ### Added
