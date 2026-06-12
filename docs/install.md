@@ -9,7 +9,7 @@ path (docker + Claude Code). This page covers everything else:
 - [Arch Linux native packages (AUR)](#arch-linux-native-packages-aur)
   (systemd system service or user service)
 - [Configuring other agent CLIs](#configuring-other-agent-clis)
-  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw)
+  (Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, VS Code Copilot)
 - [Installing hooks without docker](#installing-hooks-without-docker)
   (curl-based installer)
 - [Running ai-memory without docker](#running-ai-memory-without-docker)
@@ -528,7 +528,7 @@ files owned by the user running the command. Prefer it as the
 default; reach for `setup-agent` only when your docker setup is
 known not to remap UIDs.
 
-### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI
+### Cursor, Gemini CLI, Claude Desktop, OpenClaw, Antigravity CLI, VS Code Copilot
 
 See [**`docs/mcp-install.md`**](mcp-install.md) for the per-client MCP
 config file path and snippet, or one-shot it via:
@@ -569,11 +569,16 @@ docker run --rm akitaonrails/ai-memory:latest \
 docker run --rm akitaonrails/ai-memory:latest \
     install-hooks --agent openclaw       --auth-token "$TOKEN" \
     --server-url "http://homelab:49374"
+
+docker run --rm akitaonrails/ai-memory:latest \
+    install-mcp --client vscode-copilot  --auth-token "$TOKEN" \
+    --server-url "http://homelab:49374/mcp"
 ```
 
 Cursor, Gemini CLI, Antigravity CLI, and OpenClaw support both `install-mcp` and
-`install-hooks`. Claude Desktop is MCP-only here, so you'll need to
-nudge the model to call `memory_query` / `memory_handoff_accept` itself.
+`install-hooks`. Claude Desktop and VS Code Copilot are MCP-only here,
+so you'll need to nudge the model to call `memory_query` /
+`memory_handoff_accept` itself.
 For clients with `install-hooks` support, the capture path handles
 handoff injection at session start or the client's closest equivalent
 (Antigravity CLI uses `PreInvocation`).
@@ -1086,6 +1091,6 @@ write to `~/.local/share/ai-memory/hooks/`.
 - [`docs/usage.md`](usage.md) - handoffs, proactive querying, web UI,
   routing snippet, and raw-wiki inspection
 - [`docs/mcp-install.md`](mcp-install.md) - per-client MCP config
-  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP
+  reference for Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) - what's actually
   running inside ai-memory

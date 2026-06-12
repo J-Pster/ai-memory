@@ -31,6 +31,7 @@
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
+| VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
 
@@ -78,8 +79,9 @@ priors are at the [bottom](#influences-and-prior-art).
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
-  Gemini CLI, Antigravity CLI, OpenClaw, and Oh My Pi / OMP
-  (`pi` / `omp` aliases).
+  Gemini CLI, Antigravity CLI, OpenClaw, Oh My Pi / OMP
+  (`pi` / `omp` aliases), and VS Code GitHub Copilot agent mode
+  (MCP-only, workspace `.vscode/mcp.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
   with bearer-token auth. Shared servers can opt into
   [`[auto_scope]` modes](docs/auto-scope.md) for per-user or
@@ -269,8 +271,8 @@ use `--mcp-url` if you installed MCP with a custom endpoint, and
   and staged hook scripts. Redeploy remote servers separately.
 
 For Codex, OpenCode, OMP, Cursor, Claude Desktop, Gemini CLI, Antigravity CLI,
-OpenClaw, curl-based hook installs, source builds, CLI env vars, and the full
-subcommand reference, see [`docs/install.md`](docs/install.md).
+OpenClaw, VS Code Copilot, curl-based hook installs, source builds, CLI env vars,
+and the full subcommand reference, see [`docs/install.md`](docs/install.md).
 
 ## Security
 
@@ -521,7 +523,7 @@ diagram, crate breakdown, schema notes, and invariants.
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/windows.md`](docs/windows.md) | Windows install modes: full WSL2, native Windows with Docker Desktop, prebuilt native release zip, native source builds, and current hook/MCP harness caveats. |
-| [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP). |
+| [`docs/mcp-install.md`](docs/mcp-install.md) | Per-client MCP and lifecycle notes (Cursor, Claude Desktop, Gemini CLI, Antigravity CLI, OpenClaw, OMP, VS Code Copilot). |
 | [`docs/deploy.md`](docs/deploy.md) | Homelab deploy: bin/deploy, bearer-token auth, pointers to the TLS guide. |
 | [`docs/users.md`](docs/users.md) | **Multi-user attribution (v0.8).** Four-rung auth ladder, `ai-memory user add/list/expire/revive/rotate-token` walkthrough, backward-compat migration for pre-v0.8 installs, token storage rationale. |
 | [`docs/https-via-proxy.md`](docs/https-via-proxy.md) | **HTTPS via a reverse proxy.** When you need TLS (multi-user, non-loopback) and when you don't (loopback / stdio). Copy-paste docker compose templates for Caddy + Let's Encrypt, Caddy + internal CA (LAN-only), Cloudflare Tunnel (no open ports), and external cert files; plus native-Caddy + nginx recipes. The "thinking you're secure when you're not" failure modes explicitly called out. |

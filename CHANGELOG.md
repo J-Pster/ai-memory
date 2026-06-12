@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `install-mcp --client vscode-copilot` renders (and `--apply` writes) a
+  workspace-scoped `.vscode/mcp.json` for VS Code GitHub Copilot's agent
+  mode. The renderer uses VS Code's MCP framework schema — top-level
+  `servers` key, `type: "http"`, `url`, and an inline `headers` map for
+  the bearer token — and includes a note that VS Code Copilot does not
+  yet expose lifecycle hooks, so ai-memory's automatic capture is not
+  active there (the MCP tools must be called explicitly from chat).
+  Aliases: `copilot`, `github-copilot`. `uninstall --only mcp` strips
+  the same entry idempotently.
 
 ## [1.0.0] - 2026-06-12
 ### Added

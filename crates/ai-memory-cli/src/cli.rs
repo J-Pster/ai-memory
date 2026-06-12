@@ -747,6 +747,19 @@ pub enum McpClient {
     /// Google Antigravity CLI (`agy`) — `~/.gemini/antigravity-cli/mcp_config.json`.
     #[value(alias = "antigravity", alias = "agy")]
     AntigravityCli,
+    /// VS Code GitHub Copilot (agent mode) — per-workspace
+    /// `.vscode/mcp.json`. Copilot's agent mode reads MCP servers
+    /// from VS Code's own MCP framework (top-level `servers` key),
+    /// so the same JSON file works for any MCP-capable VS Code
+    /// extension, not just Copilot. Default scope is the current
+    /// workspace; pass `--config-file ~/path/to/mcp.json` to target
+    /// the user-level config instead.
+    ///
+    /// The hook surface (PreToolUse/PostToolUse/SessionStart) does
+    /// not yet exist in VS Code Copilot — this is MCP-only by
+    /// design. See `install-mcp --client vscode-copilot`.
+    #[value(name = "vscode-copilot", alias = "copilot", alias = "github-copilot")]
+    VsCodeCopilot,
 }
 
 /// Arguments for `commit`.
@@ -1185,6 +1198,29 @@ mod tests {
                 panic!("expected install-hooks command for alias {alias}");
             };
             assert!(matches!(hook_args.agent, AgentChoice::AntigravityCli));
+        }
+    }
+
+    #[test]
+    fn vscode_copilot_aliases_parse_to_same_variant() {
+        for alias in ["vscode-copilot", "copilot", "github-copilot"] {
+            let cli = Cli::try_parse_from([
+                "ai-memory",
+                "install-mcp",
+                "--client",
+                alias,
+                "--server-url",
+                "http://example.test:49374/mcp",
+            ])
+            .unwrap_or_else(|e| panic!("failed to parse install-mcp alias {alias}: {e}"));
+
+            let Command::InstallMcp(args) = cli.command else {
+                panic!("expected install-mcp command for alias {alias}");
+            };
+            assert!(
+                matches!(args.client, McpClient::VsCodeCopilot),
+                "alias {alias} must resolve to the VS Code Copilot MCP client"
+            );
         }
     }
 

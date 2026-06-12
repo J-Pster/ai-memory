@@ -113,6 +113,84 @@ metadata.
 
 ---
 
+## VS Code GitHub Copilot
+
+**Status:** ✅ MCP supported (workspace-default). ❌ No lifecycle hooks
+(Copilot's agent mode does not expose `PreToolUse` / `PostToolUse` /
+`SessionStart` yet, so ai-memory's automatic capture is not active in
+VS Code — call `memory_query`, `memory_write_page`, etc. from chat).
+
+**Config file:**
+- Workspace (recommended): `.vscode/mcp.json` in the repo root. Matches
+  ai-memory's per-cwd auto-scoping.
+- User-level: `~/.vscode/mcp.json`, or managed through the **MCP: Add
+  server** palette command.
+
+**Schema (verified against VS Code's MCP reference):** top-level key is
+`servers` (NOT `mcpServers`). HTTP endpoints use `type: "http"` and the
+`url` field; the bearer token goes into an inline `headers` object.
+
+```json
+{
+  "servers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp"
+    }
+  }
+}
+```
+
+**With a bearer token** (rendered when `--auth-token` is passed):
+
+```json
+{
+  "servers": {
+    "ai-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:49374/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+**Install command:**
+
+```bash
+# Print the snippet:
+ai-memory install-mcp --client vscode-copilot
+
+# Or write .vscode/mcp.json in the current workspace directly:
+ai-memory install-mcp --client vscode-copilot --apply
+```
+
+Aliases: `copilot`, `github-copilot`.
+
+**Gotchas:**
+- The top-level key must be `servers`. The `mcpServers` form (used by
+  Claude Code / Cursor / Gemini CLI) is silently ignored by VS Code.
+- After editing, open the MCP view in the Extensions sidebar and start
+  the server (or use **MCP: Show installed servers**). VS Code does not
+  auto-reload `.vscode/mcp.json` while the window is focused on another
+  tab.
+- Copilot Enterprise behaves the same as Copilot Individual/Business
+  for MCP — your org may restrict which MCP servers Copilot is allowed
+  to call; check **Settings → Copilot → MCP servers** if the server
+  shows as blocked.
+- Lifecycle hooks aren't possible until VS Code Copilot adds an agent
+  hook surface. Until then, the auto-handoff flow that other agents
+  enjoy (SessionStart auto-fetches a "where you left off" block) does
+  not run here — ask the agent to call `memory_handoff_accept`
+  manually if you want it.
+- Sources:
+  <https://code.visualstudio.com/docs/copilot/customization/mcp-servers>,
+  <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
+
+---
+
 ## Claude Desktop
 
 **Status:** ✅ MCP supported (via stdio shim for HTTP). ❌ No lifecycle hooks.

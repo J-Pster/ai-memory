@@ -31,6 +31,12 @@ enum JsonMcpLocation {
     RootMcpServers,
     RootMcp,
     NestedMcpServers,
+    /// Top-level `servers` key — what VS Code's MCP framework expects
+    /// in `.vscode/mcp.json` (workspace) or the user-level mcp.json.
+    /// Distinct from `RootMcpServers` despite the similar shape: VS
+    /// Code documents `servers`, not `mcpServers`, and writing the
+    /// wrong key produces a silent no-op rather than an error.
+    RootServers,
 }
 
 /// Run the `install-mcp` subcommand.
@@ -58,6 +64,7 @@ pub fn run(config: &Config, args: InstallMcpArgs) -> Result<()> {
         McpClient::Openclaw => render_openclaw(&args)?,
         McpClient::Pi => render_pi(&args)?,
         McpClient::AntigravityCli => render_antigravity_cli(&args)?,
+        McpClient::VsCodeCopilot => render_vscode_copilot(&args)?,
     };
     println!("{snippet}");
     Ok(())
@@ -135,6 +142,16 @@ pub(crate) fn mcp_config_path(client: crate::cli::McpClient) -> Result<PathBuf> 
             .join(".gemini")
             .join("antigravity-cli")
             .join("mcp_config.json"),
+        // VS Code MCP is workspace-scoped by default: `.vscode/mcp.json`
+        // at the current workspace root. The user-level alternative is
+        // managed through VS Code's `MCP: Add server` palette and not
+        // a single canonical file path, so we don't try to detect it
+        // here — `--config-file` is the escape hatch for users who
+        // want to target a non-standard location.
+        McpClient::VsCodeCopilot => std::env::current_dir()
+            .context("could not resolve current dir for .vscode/mcp.json default")?
+            .join(".vscode")
+            .join("mcp.json"),
     })
 }
 
@@ -183,6 +200,7 @@ fn json_mcp_location(client: McpClient) -> Option<JsonMcpLocation> {
         | McpClient::AntigravityCli => Some(JsonMcpLocation::RootMcpServers),
         McpClient::OpenCode => Some(JsonMcpLocation::RootMcp),
         McpClient::Openclaw => Some(JsonMcpLocation::NestedMcpServers),
+        McpClient::VsCodeCopilot => Some(JsonMcpLocation::RootServers),
         McpClient::Codex => None,
     }
 }
@@ -231,6 +249,14 @@ fn upsert_json_mcp_entry(
                 .context("`mcp.servers` is present but not an object")?;
             servers.insert(args.name.clone(), entry);
         }
+        JsonMcpLocation::RootServers => {
+            let servers = root
+                .entry("servers")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .context("`servers` is present but not an object")?;
+            servers.insert(args.name.clone(), entry);
+        }
     }
     Ok(())
 }
@@ -247,6 +273,9 @@ fn render_json_mcp_fragment(args: &InstallMcpArgs) -> Result<String> {
             }),
             JsonMcpLocation::NestedMcpServers => json!({
                 "mcp": { "servers": { args.name.as_str(): entry } }
+            }),
+            JsonMcpLocation::RootServers => json!({
+                "servers": { args.name.as_str(): entry }
             }),
         };
     Ok(serde_json::to_string_pretty(&fragment)?)
@@ -302,6 +331,18 @@ fn build_mcp_entry(args: &InstallMcpArgs) -> Result<serde_json::Value> {
         McpClient::AntigravityCli => {
             entry.insert("serverUrl".into(), json!(args.server_url));
             entry.insert("timeout".into(), json!(GEMINI_MCP_TIMEOUT_MS));
+            if let Some(b) = &bearer {
+                entry.insert("headers".into(), json!({"Authorization": b}));
+            }
+        }
+        McpClient::VsCodeCopilot => {
+            // VS Code MCP framework schema: `type: "http"` + `url`,
+            // headers map for auth. Verified against
+            // https://code.visualstudio.com/docs/agents/reference/mcp-configuration.
+            // The `mcpServers` key (used by Claude Code/Cursor/Gemini)
+            // is silently ignored here — VS Code reads `servers`.
+            entry.insert("type".into(), json!("http"));
+            entry.insert("url".into(), json!(args.server_url));
             if let Some(b) = &bearer {
                 entry.insert("headers".into(), json!({"Authorization": b}));
             }
@@ -584,6 +625,29 @@ fn render_antigravity_cli(args: &InstallMcpArgs) -> Result<String> {
     ))
 }
 
+fn render_vscode_copilot(args: &InstallMcpArgs) -> Result<String> {
+    Ok(format!(
+        "# VS Code GitHub Copilot (agent mode) — write to one of:\n\
+         #   - .vscode/mcp.json   (workspace, recommended — matches\n\
+         #                         ai-memory's per-cwd auto-scoping)\n\
+         #   - ~/.vscode/mcp.json (user-level, all workspaces)\n\
+         #\n\
+         # VS Code's MCP framework uses `servers` (NOT `mcpServers`) as the\n\
+         # top-level key, `type: \"http\"` for streamable-HTTP endpoints, and\n\
+         # an inline `headers` map for Authorization. Copilot's agent mode\n\
+         # reads this config along with any other MCP-capable VS Code\n\
+         # extension. Toggle the server from the MCP view in the\n\
+         # Extensions sidebar after editing.\n\
+         #\n\
+         # NOTE: VS Code Copilot does not yet expose lifecycle hooks\n\
+         # (PreToolUse / PostToolUse / SessionStart), so ai-memory's\n\
+         # automatic capture is NOT active here — call `memory_query`,\n\
+         # `memory_write_page`, etc. from chat when you need them.\n\
+         {snippet}\n",
+        snippet = render_json_mcp_fragment(args)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +686,7 @@ mod tests {
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
+            McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
 
@@ -639,6 +704,7 @@ mod tests {
             McpClient::Openclaw,
             McpClient::Pi,
             McpClient::AntigravityCli,
+            McpClient::VsCodeCopilot,
         ] {
             let out = render_with_token(client);
             // Every client embeds the token as `Authorization:
@@ -670,6 +736,7 @@ mod tests {
             McpClient::Openclaw,
             McpClient::Pi,
             McpClient::AntigravityCli,
+            McpClient::VsCodeCopilot,
         ] {
             let out = render_for_test(client);
             assert!(
@@ -691,6 +758,7 @@ mod tests {
             McpClient::Openclaw => render_openclaw(&args).unwrap(),
             McpClient::Pi => render_pi(&args).unwrap(),
             McpClient::AntigravityCli => render_antigravity_cli(&args).unwrap(),
+            McpClient::VsCodeCopilot => render_vscode_copilot(&args).unwrap(),
         }
     }
 
@@ -750,6 +818,14 @@ mod tests {
         assert!(render_for_test(McpClient::Codex).contains("[mcp_servers.ai-memory]"));
         assert!(render_for_test(McpClient::Pi).contains("~/.omp/agent/mcp.json"));
         assert!(render_for_test(McpClient::AntigravityCli).contains("\"serverUrl\""));
+        // VS Code Copilot must use the `servers` top-level key — the
+        // `mcpServers` form is silently ignored by VS Code's MCP
+        // framework. Regression guard against a future copy-paste
+        // from the Cursor / Claude Code renderer.
+        let vsc = render_for_test(McpClient::VsCodeCopilot);
+        assert!(vsc.contains("\"servers\""));
+        assert!(!vsc.contains("\"mcpServers\""));
+        assert!(vsc.contains("\"type\": \"http\""));
     }
 
     /// The Codex apply path must emit block-form `[mcp_servers.<name>]`

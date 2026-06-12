@@ -183,6 +183,7 @@ fn build_plan(args: &UninstallArgs) -> anyhow::Result<Vec<PlannedChange>> {
             Openclaw,
             Pi,
             AntigravityCli,
+            VsCodeCopilot,
         ] {
             let Ok(path) = install_mcp::mcp_config_path(client) else {
                 continue;
@@ -588,6 +589,7 @@ fn mcp_servers_path(client: McpClient) -> Option<&'static [&'static str]> {
         | McpClient::AntigravityCli => Some(&["mcpServers"]),
         McpClient::OpenCode => Some(&["mcp"]),
         McpClient::Openclaw => Some(&["mcp", "servers"]),
+        McpClient::VsCodeCopilot => Some(&["servers"]),
         McpClient::Codex => None,
     }
 }
