@@ -70,6 +70,8 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         AgentChoice::Cursor => "cursor",
         AgentChoice::GeminiCli => "gemini-cli",
         AgentChoice::AntigravityCli => "antigravity-cli",
+        // Grok reuses Claude Code's hook scripts (same shape + events).
+        AgentChoice::Grok => "claude-code",
         AgentChoice::OpenCode => unreachable!("opencode handled above"),
         AgentChoice::Omp => unreachable!("omp handled above"),
         AgentChoice::Openclaw => unreachable!("openclaw handled above"),
@@ -126,7 +128,7 @@ pub fn run(config: &Config, args: SetupAgentArgs) -> Result<()> {
         .join(agent_sub);
 
     match args.agent {
-        AgentChoice::ClaudeCode => emit_claude_code(&emit_root, &args)?,
+        AgentChoice::ClaudeCode | AgentChoice::Grok => emit_claude_code(&emit_root, &args)?,
         AgentChoice::Codex
         | AgentChoice::Cursor
         | AgentChoice::GeminiCli

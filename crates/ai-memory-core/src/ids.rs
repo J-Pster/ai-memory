@@ -191,6 +191,8 @@ pub enum AgentKind {
     AntigravityCli,
     /// Oh My Pi (`omp`) / Pi-compatible coding agent.
     Omp,
+    /// xAI Grok Build CLI (`grok`).
+    Grok,
     /// Anything else (manual capture, future agents).
     Other,
 }
@@ -209,6 +211,7 @@ impl AgentKind {
             Self::OpenClaw => "openclaw",
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
+            Self::Grok => "grok",
             Self::Other => "other",
         }
     }
@@ -228,6 +231,7 @@ impl AgentKind {
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
             "omp" | "pi" | "oh-my-pi" => Self::Omp,
+            "grok" => Self::Grok,
             _ => Self::Other,
         }
     }
@@ -256,6 +260,20 @@ mod tests {
     fn page_path_rejects_dot_segments() {
         assert!(PagePath::new("a/./b").is_err());
         assert!(PagePath::new("a/../b").is_err());
+    }
+
+    #[test]
+    fn agent_kind_grok_round_trips() {
+        assert_eq!(AgentKind::Grok.as_str(), "grok");
+        assert_eq!(AgentKind::from_wire("grok"), AgentKind::Grok);
+        // serde uses rename_all = "kebab-case" → "grok".
+        assert_eq!(serde_json::to_string(&AgentKind::Grok).unwrap(), "\"grok\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"grok\"").unwrap(),
+            AgentKind::Grok
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("grok-2"), AgentKind::Other);
     }
 
     #[test]

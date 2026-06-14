@@ -131,6 +131,26 @@ pub(crate) fn build_claude_code_payload_with_data_dir(
     )
 }
 
+/// Grok Build CLI hook payload. Grok's `~/.grok/hooks/*.json` shares
+/// Claude Code's JSON shape and seven-event vocabulary
+/// (`CLAUDE_CODE_EVENTS`, `HookShape::Nested`), so we reuse both and
+/// only swap the `--agent grok` tag in the emitted native command.
+pub(crate) fn build_grok_payload_with_data_dir(
+    emit_root: &Path,
+    server_url: &str,
+    auth_token: Option<&str>,
+    data_dir: Option<&Path>,
+) -> serde_json::Value {
+    build_hook_payload_for_platform(
+        &CLAUDE_CODE_EVENTS,
+        emit_root,
+        server_url,
+        auth_token,
+        HookShape::Nested,
+        HookCommandContext::new(HookCommandPlatform::for_bash_runner(), "grok", data_dir),
+    )
+}
+
 /// Different agents nest hook entries differently. Two shapes
 /// cover everyone we support:
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

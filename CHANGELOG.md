@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `install-hooks --agent grok` (plus `setup-agent` / `uninstall` coverage) for
+  the xAI **Grok Build CLI**. Grok's `~/.grok/hooks/ai-memory.json` shares Claude
+  Code's JSON shape and seven-event vocabulary, so it reuses the claude-code hook
+  scripts and emits the native `ai-memory hook --event … --agent grok` command.
+  ai-memory entries merge into a dedicated `ai-memory.json`, leaving any
+  third-party `~/.grok/hooks/*.json` untouched. NOTE: Grok ignores hook stdout on
+  `SessionStart`, so capture works but handoff injection does not — recover a
+  prior session's handoff via the MCP `memory_handoff_accept` tool. Adds
+  `AgentKind::Grok` (`grok` wire tag).
 
 ## [1.0.3] - 2026-06-13
 ### Added

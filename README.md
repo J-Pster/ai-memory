@@ -31,6 +31,7 @@
 | Claude Desktop | MCP-only | Uses `mcp-remote`; no lifecycle hooks. |
 | OpenClaw | Supported | MCP config + native plugin lifecycle hooks. |
 | Antigravity CLI | Supported | MCP config (`serverUrl`) + lifecycle hooks (`agy` alias). |
+| Grok Build CLI | Hooks | Lifecycle hooks via `install-hooks --agent grok` (`~/.grok/hooks/ai-memory.json`, native `--agent grok`, reuses claude-code scripts). Capture works; no handoff injection — Grok ignores `SessionStart` stdout, so recover handoffs via MCP `memory_handoff_accept`. |
 | VS Code Copilot | MCP-only | `.vscode/mcp.json` for Copilot agent mode; no lifecycle hooks (Copilot does not expose them yet). |
 | LLM/auth providers | Supported | Anthropic, OpenAI, OpenAI OAuth/Codex, GitHub Copilot, Gemini, OpenAI-compatible endpoints, and generic OIDC device auth for native hooks. |
 | Embedding providers | Supported | OpenAI, Voyage, and Google Gemini. |
@@ -79,7 +80,7 @@ priors are at the [bottom](#influences-and-prior-art).
   mode. Mounted on the same axum server as MCP.
 - **Multi-agent + multi-machine ready.** Supported clients: Claude
   Code, Codex, OpenCode, Cursor, Claude Desktop (via `mcp-remote`),
-  Gemini CLI, Antigravity CLI, OpenClaw, Oh My Pi / OMP
+  Gemini CLI, Antigravity CLI, Grok Build CLI, OpenClaw, Oh My Pi / OMP
   (`pi` / `omp` aliases), and VS Code GitHub Copilot agent mode
   (MCP-only, workspace `.vscode/mcp.json`).
   Server runs local (loopback) OR on a homelab box (LAN/VPN/cloud)
