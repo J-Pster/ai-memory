@@ -101,6 +101,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `403 user '' not allowed to purge_project`, making purge/move unusable on any
   instance running scope-guard. `rename-project` is unaffected (it runs no
   admission chain).
+- Hook spool no longer counts a server `429` (saturation / `hook queue full`)
+  against a spooled event's `MAX_ATTEMPTS` retry budget: transient backpressure
+  keeps the event queued without burning an attempt (`MAX_AGE_MS` still bounds
+  it), so a saturation burst no longer silently discards real observations.
+
+### Added
+- Mid-session hook-spool drain: on `post-tool-use`, once the local spool backlog
+  crosses a threshold, the hook runs a tightly time-boxed (~250 ms) catch-up
+  drain so a heavy session keeps the backlog flat instead of waiting for the next
+  session boundary. Tunable via `AI_MEMORY_HOOK_INCREMENTAL_THRESHOLD`
+  (default 32 events).
 
 ## [1.0.6] - 2026-06-14
 
