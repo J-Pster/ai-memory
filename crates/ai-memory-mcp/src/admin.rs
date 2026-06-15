@@ -354,6 +354,10 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route(
+            "/admin/audit-contamination",
+            get(handle_audit_contamination),
+        )
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
@@ -503,6 +507,43 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
 // ---------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/audit-contamination`. Supplying BOTH
+/// `workspace` and `project` scopes the audit to that one landed bucket;
+/// omit both to audit every project.
+#[derive(Deserialize)]
+struct AuditContaminationQuery {
+    workspace: Option<String>,
+    project: Option<String>,
+}
+
+/// `GET /admin/audit-contamination` — read-only structural contamination audit
+/// (see [`ai_memory_store::ReaderPool::audit_contamination`]). Reports likely
+/// cross-project mislandings (a session whose cwd resolves elsewhere; an
+/// observation whose project disagrees with its session); never mutates, so it
+/// is safe to run on any cadence (e.g. a cron probe alerting on non-zero counts).
+async fn handle_audit_contamination(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<AuditContaminationQuery>,
+) -> impl IntoResponse {
+    let scope = match (q.workspace.as_deref(), q.project.as_deref()) {
+        (Some(ws), Some(proj)) => match lookup_ws_proj_no_create(&state, ws, proj).await {
+            Ok(ids) => Some(ids),
+            Err(e) => return e,
+        },
+        _ => None,
+    };
+    match state.reader.audit_contamination(scope).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
 
 /// JSON response body for `GET /admin/status`. The CLI's `status`
 /// subcommand renders this either as JSON (`--json`) or as a small
@@ -5661,6 +5702,7 @@ mod tests {
                 }),
             ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            ("GET", "/admin/audit-contamination", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
                 "GET",
