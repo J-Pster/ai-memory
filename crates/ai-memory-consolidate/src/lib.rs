@@ -12,8 +12,11 @@ pub mod auto_improve;
 pub mod bootstrap;
 pub mod consolidator;
 pub mod curator;
+pub mod import;
+pub mod import_normalize;
 pub mod lint;
 pub mod projection;
+pub mod rehome;
 pub mod sweep;
 pub mod types;
 
@@ -38,7 +41,15 @@ pub use curator::{
     CuratorFinding, CuratorParams, CuratorReport, render_curator_report_markdown,
     run_curator_report,
 };
+pub use import::{
+    GraphEntity, GraphRelation, ImportedPage, OmcWikiPage, QdrantPoint, build_import_pages,
+    build_omc_wiki_pages,
+};
+pub use import_normalize::{NORMALIZE_SYSTEM_PROMPT, NormalizeInputPage, build_normalize_request};
 pub use lint::{LintError, LintFinding, LintReport, run_lint};
+pub use rehome::{
+    RehomeMove, RehomePage, RehomePlan, RehomeSkip, build_rehome_plan, kind_folder, rewrite_links,
+};
 pub use sweep::{EvictedPage, SweepError, SweepReport, run_sweep};
 pub use types::{
     ConsolidatedBatch, ConsolidatedPage, ConsolidatedPageUpdate, ConsolidationOutcome, PageKind,

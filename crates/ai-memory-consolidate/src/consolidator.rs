@@ -415,7 +415,7 @@ fn build_update(
     Ok((req, outcome))
 }
 
-const fn tier_as_str(t: Tier) -> &'static str {
+pub(crate) const fn tier_as_str(t: Tier) -> &'static str {
     match t {
         Tier::Working => "working",
         Tier::Episodic => "episodic",
