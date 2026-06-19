@@ -1,4 +1,4 @@
-//! `ai-memory delete-pages` — bulk-delete wiki pages via the server.
+//! `ai-memory delete-pages`, bulk-delete wiki pages via the server.
 //!
 //! Sends a `POST /admin/delete-pages` request to the running server,
 //! which removes every targeted page and commits the wiki git repo ONCE
@@ -40,7 +40,7 @@ struct DeletePagesResponseBody {
 /// webhook rejection, or filesystem error on the server).
 pub async fn run(config: &Config, args: DeletePagesArgs) -> Result<()> {
     // At least one selector is required: a prefix, an explicit list, or
-    // both. Without either there is nothing to delete — fail loud rather
+    // both. Without either there is nothing to delete, fail loud rather
     // than silently POSTing an empty set.
     if args.prefix.is_none() && args.paths_file.is_none() {
         bail!("provide at least one of --prefix or --paths-file");

@@ -6,7 +6,7 @@ no `kind` classification yet and was written at the `semantic` tier by
 default. Your job is to clean and classify each page WITHOUT changing
 what it says.
 
-## FAITHFULNESS — the most important rule
+## FAITHFULNESS, the most important rule
 
 This is a MEMORY system. The page records *what the source store
 remembered about this project*. You are NOT writing tutorials,
@@ -17,10 +17,10 @@ For EACH page you MUST:
 
 1. Classify `kind` as EXACTLY ONE of: `decision` | `gotcha` | `rule` |
    `fact`. Read the page content and pick the best fit:
-   - `decision` — the project chose X over Y (an ADR-shaped record).
-   - `gotcha`   — a failure mode, surprise, or trap worth remembering.
-   - `rule`     — a durable convention: "always X", "never Y".
-   - `fact`     — everything else; the default. Use this whenever the
+   - `decision`, the project chose X over Y (an ADR-shaped record).
+   - `gotcha`  , a failure mode, surprise, or trap worth remembering.
+   - `rule`    , a durable convention: "always X", "never Y".
+   - `fact`    , everything else; the default. Use this whenever the
      page is a plain note, concept, or reference and none of the
      stronger categories clearly applies.
 
@@ -33,7 +33,7 @@ For EACH page you MUST:
    content clearly indicates otherwise.
 
 3. Clean the body, conservatively:
-   - Repair obvious DOUBLE-ENCODED UTF-8 mojibake — text that was UTF-8,
+   - Repair obvious DOUBLE-ENCODED UTF-8 mojibake, text that was UTF-8,
      misread as Latin-1, and re-encoded as UTF-8, so accented
      characters appear as garbled multi-byte sequences. This is common
      in Portuguese text. Examples of high-confidence repairs:

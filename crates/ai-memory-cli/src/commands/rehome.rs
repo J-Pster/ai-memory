@@ -1,4 +1,4 @@
-//! `ai-memory rehome` — re-home classified pages into their native kind
+//! `ai-memory rehome`, re-home classified pages into their native kind
 //! folders and rewrite the links to moved pages.
 //!
 //! Thin HTTP client: it POSTs `/admin/rehome-by-kind` on the running server
@@ -82,7 +82,7 @@ pub async fn run_rehome(
     Ok(())
 }
 
-/// Print the rehome report — a dry-run plan or the live result.
+/// Print the rehome report, a dry-run plan or the live result.
 fn print_report(report: &RehomeResponseBody, workspace: &str, project: &str) {
     let verb = if report.dry_run {
         "would move"

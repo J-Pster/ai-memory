@@ -10,16 +10,16 @@
 //!    double-encoded UTF-8 mojibake (Portuguese text stored as
 //!    Latin-1-misread UTF-8) and tidy H1 / whitespace structure.
 //! 3. Preserve all factual content, every `[[..]]` / markdown link, and
-//!    the page `path` verbatim. The LLM must not invent content — this
+//!    the page `path` verbatim. The LLM must not invent content, this
 //!    is a memory system and fabrication corrupts it.
 //!
 //! The per-page output is a [`ConsolidatedPageUpdate`] reusing the
 //! consolidator's structured-output type; each is written via the
-//! existing write/supersession path (non-destructive — the raw version
+//! existing write/supersession path (non-destructive, the raw version
 //! stays in the supersession chain + git), making the pass idempotent
 //! (re-running re-normalizes the current latest).
 //!
-//! ## Scope — phase 1 only
+//! ## Scope, phase 1 only
 //!
 //! This is strictly per-page. There is NO cross-page deduplication or
 //! merge here; that is a documented future v2 (see
@@ -52,7 +52,7 @@ pub const NORMALIZE_SYSTEM_PROMPT: &str = include_str!("../prompts/import_normal
 /// so a re-run sees the latest values).
 #[derive(Debug, Clone)]
 pub struct NormalizeInputPage {
-    /// Wiki path — echoed back unchanged; it is the supersession key.
+    /// Wiki path, echoed back unchanged; it is the supersession key.
     pub path: String,
     /// Current page body (markdown without frontmatter).
     pub body: String,

@@ -1,11 +1,11 @@
-//! `ai-memory import-instructions` — print the agent-driven ingestion
+//! `ai-memory import-instructions`, print the agent-driven ingestion
 //! playbook to stdout.
 //!
 //! ## Why this exists
 //!
 //! The deterministic `ai-memory import` writes raw 1:1 pages. The
-//! *second pass* — pruning, classifying (`kind`), cleaning, re-homing by
-//! kind, and de-duplicating — is best done by whatever coding agent the
+//! *second pass*, pruning, classifying (`kind`), cleaning, re-homing by
+//! kind, and de-duplicating, is best done by whatever coding agent the
 //! user already runs, following `docs/ai-ingestion-playbook.md`.
 //!
 //! This subcommand emits that playbook so an agent can fetch it with a

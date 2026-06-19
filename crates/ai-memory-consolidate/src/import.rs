@@ -40,7 +40,7 @@ pub struct GraphRelation {
     /// Source entity name (the relation's owner page).
     pub from: String,
     /// Target entity name (becomes a wikilink; may not exist as an
-    /// entity — unresolved forward links are valid in ai-memory).
+    /// entity, unresolved forward links are valid in ai-memory).
     pub to: String,
     /// Relation kind (`decided_by`, `depends_on`, …), passed through.
     pub relation_type: String,
@@ -49,9 +49,9 @@ pub struct GraphRelation {
 /// A Qdrant point's distilled payload.
 #[derive(Debug, Clone)]
 pub struct QdrantPoint {
-    /// `metadata.entityName` — the bridge to a Memory Graph entity.
+    /// `metadata.entityName`, the bridge to a Memory Graph entity.
     pub entity_name: String,
-    /// `payload.document` — the semantic summary text.
+    /// `payload.document`, the semantic summary text.
     pub document: String,
     /// `metadata.project`, when present.
     pub project: Option<String>,
@@ -73,9 +73,9 @@ pub struct ImportedPage {
     pub title: String,
     /// Rendered markdown body.
     pub body: String,
-    /// Tier the page is written at — always `semantic` for imports.
+    /// Tier the page is written at, always `semantic` for imports.
     pub tier: String,
-    /// Frontmatter tags — the source `entityType` (one element), or
+    /// Frontmatter tags, the source `entityType` (one element), or
     /// empty for an orphan Qdrant point with no entity.
     pub tags: Vec<String>,
     /// Whether the page is pinned (exempt from the decay sweep).
@@ -144,7 +144,7 @@ pub fn build_import_pages(
     // always wins the un-suffixed base slug. We keep two indexes:
     // `entity_slugs[i]` is the unique page slug for the i-th entity (so
     // even two entities sharing a name get distinct pages), while
-    // `entity_slug[name]` records the FIRST occurrence's slug — the
+    // `entity_slug[name]` records the FIRST occurrence's slug, the
     // canonical target a relation to `name` resolves to.
     let mut used_slugs: HashMap<String, usize> = HashMap::new();
     let mut entity_slugs: Vec<String> = Vec::with_capacity(entities.len());
@@ -233,7 +233,7 @@ pub struct OmcWikiPage {
     /// Frontmatter `category`, when present. Appended to `tags` unless
     /// already present.
     pub category: Option<String>,
-    /// Frontmatter `links` — bare filenames of sibling OMC wiki pages.
+    /// Frontmatter `links`, bare filenames of sibling OMC wiki pages.
     /// Rendered as `[[omc/<link>]]` wikilinks under a trailing
     /// `## Related (OMC wiki)` section.
     pub links: Vec<String>,
@@ -404,7 +404,7 @@ fn render_entity_body(
 /// If the target is a known entity, reuse its already-assigned slug so
 /// the link resolves to the real page. Otherwise (an orphan forward
 /// reference to an entity that does not exist) compute a slug for the
-/// name without reserving it as a collision — unresolved forward links
+/// name without reserving it as a collision, unresolved forward links
 /// are valid, and we must not perturb the disambiguation counters that
 /// real pages depend on. We therefore slug it in an isolated map.
 fn resolve_target_slug(target: &str, entity_slug: &HashMap<&str, String>) -> String {
@@ -628,7 +628,7 @@ mod tests {
     /// transcoding, no escaping, no normalisation).
     #[test]
     fn text_is_passed_through_byte_for_byte() {
-        let tricky = "naïve café — façade \u{1F600} <html> & \"quotes\" \\back";
+        let tricky = "naïve café, façade \u{1F600} <html> & \"quotes\" \\back";
         let entities = vec![entity("Encoding Test", "Reference", &[tricky])];
         let points = vec![point("Encoding Test", tricky)];
 
@@ -814,7 +814,7 @@ mod tests {
     /// and the appended Related section follows it verbatim.
     #[test]
     fn omc_body_is_preserved_byte_for_byte() {
-        let tricky = "naïve café \u{1F600} integração — fluxo\nlinha dois";
+        let tricky = "naïve café \u{1F600} integração, fluxo\nlinha dois";
         let pages = build_omc_wiki_pages(
             &[omc_page(
                 "enc.md",

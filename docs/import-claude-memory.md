@@ -1,4 +1,4 @@
-# `ai-memory import` — Claude Code memory stack importer
+# `ai-memory import`, Claude Code memory stack importer
 
 > Status: proposed feature. Imports an existing Claude Code "dual-store"
 > memory setup (the `@modelcontextprotocol/server-memory` knowledge
@@ -10,12 +10,12 @@
 A common Claude Code memory setup before adopting ai-memory is a
 **dual store**:
 
-- **Memory Graph** — the `@modelcontextprotocol/server-memory` MCP
+- **Memory Graph**, the `@modelcontextprotocol/server-memory` MCP
   server. Persists a knowledge graph to a JSON-Lines file
   (`memory.jsonl`): one object per line, either an `entity`
   (`name`, `entityType`, `observations[]`) or a `relation`
   (`from`, `to`, `relationType`).
-- **Qdrant** — the `mcp-server-qdrant` MCP server. Stores one point per
+- **Qdrant**, the `mcp-server-qdrant` MCP server. Stores one point per
   memory with payload `{ document: <text>, metadata: { ... } }`. By
   convention the two stores are bridged: `metadata.entityName` on a
   Qdrant point equals the `name` of a Memory Graph entity, so the same
@@ -134,7 +134,7 @@ kind: None, tier: "semantic", tags: [<entityType>], pinned }`.
   `QdrantPoint`. Output: `ImportedPage { path, title, body, tier, tags,
   pinned }`.
 - **IO + orchestration**: `crates/ai-memory-cli/src/commands/import.rs`
-  — parse the jsonl file, scroll the Qdrant collection over HTTP
+ , parse the jsonl file, scroll the Qdrant collection over HTTP
   (`POST /collections/<c>/points/scroll`, paging via
   `next_page_offset`), call the pure mapper, then POST each page (or
   print under `--dry-run`).
@@ -159,7 +159,7 @@ A second importer, selected with `--source omc-wiki`, ingests an
 oh-my-claudecode (OMC) Karpathy wiki: a **flat directory of markdown
 pages**, each carrying YAML frontmatter, plus one `index.md` manifest
 that is skipped. Unlike the dual-store importer this source needs no
-LLM and no network — it reads the directory and maps each page directly.
+LLM and no network, it reads the directory and maps each page directly.
 
 ### Source format (one OMC wiki page)
 
@@ -198,15 +198,15 @@ For each `*.md` file (except `index.md`) → one `ImportedPage`:
 | markdown body                       | page body, preserved byte-for-byte                 |
 | frontmatter `links[]`               | `## Related (OMC wiki)` of `[[omc/<link>]]` links  |
 
-- **path**: `omc/<original-filename>` — the filename is preserved
+- **path**: `omc/<original-filename>`, the filename is preserved
   verbatim (it already ends in `.md`); no slugging.
 - **title**: frontmatter `title`; else the first markdown `# H1`; else
   the filename stem.
 - **tags**: frontmatter `tags` PLUS `category` (when present),
   de-duplicated and order-stable (tags first, then category if new).
 - **tier**: always `semantic`. **pinned**: from `--pinned`.
-- **body**: the markdown body byte-for-byte, then — only when the page
-  has `links` — a trailing section:
+- **body**: the markdown body byte-for-byte, then, only when the page
+  has `links`, a trailing section:
 
   ```markdown
 
@@ -252,7 +252,7 @@ The deterministic importers above are intentionally lossless and 1:1:
 every source memory becomes one wiki page, copied byte-for-byte, with no
 `kind` classification and `tier = semantic` by default. That faithfulness
 is the right default for migration, but it leaves the imported corner of
-the wiki rougher than a session-grown one — unclassified, and (for
+the wiki rougher than a session-grown one, unclassified, and (for
 sources that round-tripped through a Latin-1 mojibake) sometimes garbled.
 
 `--normalize` runs an **LLM first-pass normalization** over the pages
@@ -281,9 +281,9 @@ The per-page output is a `ConsolidatedPageUpdate` (same `path`, new
 `kind`, `tier`, cleaned `body`), written by **supersession** through the
 existing write path. The write is **non-destructive**: the raw imported
 version stays in the supersession chain and in git. The pass is
-**idempotent** — re-running re-normalizes whatever is currently latest.
+**idempotent**, re-running re-normalizes whatever is currently latest.
 
-### Scope — phase 1 only (no cross-page dedup yet)
+### Scope, phase 1 only (no cross-page dedup yet)
 
 This is strictly per-page. There is **no** cross-page deduplication or
 merge: two imported pages describing the same concept stay two pages.
@@ -326,9 +326,9 @@ ai-memory import --source omc-wiki --project my-project \
   (~8k tokens, roughly 5-6 pages/batch). Raise it for fast non-reasoning
   models; lower it if large batches still time out.
 - `--dry-run` (shared with the import step) makes the normalize pass
-  **compute and print the plan WITHOUT calling the LLM** — pages
+  **compute and print the plan WITHOUT calling the LLM**, pages
   considered, batch count, estimated input tokens, and the list of page
-  paths that would be normalized — and write nothing. Because the new
+  paths that would be normalized, and write nothing. Because the new
   `kind`/`tier` only exist after the (skipped) LLM call, the plan lists
   paths only; it does not show reclassifications. Dry-run is the
   cost-estimate path, so it must be free.
@@ -346,8 +346,8 @@ tokens, roughly 5-6 pages/batch): reasoning-capable models (e.g.
 `gpt-5-mini`) spend a long time on large structured-output batches, and a
 ~40k-token batch reliably overflows the provider's HTTP timeout while an
 8k one returns in seconds. Override it with `--normalize-max-tokens` when
-you know the model is fast. `--dry-run` is **free** — it never calls the
-LLM — so run it first to see the batch count and estimated input tokens
+you know the model is fast. `--dry-run` is **free**, it never calls the
+LLM, so run it first to see the batch count and estimated input tokens
 before paying for a live run, and use `--normalize-limit` to bound a test.
 
 ### Resilience (retry + skip-and-continue)
@@ -358,7 +358,7 @@ batch still fails after retries, the pass does **not** abort: it skips
 that batch, records its page paths, and continues the remaining batches.
 The CLI then prints a `⚠ N pages failed (re-run to retry)` line and the
 response carries them in `pages_failed`. The pass only fails fast when the
-**first** batch fails on a **non-transient** error (auth/400/schema) —
+**first** batch fails on a **non-transient** error (auth/400/schema) , 
 i.e. the provider is misconfigured and every batch would hit the same
 wall. Re-running re-processes the still-raw + failed pages naturally (it
 always re-normalizes whatever is currently latest).
@@ -378,7 +378,7 @@ Two things keep the normalize pass fast:
   concurrency (up to 6 in flight) instead of one-after-another. Each batch
   keeps its own retry + skip-and-continue behaviour; only the page WRITES are
   serialized (they go through the single writer actor). Write order doesn't
-  matter — each page is an independent supersession.
+  matter, each page is an independent supersession.
 
 ### Pruning imported pages (`delete-pages`)
 
@@ -446,7 +446,7 @@ part: **every link to a moved page is rewritten** (`[[imported/x.md|L]]` →
 `[[concepts/x.md|L]]`, and `[label](imported/x.md)` likewise) so the link
 graph never dangles. Bare wikilinks (`[[slug]]`, no folder) resolve by
 filename and are left untouched. It is **deterministic, LLM-free, and
-idempotent** — pages already home are skipped, so a second run is a no-op.
+idempotent**, pages already home are skipped, so a second run is a no-op.
 Collisions (two pages onto one path, or an occupied target) are skipped and
 reported, never clobbered.
 
@@ -469,7 +469,7 @@ ai-memory import --source omc-wiki --omc-wiki-dir ~/.omc/wiki \
   `{ dry_run, pages_considered, pages_moved, links_rewritten, moves, skipped, checkpoint? }`.
   A typo'd scope returns 404 (no auto-create).
 - Pure logic (`build_rehome_plan`, `rewrite_links`, `kind_folder`) lives in
-  `crates/ai-memory-consolidate/src/rehome.rs` — no IO, fully unit-tested
+  `crates/ai-memory-consolidate/src/rehome.rs`, no IO, fully unit-tested
   (collisions, occupied targets, `.md`-suffix preservation, unicode bodies).
 
 ## Importing the playbook (`import-instructions`)

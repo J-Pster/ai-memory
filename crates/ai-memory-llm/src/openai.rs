@@ -447,7 +447,7 @@ fn model_requires_max_completion_tokens(model: &str) -> bool {
 /// Only the gpt-5 family takes `reasoning_effort` (minimal|low|medium|high)
 /// on the Chat Completions endpoint. The o-series exposes a different
 /// reasoning knob, so this is intentionally narrower than
-/// [`model_requires_max_completion_tokens`] — keep it gpt-5 only so we
+/// [`model_requires_max_completion_tokens`], keep it gpt-5 only so we
 /// never send an unsupported field to o1/o3/o4.
 fn model_supports_reasoning_effort(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("gpt-5")
@@ -953,7 +953,7 @@ mod tests {
     #[test]
     fn build_request_compat_dialect_omits_reasoning_effort_for_gpt5() {
         // Even for a gpt-5 model id, the Compat dialect (local engines)
-        // must not emit `reasoning_effort` — they don't implement it.
+        // must not emit `reasoning_effort`, they don't implement it.
         let p = OpenAiProvider::new(SecretString::new("dummy".into()), "gpt-5-mini")
             .unwrap()
             .with_dialect(RequestDialect::Compat);

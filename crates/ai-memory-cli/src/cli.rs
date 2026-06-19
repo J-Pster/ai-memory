@@ -111,7 +111,7 @@ pub enum Command {
     /// Import an existing Claude Code "dual-store" memory setup (the
     /// `@modelcontextprotocol/server-memory` knowledge graph and/or an
     /// `mcp-server-qdrant` collection) into the wiki as native markdown
-    /// pages with resolved cross-links. Deterministic and LLM-free —
+    /// pages with resolved cross-links. Deterministic and LLM-free , 
     /// entities/relations/points map straight onto pages + wikilinks.
     /// See docs/import-claude-memory.md.
     Import(ImportArgs),
@@ -119,7 +119,7 @@ pub enum Command {
     /// (`docs/ai-ingestion-playbook.md`) to stdout. The second pass after
     /// `import`: an agent reads it to prune, classify (`kind`), clean,
     /// re-home by kind, and de-duplicate the imported pages. Embedded in
-    /// the binary — fetch it with one command, no repo layout knowledge
+    /// the binary, fetch it with one command, no repo layout knowledge
     /// needed.
     ImportInstructions,
     /// Re-home classified pages into ai-memory's native kind folders
@@ -545,11 +545,11 @@ pub struct ImportArgs {
     pub source: String,
     /// Path to the `@modelcontextprotocol/server-memory` knowledge-graph
     /// dump (`memory.jsonl`: one entity/relation JSON object per line).
-    /// Optional — import the Qdrant collection alone by omitting this.
+    /// Optional, import the Qdrant collection alone by omitting this.
     #[arg(long)]
     pub memory_graph_file: Option<PathBuf>,
     /// Base URL of the running Qdrant instance (e.g.
-    /// `http://localhost:6333`). Optional — import the graph file alone by
+    /// `http://localhost:6333`). Optional, import the graph file alone by
     /// omitting this. At least one of `--memory-graph-file` /
     /// `--qdrant-url` must be given.
     #[arg(long)]

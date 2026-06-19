@@ -1,4 +1,4 @@
-//! `ai-memory import` — import a Claude Code "dual-store" memory setup.
+//! `ai-memory import`, import a Claude Code "dual-store" memory setup.
 //!
 //! Thin HTTP client, like every other state-touching subcommand. It
 //! reads the sources locally (a `@modelcontextprotocol/server-memory`
@@ -173,7 +173,7 @@ pub async fn run(config: &Config, args: ImportArgs) -> Result<()> {
     Ok(())
 }
 
-/// The wiki path prefix each `--source` writes under — also the scope the
+/// The wiki path prefix each `--source` writes under, also the scope the
 /// normalize pass operates on. `claude-memory` → `imported/`,
 /// `omc-wiki` → `omc/`.
 ///
@@ -223,7 +223,7 @@ async fn run_normalize(
     Ok(())
 }
 
-/// Print the normalize report — a dry-run plan or the live result.
+/// Print the normalize report, a dry-run plan or the live result.
 fn print_normalize_report(report: &ImportNormalizeResponseBody, workspace: &str, project: &str) {
     let verb = if report.dry_run {
         "would normalize"
@@ -365,7 +365,7 @@ fn collect_omc_wiki_pages(args: &ImportArgs) -> Result<Vec<ImportedPage>> {
     Ok(pages)
 }
 
-/// Whether an OMC wiki page is an auto-capture "session log" — transient
+/// Whether an OMC wiki page is an auto-capture "session log", transient
 /// per-session capture noise (oh-my-claudecode writes one page per session)
 /// that should not flood the imported wiki. Matches a `session-log-*`
 /// filename (case-insensitive, `.md` suffix stripped) or a `Session Log …`
@@ -759,7 +759,7 @@ impl QdrantRawPoint {
     }
 }
 
-/// Print the planned pages without writing anything — path, title, and a
+/// Print the planned pages without writing anything, path, title, and a
 /// summary of which sections each page carries. Mirrors the
 /// `bootstrap --dry-run` human report.
 fn print_dry_run(pages: &[ImportedPage], workspace: &str, project: &str) {

@@ -4,7 +4,7 @@
 //! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
-//! - `POST /admin/import-normalize` — LLM first-pass normalization of
+//! - `POST /admin/import-normalize`, LLM first-pass normalization of
 //!   imported pages (classify kind/tier, repair mojibake) via supersession.
 //! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
@@ -24,7 +24,7 @@
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
-//! - `POST /admin/delete-pages`   — bulk-delete many pages (paths and/or a
+//! - `POST /admin/delete-pages`  , bulk-delete many pages (paths and/or a
 //!   path prefix) with ONE git commit at the end.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
@@ -1097,9 +1097,9 @@ fn dry_run_outcome(
 /// each updated page via the existing write/supersession path.
 #[derive(Deserialize)]
 struct ImportNormalizeRequest {
-    /// Workspace name (must already exist — no auto-create).
+    /// Workspace name (must already exist, no auto-create).
     workspace: String,
-    /// Project name (must already exist — no auto-create).
+    /// Project name (must already exist, no auto-create).
     project: String,
     /// Path prefixes to normalize. Defaults to the importer's two output
     /// roots, `imported/` and `omc/`.
@@ -1231,7 +1231,7 @@ async fn handle_import_normalize(
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Live runs need an LLM; dry-runs also need it (the plan shows the
     // model's sample reclassifications), so fail loud either way when no
-    // provider is configured — the feature is opt-in by design.
+    // provider is configured, the feature is opt-in by design.
     let Some(llm) = state.llm.as_ref().cloned() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1303,7 +1303,7 @@ async fn handle_import_normalize(
     let pages_considered = pages.len();
 
     // Dry-run is the COST-ESTIMATE path: it must NOT call the LLM (the
-    // whole point is to size the run before spending). Report the plan —
+    // whole point is to size the run before spending). Report the plan , 
     // pages considered, batch count, estimated input tokens, and the
     // paths that WOULD be normalized. `kind`/`tier` are left empty here
     // because the new classification only exists after the LLM runs.
@@ -1346,14 +1346,14 @@ async fn handle_import_normalize(
     // one-after-another. The LLM call is the dominant cost (gpt-5-mini
     // reasoning time), so overlapping batches is the main speedup. The
     // per-batch retry (`normalize_batch_with_retries`) and skip-and-continue
-    // semantics are preserved verbatim — they just run inside each stream
+    // semantics are preserved verbatim, they just run inside each stream
     // task now. Page WRITES are deliberately NOT done here: every write must
     // go through the single writer actor, so the concurrent stage only
     // PRODUCES `ConsolidatedPageUpdate`s; the sequential write stage below
     // consumes them. Write ordering doesn't matter (each page is independent).
     // Materialise each batch's owned inputs + paths BEFORE the stream so
     // every future owns its data (no borrow of `batches` held across an
-    // await — that tripped a higher-ranked-lifetime inference failure).
+    // await, that tripped a higher-ranked-lifetime inference failure).
     let batch_jobs: Vec<(
         usize,
         Vec<ai_memory_consolidate::NormalizeInputPage>,
@@ -1418,7 +1418,7 @@ async fn handle_import_normalize(
                 paths,
             } => {
                 // A non-transient failure on the very FIRST batch means the
-                // provider is misconfigured (auth/400/schema) — every batch
+                // provider is misconfigured (auth/400/schema), every batch
                 // would hit the same wall, so fail fast with the real cause
                 // rather than silently skipping the whole run.
                 if batch_idx == 0 && !transient {
@@ -1646,7 +1646,7 @@ fn plan_normalize_batches(
 /// failures (transport/timeout/5xx) with a short linear backoff (1s, 2s).
 /// The `ChatRequest` is rebuilt each attempt because `complete_structured`
 /// consumes it. Non-transient errors (auth/400/schema/parse-shape) return
-/// immediately — a retry would hit the same wall. On exhaustion the LAST
+/// immediately, a retry would hit the same wall. On exhaustion the LAST
 /// error is returned so the caller can classify it.
 async fn normalize_batch_with_retries(
     llm: &(dyn ai_memory_llm::LlmProvider + 'static),
@@ -1679,7 +1679,7 @@ async fn normalize_batch_with_retries(
     }
 }
 
-/// Whether an [`LlmError`] looks TRANSIENT — worth a retry — versus a
+/// Whether an [`LlmError`] looks TRANSIENT, worth a retry, versus a
 /// permanent config error. Transient: transport failures (`error sending
 /// request`, connect/timeout) and 5xx provider responses. Permanent:
 /// 4xx (auth/400/422), unexpected shape, schema, not-configured.
@@ -1687,7 +1687,7 @@ fn is_transient_llm_error(e: &ai_memory_llm::LlmError) -> bool {
     use ai_memory_llm::LlmError;
     match e {
         // Reqwest transport errors: connect, timeout, "error sending
-        // request for url" — exactly the live failure mode this hardens.
+        // request for url", exactly the live failure mode this hardens.
         LlmError::Http(_) => true,
         // Provider HTTP error: retry only on 5xx (and 429 rate-limit).
         // 4xx is a request/config problem a retry won't fix.
@@ -4461,7 +4461,7 @@ async fn handle_write_page(
 /// delete to the wrong slot.
 #[derive(Deserialize)]
 struct DeletePageAdminRequest {
-    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    /// Workspace name. Required (no auto-create, delete acts on existing data).
     workspace: String,
     /// Project name within the workspace. Required.
     project: String,
@@ -4573,7 +4573,7 @@ async fn handle_delete_page(
 /// imported pages takes a single ~860ms commit instead of one per page.
 ///
 /// The deletion set is the union of:
-/// - `paths` — explicit page paths.
+/// - `paths`, explicit page paths.
 /// - every LATEST page under `(workspace, project)` whose path starts
 ///   with `path_prefix` (expanded server-side), when present.
 ///
@@ -4581,7 +4581,7 @@ async fn handle_delete_page(
 /// set; an empty union is a successful no-op.
 #[derive(Deserialize)]
 struct DeletePagesAdminRequest {
-    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    /// Workspace name. Required (no auto-create, delete acts on existing data).
     workspace: String,
     /// Project name within the workspace. Required.
     project: String,
@@ -4601,7 +4601,7 @@ struct DeletePagesResponse {
     deleted: usize,
     /// Explicit `paths` that did not match any latest page (and were not
     /// covered by `path_prefix`). Prefix-expanded paths never appear here
-    /// — they are derived from existing pages by construction.
+    ///, they are derived from existing pages by construction.
     not_found: Vec<String>,
     /// Post-delete checkpoint OID, if the bulk delete changed the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4661,7 +4661,7 @@ async fn handle_delete_pages(
         }
     }
 
-    // Empty union is a successful no-op — nothing to delete, no commit.
+    // Empty union is a successful no-op, nothing to delete, no commit.
     if to_delete.is_empty() {
         return Ok((
             StatusCode::OK,
@@ -4682,7 +4682,7 @@ async fn handle_delete_pages(
     let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
 
     // Delete every page through the writer/wiki path WITHOUT committing per
-    // page — `delete_page` removes the SQLite row + the markdown file but
+    // page, `delete_page` removes the SQLite row + the markdown file but
     // does not touch git. The single `checkpoint_or_warn` below stages all
     // removals (`add_all` picks up deletions) and commits once.
     let mut deleted = 0usize;
@@ -4711,7 +4711,7 @@ async fn handle_delete_pages(
         deleted += 1;
     }
 
-    // ONE commit for the whole batch — the core win over N× delete-page.
+    // ONE commit for the whole batch, the core win over N× delete-page.
     let checkpoint = checkpoint_or_warn(
         &state.wiki,
         format!(
@@ -4740,7 +4740,7 @@ async fn handle_delete_pages(
 /// JSON request body for `POST /admin/rehome-by-kind`.
 #[derive(Debug, Deserialize)]
 struct RehomeByKindRequest {
-    /// Workspace name. Required (no auto-create — acts on existing data).
+    /// Workspace name. Required (no auto-create, acts on existing data).
     workspace: String,
     /// Project name within the workspace. Required.
     project: String,
@@ -4938,7 +4938,7 @@ async fn handle_rehome_by_kind(
             .map_err(|e| internal_err(e.to_string()))?;
     }
 
-    // 2) Delete the old paths of moved pages — EXCEPT any path that is also a
+    // 2) Delete the old paths of moved pages, EXCEPT any path that is also a
     //    write target (a sibling move reused it, e.g. a folder swap), so we
     //    never delete a page we just wrote.
     let new_paths: std::collections::BTreeSet<&str> =

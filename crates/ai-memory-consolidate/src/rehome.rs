@@ -59,7 +59,7 @@ pub struct RehomePlan {
     pub moves: Vec<RehomeMove>,
     /// Move candidates held back to avoid clobbering, with reasons.
     pub skipped: Vec<RehomeSkip>,
-    /// `old_path -> new_path` for the moves — the link rewriter's input.
+    /// `old_path -> new_path` for the moves, the link rewriter's input.
     pub map: BTreeMap<String, String>,
 }
 
@@ -79,7 +79,7 @@ pub fn kind_folder(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// The last `/`-separated segment of a path — the slug (filename), which a
+/// The last `/`-separated segment of a path, the slug (filename), which a
 /// re-home preserves verbatim.
 fn slug_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
@@ -237,7 +237,7 @@ fn rewrite_wikilink_inner(inner: &str, map: &BTreeMap<String, String>) -> Option
 /// simply not a moved page.
 fn remap_target(target: &str, map: &BTreeMap<String, String>) -> Option<String> {
     if target.contains(':') || !target.contains('/') {
-        return None; // cross-scope, URL, or bare slug — leave untouched
+        return None; // cross-scope, URL, or bare slug, leave untouched
     }
     let had_md = target.ends_with(".md");
     let key = if had_md {
