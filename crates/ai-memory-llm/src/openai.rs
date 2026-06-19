@@ -141,6 +141,13 @@ struct OpenAiRequest<'a> {
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    /// GPT-5 reasoning budget. Set to `"low"` for gpt-5 models under the
+    /// `Official` dialect to cut the time the model spends on internal
+    /// reasoning (a large latency win for summarization-style calls like
+    /// normalize / consolidate / lint). Omitted for every other model and
+    /// for the `Compat` dialect, where local engines don't accept it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
 }
@@ -283,12 +290,26 @@ impl OpenAiProvider {
                 (mt, mct, temp)
             }
         };
+        // GPT-5 models accept `reasoning_effort` (minimal|low|medium|high);
+        // `"low"` cuts the internal-reasoning latency a lot for the
+        // summarization-style structured calls this provider serves
+        // (normalize / consolidate / lint). Only the `Official` dialect
+        // targets `api.openai.com`; `Compat` backends (Ollama / vLLM / …)
+        // don't implement the field, so leave it off there.
+        let reasoning_effort = if self.dialect == RequestDialect::Official
+            && model_supports_reasoning_effort(&self.model)
+        {
+            Some("low")
+        } else {
+            None
+        };
         OpenAiRequest {
             model: &self.model,
             messages,
             max_tokens,
             max_completion_tokens,
             temperature,
+            reasoning_effort,
             response_format,
         }
     }
@@ -419,6 +440,17 @@ pub(crate) fn enforce_strict_object_schemas(value: &mut serde_json::Value) {
 fn model_requires_max_completion_tokens(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
+}
+
+/// Models that accept the `reasoning_effort` parameter.
+///
+/// Only the gpt-5 family takes `reasoning_effort` (minimal|low|medium|high)
+/// on the Chat Completions endpoint. The o-series exposes a different
+/// reasoning knob, so this is intentionally narrower than
+/// [`model_requires_max_completion_tokens`] — keep it gpt-5 only so we
+/// never send an unsupported field to o1/o3/o4.
+fn model_supports_reasoning_effort(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("gpt-5")
 }
 
 /// Models that reject any non-default `temperature` value.
@@ -885,6 +917,50 @@ mod tests {
             (temp - 0.2).abs() < 1e-6,
             "compat dialect must forward temperature unchanged, got {temp}"
         );
+    }
+
+    #[test]
+    fn build_request_sets_reasoning_effort_low_for_gpt5() {
+        // gpt-5 under the Official dialect gets `reasoning_effort: "low"`
+        // to cut summarization latency.
+        let p = provider_for("gpt-5-mini");
+        let req_input = chat_request();
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn build_request_omits_reasoning_effort_for_gpt4() {
+        // Non-gpt-5 models must NOT receive `reasoning_effort`.
+        let p = provider_for("gpt-4o-mini");
+        let req_input = chat_request();
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn build_request_omits_reasoning_effort_for_o_series() {
+        // The o-series uses a different reasoning knob; keep it off.
+        let p = provider_for("o3-mini");
+        let req_input = chat_request();
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn build_request_compat_dialect_omits_reasoning_effort_for_gpt5() {
+        // Even for a gpt-5 model id, the Compat dialect (local engines)
+        // must not emit `reasoning_effort` — they don't implement it.
+        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "gpt-5-mini")
+            .unwrap()
+            .with_dialect(RequestDialect::Compat);
+        let req_input = chat_request();
+        let req = p.build_request(&req_input, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
     }
 
     #[test]
