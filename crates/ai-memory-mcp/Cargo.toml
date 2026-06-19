@@ -23,6 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+# Bounded-concurrency stream combinators (`buffer_unordered`) used to run
+# the import-normalize per-batch LLM calls in parallel.
+futures-util.workspace = true
 tracing.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
