@@ -98,6 +98,16 @@ priors are at the [bottom](#influences-and-prior-art).
 - **LLM is opt-in.** Zero-LLM mode still gives you FTS5 search +
   rule-based summarisation. Add a provider when you want consolidated
   pages, lint contradictions, or staged auto-improvement proposals.
+- **Import from other memory tools.** Already running another stack?
+  `ai-memory import` migrates it into native pages with the link graph
+  intact. Supported sources today: a Claude Code "dual-store" setup
+  (the `@modelcontextprotocol/server-memory` **Memory Graph** +
+  an **mcp-server-qdrant** collection) via `--source claude-memory`, and
+  an **oh-my-claudecode Karpathy wiki** via `--source omc-wiki`. The
+  import itself is deterministic and LLM-free; an optional AI pass then
+  classifies (`--normalize`), cleans, and re-homes pages by kind
+  (`rehome`) without dangling a single link. See
+  [docs/import-claude-memory.md](docs/import-claude-memory.md).
 
 ## Use cases
 
@@ -559,6 +569,7 @@ diagram, crate breakdown, schema notes, and invariants.
 |---|---|
 | [`docs/install.md`](docs/install.md) | **Installation cookbook.** Every agent CLI, every alternative (curl, source build, no-docker, no-auth), and the server-on-a-different-machine (homelab/LAN) walkthrough. Read after the Quick start if your setup doesn't match the happy path. |
 | [`docs/usage.md`](docs/usage.md) | Handoffs, proactive memory queries, routing snippet, migration from other memory tools, web UI, raw-wiki inspection, and rules-vs-facts workflow. |
+| [`docs/import-claude-memory.md`](docs/import-claude-memory.md) | **Import from other memory tools.** `ai-memory import` for a Claude Code dual-store (Memory Graph + Qdrant) or an oh-my-claudecode wiki, plus the optional AI normalize pass, re-home by kind, bulk delete-pages, and the agent-driven ingestion playbook. |
 | [`docs/marker-file.md`](docs/marker-file.md) | `.ai-memory.toml` workspace/project routing for multi-client trees, mono-repos, worktrees, and work/personal separation. |
 | [`docs/auto-scope.md`](docs/auto-scope.md) | `[auto_scope]` modes for shared servers: default single-slot routing, session-aware isolation, and multi-user `per_actor` behavior. |
 | [`docs/macos.md`](docs/macos.md) | macOS install paths: native release binary (recommended), source build, the Docker wrapper, hook-platform notes, and current macOS limitations. |
