@@ -48,6 +48,10 @@ pub enum Command {
     /// exists in multiple workspaces never silently lands in the wrong
     /// slot (the MCP `memory_delete_page` had that gap until this build).
     DeletePage(DeletePageArgs),
+    /// Bulk-delete many wiki pages in one pass (paths and/or a path
+    /// prefix), committing the wiki git repo ONCE at the end instead of
+    /// once per page. Use this for pruning large imports.
+    DeletePages(DeletePagesArgs),
     /// Run the MCP server (with watcher) over stdio or HTTP.
     Serve(ServeArgs),
     /// Wipe the data directory's wiki/, db/, raw/ contents.
@@ -104,6 +108,27 @@ pub enum Command {
     /// project that's been around for a while. Requires
     /// AI_MEMORY_LLM_PROVIDER configured on the server.
     Bootstrap(BootstrapArgs),
+    /// Import an existing Claude Code "dual-store" memory setup (the
+    /// `@modelcontextprotocol/server-memory` knowledge graph and/or an
+    /// `mcp-server-qdrant` collection) into the wiki as native markdown
+    /// pages with resolved cross-links. Deterministic and LLM-free —
+    /// entities/relations/points map straight onto pages + wikilinks.
+    /// See docs/import-claude-memory.md.
+    Import(ImportArgs),
+    /// Print the agent-driven ingestion playbook
+    /// (`docs/ai-ingestion-playbook.md`) to stdout. The second pass after
+    /// `import`: an agent reads it to prune, classify (`kind`), clean,
+    /// re-home by kind, and de-duplicate the imported pages. Embedded in
+    /// the binary — fetch it with one command, no repo layout knowledge
+    /// needed.
+    ImportInstructions,
+    /// Re-home classified pages into ai-memory's native kind folders
+    /// (`decision->decisions/`, `gotcha->gotchas/`, `rule->_rules/`,
+    /// `fact->concepts/`, …) and rewrite every link to the moved pages so
+    /// the graph never dangles. Deterministic, LLM-free, idempotent. Run it
+    /// after a page's `kind` is assigned (e.g. after `import --normalize` or
+    /// an agent-driven classify pass). Pages already home are left alone.
+    Rehome(RehomeArgs),
     /// Install the ai-memory usage snippet into the project's
     /// CLAUDE.md / AGENTS.md (or any markdown file you specify).
     /// Idempotent — bracketed by `<!-- ai-memory:start -->` /
@@ -509,6 +534,108 @@ pub struct BootstrapArgs {
     pub force: bool,
 }
 
+/// Arguments for `import`.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Which importer to run. `claude-memory` (the default) imports a
+    /// Claude Code dual-store setup; `omc-wiki` imports an
+    /// oh-my-claudecode Karpathy wiki (a flat dir of markdown pages with
+    /// YAML frontmatter) via `--omc-wiki-dir`. Other values are rejected.
+    #[arg(long, default_value = "claude-memory")]
+    pub source: String,
+    /// Path to the `@modelcontextprotocol/server-memory` knowledge-graph
+    /// dump (`memory.jsonl`: one entity/relation JSON object per line).
+    /// Optional — import the Qdrant collection alone by omitting this.
+    #[arg(long)]
+    pub memory_graph_file: Option<PathBuf>,
+    /// Base URL of the running Qdrant instance (e.g.
+    /// `http://localhost:6333`). Optional — import the graph file alone by
+    /// omitting this. At least one of `--memory-graph-file` /
+    /// `--qdrant-url` must be given.
+    #[arg(long)]
+    pub qdrant_url: Option<String>,
+    /// Qdrant collection name to scroll. Defaults to `memory` (the
+    /// `mcp-server-qdrant` default).
+    #[arg(long, default_value = "memory")]
+    pub qdrant_collection: String,
+    /// Directory of an oh-my-claudecode Karpathy wiki to import (a flat
+    /// dir of `*.md` pages with YAML frontmatter). Required for, and only
+    /// used by, `--source omc-wiki`; the `index.md` manifest is skipped.
+    #[arg(long)]
+    pub omc_wiki_dir: Option<PathBuf>,
+    /// Import oh-my-claudecode auto-capture session-log pages too. Only
+    /// affects `--source omc-wiki`. Off by default: `session-log-*`
+    /// filenames (and `Session Log *` titles) are transient per-session
+    /// capture noise and are skipped so they don't flood the wiki. Pass
+    /// this to keep them.
+    #[arg(long)]
+    pub include_session_logs: bool,
+    /// Workspace the imported pages land in. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project the imported pages land in. When omitted, auto-derived
+    /// from the current directory using the same resolver as
+    /// write-page/read-page.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Mark every imported page pinned (exempt from the decay sweep).
+    /// Off by default; pages import at the `semantic` tier regardless.
+    #[arg(long)]
+    pub pinned: bool,
+    /// Print the planned pages (path + title + section summary) and write
+    /// nothing, mirroring `bootstrap --dry-run`. In the normalize pass,
+    /// `--dry-run` is free (it does NOT call the LLM): it prints the plan
+    /// (pages considered, batches, estimated input tokens, and the paths
+    /// that would be normalized) and writes nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// After a normal import, run an LLM "first-pass normalization" over
+    /// what was imported (scope = this project + the source's path
+    /// prefix): classify each page's kind/tier and repair high-confidence
+    /// mojibake, written non-destructively via supersession.
+    #[arg(long)]
+    pub normalize: bool,
+    /// Run ONLY the normalize pass over the scope, skipping the
+    /// import/source step entirely. When set, `--memory-graph-file` /
+    /// `--qdrant-url` / `--omc-wiki-dir` are not required.
+    #[arg(long)]
+    pub normalize_only: bool,
+    /// Cap the number of pages normalized (cheap testing). Applies to
+    /// both `--normalize` and `--normalize-only`.
+    #[arg(long)]
+    pub normalize_limit: Option<usize>,
+    /// Per-batch input-token budget (chars/4) for the normalize pass.
+    /// Omitted → the server's small reasoning-model-safe default
+    /// (~8k tokens, ~5-6 pages/batch). Raise it for fast non-reasoning
+    /// models; lower it if large batches still time out. Applies to both
+    /// `--normalize` and `--normalize-only`.
+    #[arg(long)]
+    pub normalize_max_tokens: Option<usize>,
+    /// After the import (and `--normalize`, if set), re-home every
+    /// classified page into its native kind folder and rewrite the links
+    /// to moved pages. Deterministic and LLM-free. Without a preceding
+    /// classification step most pages have no `kind` yet and stay put, so
+    /// pair this with `--normalize` (or run `ai-memory rehome` later, after
+    /// an agent-driven classify pass).
+    #[arg(long)]
+    pub rehome: bool,
+}
+
+/// Arguments for `rehome`.
+#[derive(Debug, Args)]
+pub struct RehomeArgs {
+    /// Workspace the pages live in. Defaults to `default`.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project to re-home. When omitted, auto-derived from the current
+    /// directory using the same resolver as write-page/read-page.
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Plan only: print the moves + link-rewrite count and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 /// Arguments for `setup-agent`.
 #[derive(Debug, Args)]
 pub struct SetupAgentArgs {
@@ -639,6 +766,28 @@ pub struct DeletePageArgs {
     /// (same heuristic write-page/read-page use).
     #[arg(long)]
     pub project: Option<String>,
+}
+
+/// Arguments for `delete-pages` (bulk delete).
+#[derive(Debug, Args)]
+pub struct DeletePagesArgs {
+    /// Workspace name. Defaults to `default`. Required (no auto-detect) so
+    /// a cross-workspace project-name collision can never silently route
+    /// the delete to the wrong slot.
+    #[arg(long, default_value_t = crate::config::DEFAULT_WORKSPACE.to_string())]
+    pub workspace: String,
+    /// Project name. When omitted, auto-derived from the current project
+    /// (same heuristic write-page/read-page/delete-page use).
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Delete every LATEST page whose path starts with this prefix. At
+    /// least one of `--prefix` / `--paths-file` is required.
+    #[arg(long)]
+    pub prefix: Option<String>,
+    /// Path to a file of newline-separated page paths to delete (blank
+    /// lines ignored). Combined with `--prefix` when both are given.
+    #[arg(long)]
+    pub paths_file: Option<PathBuf>,
 }
 
 /// Arguments for `reset`.
