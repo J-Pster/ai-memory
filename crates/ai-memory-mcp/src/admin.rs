@@ -4,6 +4,8 @@
 //! - `POST /admin/backup`         — snapshot db + wiki into a gzip tarball (binary response).
 //! - `POST /admin/bootstrap`      — ingest a pre-collected source bundle
 //!   into seed wiki pages via the configured LLM provider.
+//! - `POST /admin/import-normalize` — LLM first-pass normalization of
+//!   imported pages (classify kind/tier, repair mojibake) via supersession.
 //! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
@@ -22,6 +24,8 @@
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
 //! - `GET  /admin/read-page`      — fetch the full body of a single wiki page by path.
 //! - `POST /admin/delete-page`    — delete a single wiki page by path.
+//! - `POST /admin/delete-pages`   — bulk-delete many pages (paths and/or a
+//!   path prefix) with ONE git commit at the end.
 //!
 //! The CLI is responsible for filesystem access (collecting sources from
 //! the project repo, rendering output for humans); the server is
@@ -34,9 +38,9 @@ use std::path::PathBuf;
 
 use ai_memory_consolidate::{
     AutoImproveReviewConfig, Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource,
-    CuratorParams, CuratorReport, SourceCounts, prune_sources_to_budget,
-    render_curator_report_markdown, run_auto_improve_review, run_curator_report, run_lint,
-    run_sweep,
+    CuratorParams, CuratorReport, RehomePage, SourceCounts, build_rehome_plan,
+    prune_sources_to_budget, render_curator_report_markdown, rewrite_links,
+    run_auto_improve_review, run_curator_report, run_lint, run_sweep,
 };
 use ai_memory_core::{
     ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
@@ -60,6 +64,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
@@ -314,6 +319,7 @@ fn default_auto_improve_pending_path() -> String {
 /// Build the admin axum [`Router`]. Mounts:
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
+/// - `POST /admin/import-normalize`
 /// - `POST /admin/auto-improve`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
@@ -332,12 +338,14 @@ fn default_auto_improve_pending_path() -> String {
 /// - `POST /admin/move-project`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
+/// - `POST /admin/delete-pages`
 /// - user-management routes under `/admin/users*`
 pub fn admin_router(state: AdminState) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
         .route("/admin/bootstrap", post(handle_bootstrap))
+        .route("/admin/import-normalize", post(handle_import_normalize))
         .route("/admin/auto-improve", post(handle_auto_improve))
         .route("/admin/curator", post(handle_curator))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
@@ -375,7 +383,9 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
         .route("/admin/write-page", post(handle_write_page))
-        .route("/admin/delete-page", post(handle_delete_page));
+        .route("/admin/delete-page", post(handle_delete_page))
+        .route("/admin/delete-pages", post(handle_delete_pages))
+        .route("/admin/rehome-by-kind", post(handle_rehome_by_kind));
     let users = Router::new()
         .route(
             "/admin/users",
@@ -1073,6 +1083,644 @@ fn dry_run_outcome(
         StatusCode::OK,
         Json(serde_json::to_value(&outcome).unwrap_or_else(|_| serde_json::json!({}))),
     ))
+}
+
+// ---------------------------------------------------------------------
+// import-normalize
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/import-normalize`.
+///
+/// Loads the LATEST pages in `workspace`/`project` whose path starts
+/// with any of `path_prefixes`, batches them under the token budget,
+/// runs the LLM normalize pass per batch, and (unless `dry_run`) writes
+/// each updated page via the existing write/supersession path.
+#[derive(Deserialize)]
+struct ImportNormalizeRequest {
+    /// Workspace name (must already exist — no auto-create).
+    workspace: String,
+    /// Project name (must already exist — no auto-create).
+    project: String,
+    /// Path prefixes to normalize. Defaults to the importer's two output
+    /// roots, `imported/` and `omc/`.
+    #[serde(default = "default_normalize_prefixes")]
+    path_prefixes: Vec<String>,
+    /// Cap on the number of pages normalized (cheap testing). `None`
+    /// normalizes every matching page.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Compute + return the plan (pages, batches, estimated input tokens,
+    /// sample reclassifications) and write nothing.
+    #[serde(default)]
+    dry_run: bool,
+    /// Approximate chars/4 input-token budget per LLM batch. `None` (or an
+    /// absent field) falls back to [`NORMALIZE_DEFAULT_MAX_INPUT_TOKENS`],
+    /// a deliberately small budget so reasoning-capable models return each
+    /// batch well inside the provider's HTTP timeout. A literal `0` is
+    /// treated the same as absent.
+    #[serde(default)]
+    max_input_tokens: Option<usize>,
+}
+
+fn default_normalize_prefixes() -> Vec<String> {
+    vec!["imported/".to_string(), "omc/".to_string()]
+}
+
+/// One reclassified page in the [`ImportNormalizeResponse`].
+#[derive(Debug, Serialize)]
+struct NormalizedPageReport {
+    /// Wiki path (unchanged from input).
+    path: String,
+    /// New semantic kind chosen by the LLM.
+    kind: String,
+    /// New (or confirmed) tier.
+    tier: String,
+}
+
+/// JSON response body for `POST /admin/import-normalize`.
+#[derive(Debug, Serialize)]
+struct ImportNormalizeResponse {
+    /// Pages matched by the prefix filter (after the `limit` cap).
+    pages_considered: usize,
+    /// Number of LLM batches the pages were split into.
+    batches: usize,
+    /// Best-effort chars/4 estimate of total input tokens across batches.
+    estimated_input_tokens: usize,
+    /// Per-page reclassification result. On `dry_run` this is the LLM's
+    /// planned output (a sample of the reclassifications); on a live run
+    /// it is the pages actually superseded.
+    pages_updated: Vec<NormalizedPageReport>,
+    /// Paths of pages whose batch failed every retry and was skipped, so
+    /// one provider blip does not abort the whole pass. Empty on success.
+    /// Re-running the normalize pass re-processes these naturally (it
+    /// always re-normalizes the latest pages).
+    pages_failed: Vec<String>,
+    /// Whether the call ran in dry-run mode (no writes).
+    dry_run: bool,
+}
+
+/// Approximate chars-per-token heuristic, mirroring the consolidate
+/// crate's budget math. Only used to size batches, never for billing.
+const NORMALIZE_CHARS_PER_TOKEN: usize = 4;
+
+/// Default per-batch input-token budget for the normalize pass when the
+/// request omits one.
+///
+/// Deliberately small (~5-6 pages/batch). The 50k budget used elsewhere
+/// (`default_max_input_tokens`) overflows the provider's HTTP timeout for
+/// reasoning-capable models like `gpt-5-mini`, which spend a long time on
+/// large structured-output batches; a ~40k-token batch reliably times out
+/// while an 8k one returns in seconds. Keep this independent of the
+/// auto-improve budget so tuning one does not silently move the other.
+const NORMALIZE_DEFAULT_MAX_INPUT_TOKENS: usize = 8_000;
+
+/// Per-batch LLM retry budget for transient failures (transport, timeout,
+/// 5xx). The first attempt plus this many retries.
+const NORMALIZE_MAX_RETRIES: u32 = 2;
+
+/// Maximum number of per-batch normalize LLM calls in flight at once.
+///
+/// The LLM call dominates the normalize pass's wall-clock time, so
+/// overlapping batches is the main speedup. Bounded (not unbounded) so we
+/// don't open hundreds of concurrent requests against the provider and trip
+/// its rate limit; 6 is a conservative balance that still cuts a long
+/// sequential run substantially. Writes stay single-threaded through the
+/// writer actor regardless of this fan-out.
+const NORMALIZE_BATCH_CONCURRENCY: usize = 6;
+
+/// Result of one concurrent normalize batch: either the LLM updates to
+/// write, or a classified failure carrying the batch's page paths so the
+/// caller can record them in `pages_failed` (or fail fast on batch 0).
+enum NormalizeBatchOutcome {
+    /// The batch's LLM call succeeded; carries the per-page updates.
+    Ok {
+        /// Input-order index, used to sort the report deterministically.
+        batch_idx: usize,
+        /// Per-page consolidated updates to persist via the writer.
+        updates: Vec<ai_memory_consolidate::ConsolidatedPageUpdate>,
+    },
+    /// The batch's LLM call failed after retries.
+    Failed {
+        /// Input-order index; batch 0 + non-transient triggers fail-fast.
+        batch_idx: usize,
+        /// Whether the error was transient (retryable) vs a config error.
+        transient: bool,
+        /// Display string of the last error, for the fail-fast response/log.
+        error: String,
+        /// Paths in this batch, recorded in `pages_failed` when skipped.
+        paths: Vec<String>,
+    },
+}
+
+/// One page loaded from the store for normalization: its path, current
+/// body, and current kind/tier strings (as the DB stored them).
+struct LoadedNormalizePage {
+    path: String,
+    body: String,
+    current_kind: Option<ai_memory_consolidate::PageKind>,
+    current_tier: ai_memory_core::Tier,
+}
+
+async fn handle_import_normalize(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<ImportNormalizeRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Live runs need an LLM; dry-runs also need it (the plan shows the
+    // model's sample reclassifications), so fail loud either way when no
+    // provider is configured — the feature is opt-in by design.
+    let Some(llm) = state.llm.as_ref().cloned() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "LLM provider not configured on server; set AI_MEMORY_LLM_PROVIDER to use import --normalize"
+            })),
+        ));
+    };
+
+    // No-create lookup: normalizing a typo'd scope must 404, not
+    // auto-create empty containers.
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let prefixes: Vec<String> = req
+        .path_prefixes
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if prefixes.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(
+                serde_json::json!({ "error": "path_prefixes must contain at least one non-empty prefix" }),
+            ),
+        ));
+    }
+
+    let pages = load_normalize_pages(
+        &state,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        &prefixes,
+        req.limit,
+    )
+    .await?;
+    if pages.is_empty() {
+        // Nothing to do is a successful no-op, not an error.
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(ImportNormalizeResponse {
+                    pages_considered: 0,
+                    batches: 0,
+                    estimated_input_tokens: 0,
+                    pages_updated: Vec::new(),
+                    pages_failed: Vec::new(),
+                    dry_run: req.dry_run,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+
+    // Absent or `0` → the small reasoning-model-safe default. A non-zero
+    // override is honoured verbatim (callers can still opt into a larger
+    // batch for fast non-reasoning models).
+    let max_input_tokens = req
+        .max_input_tokens
+        .filter(|&n| n > 0)
+        .unwrap_or(NORMALIZE_DEFAULT_MAX_INPUT_TOKENS);
+    let batches = plan_normalize_batches(&pages, max_input_tokens);
+    let estimated_input_tokens: usize = pages
+        .iter()
+        .map(|p| (p.path.len() + p.body.len() + 32) / NORMALIZE_CHARS_PER_TOKEN)
+        .sum();
+    let pages_considered = pages.len();
+
+    // Dry-run is the COST-ESTIMATE path: it must NOT call the LLM (the
+    // whole point is to size the run before spending). Report the plan —
+    // pages considered, batch count, estimated input tokens, and the
+    // paths that WOULD be normalized. `kind`/`tier` are left empty here
+    // because the new classification only exists after the LLM runs.
+    if req.dry_run {
+        let pages_updated = pages
+            .iter()
+            .map(|p| NormalizedPageReport {
+                path: p.path.clone(),
+                kind: String::new(),
+                tier: String::new(),
+            })
+            .collect();
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(ImportNormalizeResponse {
+                    pages_considered,
+                    batches: batches.len(),
+                    estimated_input_tokens,
+                    pages_updated,
+                    pages_failed: Vec::new(),
+                    dry_run: true,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+
+    let mut reports = Vec::with_capacity(pages_considered);
+    let mut pages_failed: Vec<String> = Vec::new();
+
+    // Run the per-batch LLM calls with BOUNDED concurrency: up to
+    // `NORMALIZE_BATCH_CONCURRENCY` requests in flight at once instead of
+    // one-after-another. The LLM call is the dominant cost (gpt-5-mini
+    // reasoning time), so overlapping batches is the main speedup. The
+    // per-batch retry (`normalize_batch_with_retries`) and skip-and-continue
+    // semantics are preserved verbatim — they just run inside each stream
+    // task now. Page WRITES are deliberately NOT done here: every write must
+    // go through the single writer actor, so the concurrent stage only
+    // PRODUCES `ConsolidatedPageUpdate`s; the sequential write stage below
+    // consumes them. Write ordering doesn't matter (each page is independent).
+    // Materialise each batch's owned inputs + paths BEFORE the stream so
+    // every future owns its data (no borrow of `batches` held across an
+    // await — that tripped a higher-ranked-lifetime inference failure).
+    let batch_jobs: Vec<(
+        usize,
+        Vec<ai_memory_consolidate::NormalizeInputPage>,
+        Vec<String>,
+    )> = batches
+        .iter()
+        .enumerate()
+        .map(|(batch_idx, batch)| {
+            let inputs: Vec<ai_memory_consolidate::NormalizeInputPage> = batch
+                .iter()
+                .map(|p| ai_memory_consolidate::NormalizeInputPage {
+                    path: p.path.clone(),
+                    body: p.body.clone(),
+                    current_kind: p.current_kind,
+                    current_tier: p.current_tier,
+                })
+                .collect();
+            let batch_paths: Vec<String> = batch.iter().map(|p| p.path.clone()).collect();
+            (batch_idx, inputs, batch_paths)
+        })
+        .collect();
+
+    let llm = &*llm;
+    let outcomes: Vec<NormalizeBatchOutcome> = futures_util::stream::iter(batch_jobs)
+        .map(|(batch_idx, inputs, batch_paths)| async move {
+            // Per-batch resilience: retry the LLM call on TRANSIENT failures
+            // (transport/timeout/5xx) with a short backoff, mirroring the
+            // embedding retry loop. The request is rebuilt each attempt
+            // because `complete_structured` consumes it.
+            match normalize_batch_with_retries(llm, &inputs).await {
+                Ok(result) => NormalizeBatchOutcome::Ok {
+                    batch_idx,
+                    updates: result.updates,
+                },
+                Err(e) => NormalizeBatchOutcome::Failed {
+                    batch_idx,
+                    transient: is_transient_llm_error(&e),
+                    error: e.to_string(),
+                    paths: batch_paths,
+                },
+            }
+        })
+        .buffer_unordered(NORMALIZE_BATCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    // Collect successful updates and classify failures. `buffer_unordered`
+    // yields in completion order, so sort the OK updates back to input
+    // (path) order for a deterministic report; failures keep their own
+    // per-batch skip semantics.
+    let mut ok_updates: Vec<(usize, Vec<ai_memory_consolidate::ConsolidatedPageUpdate>)> =
+        Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            NormalizeBatchOutcome::Ok { batch_idx, updates } => {
+                ok_updates.push((batch_idx, updates));
+            }
+            NormalizeBatchOutcome::Failed {
+                batch_idx,
+                transient,
+                error,
+                paths,
+            } => {
+                // A non-transient failure on the very FIRST batch means the
+                // provider is misconfigured (auth/400/schema) — every batch
+                // would hit the same wall, so fail fast with the real cause
+                // rather than silently skipping the whole run.
+                if batch_idx == 0 && !transient {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": format!("LLM normalize failed: {error}")
+                        })),
+                    ));
+                }
+                // Otherwise one batch blipped: record its pages and keep
+                // going so a single failure doesn't sink the whole pass.
+                warn!(
+                    batch = batch_idx,
+                    pages = paths.len(),
+                    error = %error,
+                    "import-normalize: batch failed after retries; skipping and continuing"
+                );
+                pages_failed.extend(paths);
+            }
+        }
+    }
+    ok_updates.sort_by_key(|(idx, _)| *idx);
+
+    // Single-writer write stage: persist every successful batch's pages
+    // sequentially through the writer/wiki path. Ordering across pages is
+    // irrelevant (each page is an independent supersession).
+    for (_batch_idx, updates) in &ok_updates {
+        for upd in updates {
+            write_normalized_page(&state, ws, proj, upd, &actor, author_id, &skip_webhooks).await?;
+            reports.push(NormalizedPageReport {
+                path: upd.path.clone(),
+                kind: upd.kind.as_str().to_string(),
+                tier: tier_wire_str(upd.tier).to_string(),
+            });
+        }
+    }
+
+    let _ = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "import-normalize {}/{}: {} page(s){}",
+            req.workspace,
+            req.project,
+            reports.len(),
+            if pages_failed.is_empty() {
+                String::new()
+            } else {
+                format!(", {} failed", pages_failed.len())
+            }
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(ImportNormalizeResponse {
+                pages_considered,
+                batches: batches.len(),
+                estimated_input_tokens,
+                pages_updated: reports,
+                pages_failed,
+                dry_run: false,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+/// Load the latest pages under `(ws, proj)` whose path starts with any
+/// of `prefixes`, capped by `limit`, with their bodies + current
+/// kind/tier. Uses `list_pages` (by name) for the prefix scan, then
+/// `page_body_by_ids` for each body.
+async fn load_normalize_pages(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    workspace_name: &str,
+    project_name: &str,
+    prefixes: &[String],
+    limit: Option<usize>,
+) -> Result<Vec<LoadedNormalizePage>, (StatusCode, Json<serde_json::Value>)> {
+    let summaries = state
+        .reader
+        .list_pages(workspace_name, project_name)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for summary in summaries {
+        if !prefixes.iter().any(|p| summary.path.starts_with(p)) {
+            continue;
+        }
+        if let Some(cap) = limit
+            && out.len() >= cap
+        {
+            break;
+        }
+        let Some(stored) = state
+            .reader
+            .page_body_by_ids(ws, proj, &summary.path)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+        else {
+            // Index/disk skew: a listed page with no latest body row.
+            // Skip rather than fail the whole pass.
+            warn!(path = %summary.path, "import-normalize: listed page has no stored body; skipping");
+            continue;
+        };
+        out.push(LoadedNormalizePage {
+            path: summary.path,
+            body: stored.body,
+            current_kind: parse_page_kind(&summary.kind),
+            current_tier: summary
+                .tier
+                .parse()
+                .unwrap_or(ai_memory_core::Tier::Semantic),
+        });
+    }
+    Ok(out)
+}
+
+/// Write one normalized page via the existing write/supersession path.
+/// Mirrors `handle_write_page`'s frontmatter assembly + admission ctx.
+#[allow(clippy::too_many_arguments)]
+async fn write_normalized_page(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    upd: &ai_memory_consolidate::ConsolidatedPageUpdate,
+    actor: &ai_memory_core::ActorContext,
+    author_id: Option<ai_memory_core::UserId>,
+    skip_webhooks: &[String],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let path = PagePath::new(upd.path.clone()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid normalized path: {e}") })),
+        )
+    })?;
+
+    let mut fm = serde_json::Map::new();
+    fm.insert("title".into(), serde_json::Value::String(upd.title.clone()));
+    fm.insert(
+        "tier".into(),
+        serde_json::Value::String(tier_wire_str(upd.tier).to_string()),
+    );
+    fm.insert(
+        "kind".into(),
+        serde_json::Value::String(upd.kind.as_str().to_string()),
+    );
+    if !upd.tags.is_empty() {
+        fm.insert(
+            "tags".into(),
+            serde_json::Value::Array(
+                upd.tags
+                    .iter()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    // Mark the page as having been through the normalize pass so a
+    // re-run / downstream tooling can tell raw-imported from normalized.
+    fm.insert("normalized".into(), serde_json::Value::Bool(true));
+
+    let admission_ctx = Some(AdmissionContext {
+        op: AdmissionOp::WritePage,
+        skip_webhooks: skip_webhooks.to_vec(),
+        ..AdmissionContext::default()
+    });
+
+    state
+        .wiki
+        .write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path,
+            frontmatter: serde_json::Value::Object(fm),
+            body: upd.body_markdown.clone(),
+            tier: upd.tier,
+            pinned: false,
+            title: Some(upd.title.clone()),
+            admission_ctx,
+            author_id,
+            actor: actor.clone(),
+        })
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok(())
+}
+
+/// Split loaded pages into LLM batches that each stay under
+/// `max_input_tokens` (chars/4). A single page over the budget still
+/// gets its own batch (the request builder clips its body in the
+/// prompt). Preserves input order so the report reads in path order.
+fn plan_normalize_batches(
+    pages: &[LoadedNormalizePage],
+    max_input_tokens: usize,
+) -> Vec<Vec<&LoadedNormalizePage>> {
+    // Reserve ~2k tokens for the prompt scaffolding + schema.
+    let usable_chars = max_input_tokens
+        .saturating_sub(2_000)
+        .saturating_mul(NORMALIZE_CHARS_PER_TOKEN)
+        .max(NORMALIZE_CHARS_PER_TOKEN);
+    let mut batches: Vec<Vec<&LoadedNormalizePage>> = Vec::new();
+    let mut current: Vec<&LoadedNormalizePage> = Vec::new();
+    let mut current_chars = 0usize;
+    for page in pages {
+        let page_chars = page.path.len() + page.body.len() + 64;
+        if !current.is_empty() && current_chars.saturating_add(page_chars) > usable_chars {
+            batches.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(page_chars);
+        current.push(page);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// Run the LLM normalize call for one batch, retrying on TRANSIENT
+/// failures (transport/timeout/5xx) with a short linear backoff (1s, 2s).
+/// The `ChatRequest` is rebuilt each attempt because `complete_structured`
+/// consumes it. Non-transient errors (auth/400/schema/parse-shape) return
+/// immediately — a retry would hit the same wall. On exhaustion the LAST
+/// error is returned so the caller can classify it.
+async fn normalize_batch_with_retries(
+    llm: &(dyn ai_memory_llm::LlmProvider + 'static),
+    inputs: &[ai_memory_consolidate::NormalizeInputPage],
+) -> ai_memory_llm::LlmResult<ai_memory_consolidate::ConsolidatedBatch> {
+    let mut attempt = 0u32;
+    loop {
+        let request = ai_memory_consolidate::build_normalize_request(inputs);
+        match ai_memory_llm::complete_structured::<ai_memory_consolidate::ConsolidatedBatch>(
+            llm, request,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if attempt >= NORMALIZE_MAX_RETRIES || !is_transient_llm_error(&e) {
+                    return Err(e);
+                }
+                attempt += 1;
+                let delay = std::time::Duration::from_secs(u64::from(attempt));
+                warn!(
+                    attempt,
+                    error = %e,
+                    ?delay,
+                    "import-normalize: transient LLM failure; retrying batch"
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Whether an [`LlmError`] looks TRANSIENT — worth a retry — versus a
+/// permanent config error. Transient: transport failures (`error sending
+/// request`, connect/timeout) and 5xx provider responses. Permanent:
+/// 4xx (auth/400/422), unexpected shape, schema, not-configured.
+fn is_transient_llm_error(e: &ai_memory_llm::LlmError) -> bool {
+    use ai_memory_llm::LlmError;
+    match e {
+        // Reqwest transport errors: connect, timeout, "error sending
+        // request for url" — exactly the live failure mode this hardens.
+        LlmError::Http(_) => true,
+        // Provider HTTP error: retry only on 5xx (and 429 rate-limit).
+        // 4xx is a request/config problem a retry won't fix.
+        LlmError::Provider { status, .. } => *status == 429 || *status >= 500,
+        // Exhausted an inner retry budget already: don't loop again here.
+        LlmError::RetriesExhausted(_) => false,
+        // Shape/serde/schema/auth/not-configured are deterministic.
+        _ => false,
+    }
+}
+
+/// Parse a stored `kind` string back into a [`PageKind`], or `None` when
+/// it is empty / unrecognised (treated as "unclassified" for the prompt).
+fn parse_page_kind(kind: &str) -> Option<ai_memory_consolidate::PageKind> {
+    use ai_memory_consolidate::PageKind;
+    match kind.trim() {
+        "rule" => Some(PageKind::Rule),
+        "decision" => Some(PageKind::Decision),
+        "gotcha" => Some(PageKind::Gotcha),
+        "procedure" => Some(PageKind::Procedure),
+        "fact" => Some(PageKind::Fact),
+        _ => None,
+    }
+}
+
+/// Wire string for a [`Tier`], matching its `snake_case` serde rename.
+const fn tier_wire_str(t: ai_memory_core::Tier) -> &'static str {
+    match t {
+        ai_memory_core::Tier::Working => "working",
+        ai_memory_core::Tier::Episodic => "episodic",
+        ai_memory_core::Tier::Semantic => "semantic",
+        ai_memory_core::Tier::Procedural => "procedural",
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3907,6 +4555,452 @@ async fn handle_delete_page(
                 path: path.to_string(),
                 deleted: true,
                 pre_checkpoint,
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// delete-pages (bulk)
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/delete-pages`.
+///
+/// Bulk variant of `delete-page`: removes many pages then commits the
+/// wiki git repo ONCE (vs one commit per page), so pruning thousands of
+/// imported pages takes a single ~860ms commit instead of one per page.
+///
+/// The deletion set is the union of:
+/// - `paths` — explicit page paths.
+/// - every LATEST page under `(workspace, project)` whose path starts
+///   with `path_prefix` (expanded server-side), when present.
+///
+/// At least one of `paths` / `path_prefix` should resolve to a non-empty
+/// set; an empty union is a successful no-op.
+#[derive(Deserialize)]
+struct DeletePagesAdminRequest {
+    /// Workspace name. Required (no auto-create — delete acts on existing data).
+    workspace: String,
+    /// Project name within the workspace. Required.
+    project: String,
+    /// Explicit page paths to delete. May be empty when `path_prefix` is set.
+    #[serde(default)]
+    paths: Vec<String>,
+    /// When set, every LATEST page in `(workspace, project)` whose path
+    /// starts with this prefix is added to the deletion set.
+    #[serde(default)]
+    path_prefix: Option<String>,
+}
+
+/// JSON response body for `POST /admin/delete-pages`.
+#[derive(Serialize)]
+struct DeletePagesResponse {
+    /// Number of pages actually removed from the wiki + store.
+    deleted: usize,
+    /// Explicit `paths` that did not match any latest page (and were not
+    /// covered by `path_prefix`). Prefix-expanded paths never appear here
+    /// — they are derived from existing pages by construction.
+    not_found: Vec<String>,
+    /// Post-delete checkpoint OID, if the bulk delete changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+async fn handle_delete_pages(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<DeletePagesAdminRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // No-create lookup (same as delete-page/purge/move): a typo'd scope
+    // must 404, NOT auto-create empty containers and report `deleted: 0`.
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    // Snapshot the latest page paths once: used both to expand `path_prefix`
+    // and to classify explicit `paths` as found / not-found before deleting.
+    let prefix = req
+        .path_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let existing: std::collections::HashSet<String> = state
+        .reader
+        .list_pages(&req.workspace, &req.project)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .into_iter()
+        .map(|p| p.path)
+        .collect();
+
+    // Build the deletion set: explicit paths that exist, plus every latest
+    // page under the prefix. Explicit paths absent from `existing` are
+    // reported as `not_found`. Use an ordered set so the commit message
+    // and any logging stay deterministic, and so an explicit path that is
+    // also prefix-covered is only deleted once.
+    let mut to_delete: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut not_found: Vec<String> = Vec::new();
+    for raw in &req.paths {
+        let path = raw.trim();
+        if path.is_empty() {
+            continue;
+        }
+        if existing.contains(path) {
+            to_delete.insert(path.to_string());
+        } else {
+            not_found.push(path.to_string());
+        }
+    }
+    if let Some(prefix) = prefix {
+        for path in &existing {
+            if path.starts_with(prefix) {
+                to_delete.insert(path.clone());
+            }
+        }
+    }
+
+    // Empty union is a successful no-op — nothing to delete, no commit.
+    if to_delete.is_empty() {
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(DeletePagesResponse {
+                    deleted: 0,
+                    not_found,
+                    checkpoint: None,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+
+    // Delete every page through the writer/wiki path WITHOUT committing per
+    // page — `delete_page` removes the SQLite row + the markdown file but
+    // does not touch git. The single `checkpoint_or_warn` below stages all
+    // removals (`add_all` picks up deletions) and commits once.
+    let mut deleted = 0usize;
+    for raw_path in &to_delete {
+        let path = PagePath::new(raw_path.clone()).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid path {raw_path:?}: {e}") })),
+            )
+        })?;
+        let admission_ctx = if actor.has_any() || !skip_webhooks.is_empty() {
+            Some(AdmissionContext {
+                actor: actor.clone(),
+                op: AdmissionOp::Delete,
+                skip_webhooks: skip_webhooks.clone(),
+                ..AdmissionContext::default()
+            })
+        } else {
+            None
+        };
+        state
+            .wiki
+            .delete_page(ws, proj, &path, admission_ctx)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        deleted += 1;
+    }
+
+    // ONE commit for the whole batch — the core win over N× delete-page.
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "delete-pages {}/{}: {} page(s)",
+            req.workspace, req.project, deleted
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(DeletePagesResponse {
+                deleted,
+                not_found,
+                checkpoint,
+            })
+            .unwrap_or_else(|_| serde_json::json!({})),
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------
+// rehome-by-kind
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rehome-by-kind`.
+#[derive(Debug, Deserialize)]
+struct RehomeByKindRequest {
+    /// Workspace name. Required (no auto-create — acts on existing data).
+    workspace: String,
+    /// Project name within the workspace. Required.
+    project: String,
+    /// Plan only: compute the moves + link rewrites and report them, but
+    /// write/delete nothing. Default `false` (live).
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// One planned/performed move in the rehome report.
+#[derive(Debug, Serialize)]
+struct RehomeMoveReport {
+    from: String,
+    to: String,
+}
+
+/// One page held back from moving, with the reason.
+#[derive(Debug, Serialize)]
+struct RehomeSkipReport {
+    path: String,
+    reason: String,
+}
+
+/// JSON response body for `POST /admin/rehome-by-kind`.
+#[derive(Debug, Serialize)]
+struct RehomeByKindResponse {
+    dry_run: bool,
+    /// Pages examined in the scope.
+    pages_considered: usize,
+    /// Pages that moved folder (0 under `dry_run`, where it is the plan size).
+    pages_moved: usize,
+    /// Wikilinks / markdown links rewritten to follow the moves.
+    links_rewritten: usize,
+    /// Moves planned (always the full plan, dry-run or live).
+    moves: Vec<RehomeMoveReport>,
+    /// Pages that COULD move by kind but were held back (collisions).
+    skipped: Vec<RehomeSkipReport>,
+    /// Post-write checkpoint OID when the live run changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<String>,
+}
+
+/// Re-home every classified page into its native kind folder
+/// (`decision->decisions/`, `gotcha->gotchas/`, `rule->_rules/`,
+/// `fact|concept->concepts/`, …) and rewrite every link that points at a
+/// moved page so the graph never dangles. Deterministic, LLM-free, and
+/// idempotent: pages already under the right folder are left alone, so a
+/// second run is a no-op. Collisions (two pages onto one path, or an
+/// occupied target) are skipped and reported, never clobbered.
+///
+/// A move is write-at-new + delete-old; all writes happen first (bodies are
+/// snapshotted up front), then the old paths are deleted, then ONE commit.
+async fn handle_rehome_by_kind(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    headers: HeaderMap,
+    Json(req): Json<RehomeByKindRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+
+    let summaries = state
+        .reader
+        .list_pages(&req.workspace, &req.project)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let pages_considered = summaries.len();
+
+    let plan = build_rehome_plan(
+        &summaries
+            .iter()
+            .map(|s| RehomePage {
+                path: s.path.clone(),
+                kind: s.kind.clone(),
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    // Snapshot every page body up front, then compute the rewritten body +
+    // target path. Snapshotting first makes swaps/cycles safe (we never read
+    // a body we already overwrote). A page is staged for a write when it
+    // moves OR its body has links to rewrite.
+    struct Staged {
+        new_path: String,
+        moved: bool,
+        body: String,
+        frontmatter_json: String,
+        tier: String,
+        pinned: bool,
+        title: String,
+    }
+    let mut staged: Vec<Staged> = Vec::new();
+    let mut links_rewritten = 0usize;
+    for s in &summaries {
+        let Some(stored) = state
+            .reader
+            .page_body_by_ids(ws, proj, &s.path)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?
+        else {
+            continue;
+        };
+        let (new_body, n) = rewrite_links(&stored.body, &plan.map);
+        links_rewritten += n;
+        let new_path = plan.map.get(&s.path).cloned();
+        let moved = new_path.is_some();
+        if !moved && n == 0 {
+            continue; // nothing to do for this page
+        }
+        staged.push(Staged {
+            new_path: new_path.unwrap_or_else(|| s.path.clone()),
+            moved,
+            body: new_body,
+            frontmatter_json: stored.frontmatter_json,
+            tier: stored.tier,
+            pinned: stored.pinned,
+            title: stored.title,
+        });
+    }
+
+    let moves: Vec<RehomeMoveReport> = plan
+        .moves
+        .iter()
+        .map(|m| RehomeMoveReport {
+            from: m.old_path.clone(),
+            to: m.new_path.clone(),
+        })
+        .collect();
+    let skipped: Vec<RehomeSkipReport> = plan
+        .skipped
+        .iter()
+        .map(|s| RehomeSkipReport {
+            path: s.path.clone(),
+            reason: s.reason.clone(),
+        })
+        .collect();
+
+    if req.dry_run {
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(RehomeByKindResponse {
+                    dry_run: true,
+                    pages_considered,
+                    pages_moved: plan.moves.len(),
+                    links_rewritten,
+                    moves,
+                    skipped,
+                    checkpoint: None,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+
+    let actor = actor_ext
+        .map(|axum::Extension(actor)| actor)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
+    let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
+
+    // 1) Write every staged page at its (possibly new) path.
+    for item in &staged {
+        let path = PagePath::new(item.new_path.clone()).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid target path: {e}") })),
+            )
+        })?;
+        let tier: Tier = item.tier.parse().unwrap_or(Tier::Semantic);
+        let frontmatter: serde_json::Value =
+            serde_json::from_str(&item.frontmatter_json).unwrap_or(serde_json::Value::Null);
+        let admission_ctx = Some(AdmissionContext {
+            op: AdmissionOp::WritePage,
+            skip_webhooks: skip_webhooks.clone(),
+            ..AdmissionContext::default()
+        });
+        state
+            .wiki
+            .write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path,
+                frontmatter,
+                body: item.body.clone(),
+                tier,
+                pinned: item.pinned,
+                title: Some(item.title.clone()),
+                admission_ctx,
+                author_id,
+                actor: actor.clone(),
+            })
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+    }
+
+    // 2) Delete the old paths of moved pages — EXCEPT any path that is also a
+    //    write target (a sibling move reused it, e.g. a folder swap), so we
+    //    never delete a page we just wrote.
+    let new_paths: std::collections::BTreeSet<&str> =
+        staged.iter().map(|s| s.new_path.as_str()).collect();
+    let mut pages_moved = 0usize;
+    for item in &staged {
+        if !item.moved {
+            continue;
+        }
+        // `item` moved, so its OLD path is the matching plan entry. Find it.
+        // (Plan map is old->new; invert by matching new_path.)
+        // Simpler: the moved page's old path is whichever plan move targets
+        // this new_path.
+        let Some(old_path) = plan
+            .moves
+            .iter()
+            .find(|m| m.new_path == item.new_path)
+            .map(|m| m.old_path.as_str())
+        else {
+            continue;
+        };
+        if new_paths.contains(old_path) {
+            continue; // reused by a sibling move; keep it
+        }
+        let path = PagePath::new(old_path.to_string()).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid old path: {e}") })),
+            )
+        })?;
+        let admission_ctx = Some(AdmissionContext {
+            actor: actor.clone(),
+            op: AdmissionOp::Delete,
+            skip_webhooks: skip_webhooks.clone(),
+            ..AdmissionContext::default()
+        });
+        state
+            .wiki
+            .delete_page(ws, proj, &path, admission_ctx)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        pages_moved += 1;
+    }
+
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!(
+            "rehome-by-kind {}/{}: {} moved, {} links rewritten",
+            req.workspace, req.project, pages_moved, links_rewritten
+        ),
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(RehomeByKindResponse {
+                dry_run: false,
+                pages_considered,
+                pages_moved,
+                links_rewritten,
+                moves,
+                skipped,
                 checkpoint,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
