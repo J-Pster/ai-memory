@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ai-memory import`** — deterministic, LLM-free importer for an existing
+  Claude Code "dual-store" memory setup. `--source claude-memory` maps a
+  `@modelcontextprotocol/server-memory` knowledge graph (`memory.jsonl`)
+  and/or an `mcp-server-qdrant` collection into native wiki pages with
+  resolved cross-links (entities→pages, relations→wikilinks, Qdrant
+  document→Summary, bridged by `entityName`). `--source omc-wiki` ingests an
+  oh-my-claudecode Karpathy wiki (a flat dir of frontmatter markdown). See
+  `docs/import-claude-memory.md`.
+- **`import --normalize` / `--normalize-only`** — optional LLM "first-pass
+  normalization" over imported pages: classify each page's `kind`/`tier` and
+  repair high-confidence mojibake, written non-destructively via
+  supersession. Batched under a small reasoning-model-safe token budget
+  (`--normalize-max-tokens`, default ~8k) with bounded concurrency, retry,
+  and skip-and-continue. `--dry-run` is free (no LLM call). Server endpoint
+  `POST /admin/import-normalize`.
+- **`ai-memory rehome` / `import --rehome`** — deterministic "re-home by
+  kind": move every classified page into its native folder
+  (`decision→decisions/`, `gotcha→gotchas/`, `rule→_rules/`,
+  `fact|concept→concepts/`, `procedure→procedures/`, `note→notes/`) and
+  rewrite every wikilink / markdown link to a moved page so the graph never
+  dangles. Slug-preserving, idempotent, and collision-safe (colliding or
+  occupied targets are skipped and reported, never clobbered). Server
+  endpoint `POST /admin/rehome-by-kind`; pure logic in
+  `ai-memory-consolidate::rehome`.
+- **`ai-memory import-instructions`** — print the agent-driven ingestion
+  playbook (`docs/ai-ingestion-playbook.md`, embedded via `include_str!`) so
+  an agent can fetch the prune → classify → re-home → de-dup contract with
+  one command.
+- **`ai-memory delete-pages`** — bulk-delete many pages (explicit
+  `--paths-file` and/or a `--prefix`) in ONE git commit, instead of one
+  commit per page. Server endpoint `POST /admin/delete-pages`.
+- `--include-session-logs` flag for `import --source omc-wiki`. The importer
+  now SKIPS oh-my-claudecode auto-capture session-log pages (`session-log-*`
+  filenames / `Session Log …` titles) by default; pass the flag to keep them.
+
+### Changed
+- GPT-5 LLM requests (OpenAI `Official` dialect, model id `gpt-5*`) are sent
+  with `reasoning_effort: "low"` to cut latency on summarization-style calls
+  (consolidate / lint / normalize).
+
 ## [1.1.2] - 2026-06-19
 
 ### Added

@@ -915,6 +915,10 @@ docker run --rm akitaonrails/ai-memory:latest --help     # full subcommand tree
 | `checkpoints` / `restore-page` | `docker exec` | List wiki git checkpoints or restore one markdown page and reindex it |
 | `audit-contamination` | `docker exec` | Read-only structural audit for likely cross-project contamination |
 | `forget-sweep` / `lint` / `embed` | `docker exec` | Manual maintenance; sweep + lint also run on the server schedule by default |
+| `import --source …` | `docker exec` | Import a Claude Code dual-store (`claude-memory`) or oh-my-claudecode wiki (`omc-wiki`) into native pages; optional `--normalize` (LLM classify/clean) and `--rehome` (move by kind). See `docs/import-claude-memory.md` |
+| `rehome` | `docker exec` | Re-home classified pages into their kind folders and rewrite links (deterministic, idempotent) |
+| `import-instructions` | `docker run --rm` | Print the agent-driven ingestion playbook to stdout |
+| `delete-pages` | `docker exec` | Bulk-delete many pages (`--prefix` and/or `--paths-file`) in one git commit |
 | `commit -m "…"` | `docker exec` | Stage + commit the wiki tree |
 | `reset --confirm` | `docker exec` | Wipe data (refuses while siblings alive) |
 | `generate-auth-token` | `docker run --rm` | Print a random hex bearer token |
