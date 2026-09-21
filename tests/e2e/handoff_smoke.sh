@@ -84,10 +84,15 @@ fi
 # Free port for ai-memory.
 PORT="$(python3 -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()")"
 SERVER_URL="http://127.0.0.1:$PORT"
+HOOK_SCOPE="workspace=e2e-test&project=blog"
 
 # Two deliberately different Gemini variants. Both are free-tier;
 # overridable via env when the defaults rotate out.
-MODEL_A="${MODEL_A:-gemini-2.5-flash}"
+# NOTE: `gemini_call` below always sends thinkingConfig.thinkingBudget=0.
+# `gemini-3.5-flash-lite` REJECTS that field (HTTP 400) — verified against
+# the live API — so it cannot be used here. `gemini-2.5-flash-lite` accepts
+# it and stays the second variant.
+MODEL_A="${MODEL_A:-gemini-3.5-flash}"
 MODEL_B="${MODEL_B:-gemini-2.5-flash-lite}"
 
 # Isolate ai-memory's data dir; leave $HOME alone so cargo's target
@@ -120,7 +125,7 @@ AUTH_HEADER="Authorization: Bearer $AUTH_TOKEN"
 # Usage: gemini_call <model> <prompt-string>
 # Echoes the model's text response to stdout. thinkingBudget=0
 # disables reasoning tokens so maxOutputTokens is spent on the actual
-# answer (gemini-2.5-flash is a reasoning model by default).
+# answer (gemini-3.5-flash is a reasoning model by default).
 gemini_call() {
     local model="$1" prompt="$2"
     local body
@@ -213,7 +218,7 @@ SESSION_ID_1="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
 step "Session 1 ($MODEL_A): session-start hook"
 echo "{\"session_id\":\"$SESSION_ID_1\",\"cwd\":\"$TEST_DIR/blog\",\"model\":\"$MODEL_A\"}" \
     | curl -sS --max-time 3 \
-        -X POST "$SERVER_URL/hook?event=session-start&agent=open-code" \
+        -X POST "$SERVER_URL/hook?event=session-start&agent=open-code&$HOOK_SCOPE" \
         -H "Content-Type: application/json" \
         -H "$AUTH_HEADER" \
         --data-binary @- >>"$LOG_FILE" 2>&1
@@ -240,7 +245,7 @@ echo "--- end model A response ---"
 step "Session 1: forward user-prompt + session-end hooks"
 echo "{\"session_id\":\"$SESSION_ID_1\",\"prompt\":$(jq -Rs <<<"$S1_PROMPT")}" \
     | curl -sS --max-time 3 \
-        -X POST "$SERVER_URL/hook?event=user-prompt&agent=open-code" \
+        -X POST "$SERVER_URL/hook?event=user-prompt&agent=open-code&$HOOK_SCOPE" \
         -H "Content-Type: application/json" \
         -H "$AUTH_HEADER" \
         --data-binary @- >>"$LOG_FILE" 2>&1
@@ -250,7 +255,7 @@ echo "{\"session_id\":\"$SESSION_ID_1\",\"prompt\":$(jq -Rs <<<"$S1_PROMPT")}" \
 for tool in "Read" "Edit" "Write"; do
     echo "{\"session_id\":\"$SESSION_ID_1\",\"tool\":\"$tool\"}" \
         | curl -sS --max-time 2 \
-            -X POST "$SERVER_URL/hook?event=post-tool-use&agent=open-code" \
+            -X POST "$SERVER_URL/hook?event=post-tool-use&agent=open-code&$HOOK_SCOPE" \
             -H "Content-Type: application/json" \
             -H "$AUTH_HEADER" \
             --data-binary @- >>"$LOG_FILE" 2>&1
@@ -258,7 +263,7 @@ done
 
 echo "{\"session_id\":\"$SESSION_ID_1\",\"cwd\":\"$TEST_DIR/blog\"}" \
     | curl -sS --max-time 10 \
-        -X POST "$SERVER_URL/hook?event=session-end&agent=open-code" \
+        -X POST "$SERVER_URL/hook?event=session-end&agent=open-code&$HOOK_SCOPE" \
         -H "Content-Type: application/json" \
         -H "$AUTH_HEADER" \
         --data-binary @- >>"$LOG_FILE" 2>&1
@@ -287,7 +292,7 @@ SESSION_ID_2="$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
 step "Session 2 ($MODEL_B): session-start hook"
 echo "{\"session_id\":\"$SESSION_ID_2\",\"cwd\":\"$TEST_DIR/blog\",\"model\":\"$MODEL_B\"}" \
     | curl -sS --max-time 3 \
-        -X POST "$SERVER_URL/hook?event=session-start&agent=open-code" \
+        -X POST "$SERVER_URL/hook?event=session-start&agent=open-code&$HOOK_SCOPE" \
         -H "Content-Type: application/json" \
         -H "$AUTH_HEADER" \
         --data-binary @- >>"$LOG_FILE" 2>&1

@@ -12,15 +12,19 @@ use async_trait::async_trait;
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::auth::CopilotAuth;
 use crate::auth_file::{load_entry, now_ms, save_entry};
+use crate::embedding::{
+    Embedder, OPENAI_EMBED_MAX_TOKENS, normalise, parse_openai_embedding_values,
+};
 use crate::error::{LlmError, LlmResult};
 use crate::openai::{STRUCTURED_OUTPUT_SCHEMA_NAME, enforce_strict_object_schemas};
 use crate::provider::LlmProvider;
-use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::response::{provider_error_body, response_json_limited, response_text_limited};
+use crate::text::truncate_for_embedding;
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, Usage};
 
 /// GitHub Copilot's public OAuth client id used by Copilot clients.
 pub const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -179,21 +183,20 @@ impl CopilotToken {
     }
 }
 
-/// Copilot provider backed by Copilot chat completions.
-pub struct CopilotProvider {
+/// Shared Copilot token-resolution state: the GitHub->Copilot token exchange,
+/// cache, and persistence used by every Copilot-backed client (chat
+/// completions, embeddings). Factored out so both clients call the exact
+/// same `exchange_copilot_token` / `resolve_copilot_api_base_url` path
+/// instead of duplicating the auth chain.
+struct CopilotAuthState {
     client: reqwest::Client,
-    model: String,
     auth: CopilotAuth,
     stored: Mutex<CopilotToken>,
+    timeout: Duration,
 }
 
-impl CopilotProvider {
-    /// Build a provider from resolved Copilot auth inputs.
-    ///
-    /// # Errors
-    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
-    /// available.
-    pub fn new(auth: CopilotAuth, model: impl Into<String>) -> LlmResult<Self> {
+impl CopilotAuthState {
+    fn new(auth: CopilotAuth) -> LlmResult<Self> {
         let stored = CopilotToken::load(&auth.token_file)?.unwrap_or_default();
         if auth.direct_api_token.is_none()
             && auth.github_token.is_none()
@@ -206,15 +209,14 @@ impl CopilotProvider {
             )));
         }
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
             .user_agent(COPILOT_USER_AGENT)
             .build()
             .map_err(LlmError::from)?;
         Ok(Self {
             client,
-            model: model.into(),
             auth,
             stored: Mutex::new(stored),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
         })
     }
 
@@ -251,7 +253,7 @@ impl CopilotProvider {
             })?;
 
         info!("copilot API token expired or missing, exchanging GitHub token");
-        let exchanged = exchange_copilot_token(&self.client, &github).await?;
+        let exchanged = exchange_copilot_token(&self.client, self.timeout, &github).await?;
         guard.copilot_access = Some(exchanged.access.clone());
         guard.copilot_expires_at_ms = Some(exchanged.expires_at_ms);
         guard.api_base_url = Some(resolve_copilot_api_base_url(
@@ -269,20 +271,118 @@ impl CopilotProvider {
                 .unwrap_or_else(|| DEFAULT_COPILOT_API_BASE_URL.into()),
         })
     }
+}
 
-    async fn post(&self, body: &CopilotChatRequest<'_>) -> LlmResult<CopilotChatResponse> {
-        let token = self.current_token().await?;
+/// Copilot provider backed by Copilot chat completions.
+pub struct CopilotProvider {
+    model: String,
+    state: CopilotAuthState,
+    extra_headers: ExtraHeaders,
+    endpoint: Mutex<Option<CopilotEndpoint>>,
+}
+
+impl CopilotProvider {
+    /// Build a provider from resolved Copilot auth inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
+    /// available.
+    pub fn new(auth: CopilotAuth, model: impl Into<String>) -> LlmResult<Self> {
+        Ok(Self {
+            model: model.into(),
+            state: CopilotAuthState::new(auth)?,
+            extra_headers: ExtraHeaders::default(),
+            endpoint: Mutex::new(None),
+        })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Also bounds the
+    /// GitHub token-exchange request.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.state.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`. Replaces the client's
+    /// default `user-agent` when the operator configures one.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    async fn endpoint(&self, token: &CopilotApiToken) -> LlmResult<CopilotEndpoint> {
+        let mut cached = self.endpoint.lock().await;
+        if let Some(endpoint) = *cached {
+            return Ok(endpoint);
+        }
+        let url = format!("{}/models", token.base_url.trim_end_matches('/'));
+        debug!(url = %url, model = %self.model, "GET copilot model capabilities");
+        let request = self.extra_headers.apply(
+            self.state
+                .client
+                .get(&url)
+                .timeout(self.state.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers()),
+        );
+        let response = request.send().await.map_err(LlmError::from)?;
+        let status = response.status();
+        // Do not make a transient or unavailable metadata endpoint break the
+        // long-standing Chat Completions path. A successful metadata response,
+        // however, is authoritative about this model's available endpoints.
+        if !status.is_success() {
+            debug!(%status, model = %self.model, "copilot model metadata unavailable; using chat completions");
+            return Ok(CopilotEndpoint::ChatCompletions);
+        }
+        let metadata = response_json_limited::<CopilotModelsResponse>(response).await?;
+        let Some(model) = metadata
+            .data
+            .into_iter()
+            .find(|entry| entry.id == self.model)
+        else {
+            // A configured model that the catalogue does not enumerate
+            // (enterprise/custom deployments, aliases, casing, a model newer
+            // than this list) reached Chat Completions directly before this
+            // metadata check existed. Keep that backward-compatible path rather
+            // than hard-erroring; only models the catalogue lists as
+            // Responses-only route through `/responses`.
+            warn!(
+                model = %self.model,
+                "copilot model not found in /models catalogue; using chat completions"
+            );
+            *cached = Some(CopilotEndpoint::ChatCompletions);
+            return Ok(CopilotEndpoint::ChatCompletions);
+        };
+        let endpoint = CopilotEndpoint::from_supported(&model.supported_endpoints).ok_or_else(|| {
+            LlmError::UnexpectedShape(format!(
+                "copilot model {:?} has no supported completion endpoint; advertised endpoints: {:?}",
+                self.model, model.supported_endpoints
+            ))
+        })?;
+        *cached = Some(endpoint);
+        Ok(endpoint)
+    }
+
+    async fn post_chat(
+        &self,
+        token: &CopilotApiToken,
+        body: &CopilotChatRequest<'_>,
+    ) -> LlmResult<CopilotChatResponse> {
         let url = format!("{}/chat/completions", token.base_url.trim_end_matches('/'));
         debug!(url = %url, "POST copilot chat completions");
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(token.access.expose_secret())
-            .headers(copilot_runtime_headers())
-            .json(body)
-            .send()
-            .await
-            .map_err(LlmError::from)?;
+        let request = self.extra_headers.apply(
+            self.state
+                .client
+                .post(&url)
+                .timeout(self.state.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers()),
+        );
+        let resp = request.json(body).send().await.map_err(LlmError::from)?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -292,6 +392,32 @@ impl CopilotProvider {
             });
         }
         response_json_limited::<CopilotChatResponse>(resp).await
+    }
+
+    async fn post_responses(
+        &self,
+        token: &CopilotApiToken,
+        body: &CopilotResponsesRequest<'_>,
+    ) -> LlmResult<CopilotResponsesResponse> {
+        let url = format!("{}/responses", token.base_url.trim_end_matches('/'));
+        debug!(url = %url, "POST copilot responses");
+        let request = self.extra_headers.apply(
+            self.state
+                .client
+                .post(&url)
+                .timeout(self.state.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers()),
+        );
+        let resp = request.json(body).send().await.map_err(LlmError::from)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(LlmError::Provider {
+                status: status.as_u16(),
+                body: provider_error_body(resp).await,
+            });
+        }
+        response_json_limited::<CopilotResponsesResponse>(resp).await
     }
 }
 
@@ -306,10 +432,20 @@ impl LlmProvider for CopilotProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        let response = self
-            .post(&build_chat_request(&self.model, &request, None))
-            .await?;
-        Ok(to_chat_response(response))
+        let token = self.state.current_token().await?;
+        match self.endpoint(&token).await? {
+            CopilotEndpoint::ChatCompletions => to_chat_response(
+                self.post_chat(&token, &build_chat_request(&self.model, &request, None))
+                    .await?,
+            ),
+            CopilotEndpoint::Responses => Ok(to_responses_chat_response(
+                self.post_responses(
+                    &token,
+                    &build_responses_request(&self.model, &request, None),
+                )
+                .await?,
+            )?),
+        }
     }
 
     async fn complete_structured_raw(
@@ -318,26 +454,44 @@ impl LlmProvider for CopilotProvider {
         mut schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
         enforce_strict_object_schemas(&mut schema);
-        let response_format = CopilotResponseFormat::JsonSchema {
-            json_schema: CopilotJsonSchema {
-                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
-                schema,
-                strict: true,
-            },
+        let token = self.state.current_token().await?;
+        let text = match self.endpoint(&token).await? {
+            CopilotEndpoint::ChatCompletions => self
+                .post_chat(
+                    &token,
+                    &build_chat_request(
+                        &self.model,
+                        &request,
+                        Some(CopilotResponseFormat::JsonSchema {
+                            json_schema: CopilotJsonSchema {
+                                name: STRUCTURED_OUTPUT_SCHEMA_NAME.into(),
+                                schema,
+                                strict: true,
+                            },
+                        }),
+                    ),
+                )
+                .await?
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_deref())
+                .filter(|text| !text.is_empty())
+                .ok_or_else(|| {
+                    LlmError::UnexpectedShape(
+                        "copilot /chat/completions returned no structured content".into(),
+                    )
+                })?
+                .to_owned(),
+            CopilotEndpoint::Responses => response_text(
+                &self
+                    .post_responses(
+                        &token,
+                        &build_responses_request(&self.model, &request, Some(schema)),
+                    )
+                    .await?,
+            )?,
         };
-        let response = self
-            .post(&build_chat_request(
-                &self.model,
-                &request,
-                Some(response_format),
-            ))
-            .await?;
-        let text = response
-            .choices
-            .first()
-            .and_then(|c| c.message.content.as_deref())
-            .unwrap_or("");
-        serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
+        serde_json::from_str::<serde_json::Value>(&text).map_err(LlmError::from)
     }
 }
 
@@ -348,6 +502,131 @@ struct CopilotApiToken {
     base_url: String,
 }
 
+/// Default embedding model requested from Copilot's `/embeddings` endpoint.
+pub const COPILOT_DEFAULT_EMBED_MODEL: &str = "text-embedding-3-small";
+
+/// Default vector dimensionality for [`COPILOT_DEFAULT_EMBED_MODEL`].
+pub const COPILOT_DEFAULT_EMBED_DIM: u32 = 1536;
+
+#[derive(Debug, Serialize)]
+struct CopilotEmbeddingRequest<'a> {
+    input: &'a str,
+    model: &'a str,
+}
+
+/// GitHub Copilot embedder.
+///
+/// **Caveat:** the Copilot `/embeddings` endpoint path and wire shape are
+/// taken from the OpenAI-compatible contract Copilot documents for chat and
+/// from prior art in other Copilot clients (openclaw#61717), not from a live
+/// test against Copilot here — GitHub does not publish a dedicated
+/// embeddings spec. Default model [`COPILOT_DEFAULT_EMBED_MODEL`]
+/// (`text-embedding-3-small`) and dim [`COPILOT_DEFAULT_EMBED_DIM`] (1536)
+/// follow the same prior art. Reuses the identical GitHub-token ->
+/// short-lived Copilot API token exchange as [`CopilotProvider`] via
+/// [`CopilotAuthState`] — no separate exchange path.
+pub struct CopilotEmbedder {
+    state: CopilotAuthState,
+    model: String,
+    dim: u32,
+}
+
+impl CopilotEmbedder {
+    /// Build an embedder from resolved Copilot auth inputs.
+    ///
+    /// # Errors
+    /// Returns [`LlmError::NotConfigured`] when no GitHub/direct token is
+    /// available.
+    pub fn new(auth: CopilotAuth, model: impl Into<String>, dim: u32) -> LlmResult<Self> {
+        Ok(Self {
+            state: CopilotAuthState::new(auth)?,
+            model: model.into(),
+            dim,
+        })
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.state.timeout = Duration::from_secs(secs);
+        self
+    }
+}
+
+#[async_trait]
+impl Embedder for CopilotEmbedder {
+    fn provider(&self) -> &'static str {
+        "copilot"
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    async fn embed(&self, text: &str) -> LlmResult<Vec<f32>> {
+        let token = self.state.current_token().await?;
+        let input = truncate_for_embedding(text, OPENAI_EMBED_MAX_TOKENS);
+        let url = format!("{}/embeddings", token.base_url.trim_end_matches('/'));
+        debug!(url = %url, model = %self.model, "POST copilot embeddings");
+        let req = CopilotEmbeddingRequest {
+            input: &input,
+            model: &self.model,
+        };
+        let mut attempt = 0u32;
+        loop {
+            let resp = self
+                .state
+                .client
+                .post(&url)
+                .timeout(self.state.timeout)
+                .bearer_auth(token.access.expose_secret())
+                .headers(copilot_runtime_headers())
+                .json(&req)
+                .send()
+                .await
+                .map_err(LlmError::from)?;
+            let status = resp.status();
+            if status.as_u16() == 429 && attempt < 5 {
+                attempt += 1;
+                let delay = Duration::from_secs(2u64.saturating_pow(attempt));
+                debug!(attempt, ?delay, "copilot embeddings rate-limited; retrying");
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            // Client errors (e.g. input too long) are not retried.
+            if status.as_u16() == 400 {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            if !status.is_success() {
+                let body = provider_error_body(resp).await;
+                return Err(LlmError::Provider {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            let body = response_text_limited(resp).await?;
+            let values = parse_openai_embedding_values(&body, status.as_u16())?;
+            if values.len() as u32 != self.dim {
+                return Err(LlmError::UnexpectedShape(format!(
+                    "expected dim {}, got {}",
+                    self.dim,
+                    values.len()
+                )));
+            }
+            return Ok(normalise(values));
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CopilotExchangeResponse {
     token: String,
@@ -356,10 +635,12 @@ struct CopilotExchangeResponse {
 
 async fn exchange_copilot_token(
     client: &reqwest::Client,
+    timeout: Duration,
     github_token: &SecretString,
 ) -> LlmResult<CopilotApiToken> {
     let resp = client
         .get(GITHUB_COPILOT_TOKEN_URL)
+        .timeout(timeout)
         .bearer_auth(github_token.expose_secret())
         .headers(copilot_token_exchange_headers())
         .send()
@@ -396,10 +677,7 @@ fn build_chat_request<'a>(
     }
     for m in &request.messages {
         messages.push(CopilotMsg {
-            role: match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-            },
+            role: m.role.as_str(),
             content: &m.content,
         });
     }
@@ -420,6 +698,121 @@ fn build_chat_request<'a>(
 fn model_uses_default_temperature(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m.starts_with("gpt-5") || m.starts_with('o')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopilotEndpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl CopilotEndpoint {
+    fn from_supported(endpoints: &[String]) -> Option<Self> {
+        if endpoints
+            .iter()
+            .any(|endpoint| endpoint == "/chat/completions")
+        {
+            Some(Self::ChatCompletions)
+        } else if endpoints.iter().any(|endpoint| endpoint == "/responses") {
+            Some(Self::Responses)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotModelsResponse {
+    #[serde(default)]
+    data: Vec<CopilotModelMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotModelMetadata {
+    id: String,
+    #[serde(default)]
+    supported_endpoints: Vec<String>,
+}
+
+fn build_responses_request<'a>(
+    model: &'a str,
+    request: &'a ChatRequest,
+    schema: Option<serde_json::Value>,
+) -> CopilotResponsesRequest<'a> {
+    CopilotResponsesRequest {
+        model,
+        instructions: request.system.as_deref(),
+        input: request
+            .messages
+            .iter()
+            .map(|message| CopilotResponsesInput {
+                kind: "message",
+                role: message.role.as_str(),
+                content: vec![CopilotResponsesInputText {
+                    kind: "input_text",
+                    text: &message.content,
+                }],
+            })
+            .collect(),
+        max_output_tokens: request.max_tokens,
+        temperature: (!model_uses_default_temperature(model))
+            .then_some(request.temperature)
+            .flatten(),
+        store: false,
+        stream: false,
+        text: schema.map(|schema| CopilotResponsesText {
+            format: CopilotResponsesTextFormat {
+                kind: "json_schema",
+                name: STRUCTURED_OUTPUT_SCHEMA_NAME,
+                schema,
+                strict: true,
+            },
+        }),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotResponsesRequest<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    input: Vec<CopilotResponsesInput<'a>>,
+    max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    store: bool,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<CopilotResponsesText>,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotResponsesInput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'a str,
+    content: Vec<CopilotResponsesInputText<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotResponsesInputText<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotResponsesText {
+    format: CopilotResponsesTextFormat,
+}
+
+#[derive(Debug, Serialize)]
+struct CopilotResponsesTextFormat {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'static str,
+    schema: serde_json::Value,
+    strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -455,6 +848,114 @@ struct CopilotJsonSchema {
 }
 
 #[derive(Debug, Deserialize)]
+struct CopilotResponsesResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    output: Vec<CopilotResponsesOutput>,
+    #[serde(default)]
+    usage: Option<CopilotResponsesUsage>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<CopilotResponsesError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotResponsesOutput {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    content: Vec<CopilotResponsesContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotResponsesContent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotResponsesUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotResponsesError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+fn response_text(response: &CopilotResponsesResponse) -> LlmResult<String> {
+    if response
+        .status
+        .as_deref()
+        .is_some_and(|status| status != "completed")
+    {
+        let detail = response
+            .error
+            .as_ref()
+            .and_then(|error| error.message.as_deref().or(error.code.as_deref()))
+            .unwrap_or("no error detail");
+        return Err(LlmError::UnexpectedShape(format!(
+            "copilot /responses finished with status {:?}: {detail}",
+            response.status
+        )));
+    }
+    if let Some(text) = response
+        .output_text
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        return Ok(text.to_owned());
+    }
+    for output in &response.output {
+        if output.kind != "message" {
+            continue;
+        }
+        for content in &output.content {
+            if content.kind == "refusal" {
+                return Err(LlmError::UnexpectedShape(format!(
+                    "copilot /responses refused the request: {}",
+                    content.refusal.as_deref().unwrap_or("no refusal detail")
+                )));
+            }
+            if content.kind == "output_text"
+                && let Some(text) = content.text.as_deref().filter(|text| !text.is_empty())
+            {
+                return Ok(text.to_owned());
+            }
+        }
+    }
+    Err(LlmError::UnexpectedShape(
+        "copilot /responses returned no text content".into(),
+    ))
+}
+
+fn to_responses_chat_response(response: CopilotResponsesResponse) -> LlmResult<ChatResponse> {
+    let text = response_text(&response)?;
+    Ok(ChatResponse {
+        text,
+        usage: response.usage.map(|usage| Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        }),
+        model: response.model.unwrap_or_else(|| "copilot".into()),
+    })
+}
+
+#[derive(Debug, Deserialize)]
 struct CopilotChatResponse {
     choices: Vec<CopilotChoice>,
     #[serde(default)]
@@ -481,21 +982,24 @@ struct CopilotUsage {
     completion_tokens: u32,
 }
 
-fn to_chat_response(response: CopilotChatResponse) -> ChatResponse {
+fn to_chat_response(response: CopilotChatResponse) -> LlmResult<ChatResponse> {
     let text = response
         .choices
         .first()
         .and_then(|c| c.message.content.as_deref())
-        .unwrap_or_default()
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            LlmError::UnexpectedShape("copilot /chat/completions returned no text content".into())
+        })?
         .to_string();
-    ChatResponse {
+    Ok(ChatResponse {
         text,
         usage: response.usage.map(|u| Usage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
         }),
         model: response.model.unwrap_or_else(|| "copilot".into()),
-    }
+    })
 }
 
 fn copilot_token_exchange_headers() -> reqwest::header::HeaderMap {
@@ -622,7 +1126,6 @@ fn unix_epoch_to_ms(value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use secrecy::ExposeSecret as _;
     use serde_json::json;
 
     use super::*;
@@ -801,10 +1304,7 @@ mod tests {
     fn chat_request_uses_openai_compatible_shape() {
         let request = ChatRequest {
             system: Some("sys".into()),
-            messages: vec![crate::types::ChatMessage {
-                role: Role::User,
-                content: "hello".into(),
-            }],
+            messages: vec![crate::types::ChatMessage::user("hello")],
             temperature: Some(0.2),
             max_tokens: 123,
         };

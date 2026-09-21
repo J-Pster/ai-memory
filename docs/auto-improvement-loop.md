@@ -1,4 +1,42 @@
-# Optional Auto-Improvement Loop Research
+# Auto-improvement
+
+## The 60-second version (read this first)
+
+When an LLM provider is configured, the server periodically reviews
+newly completed sessions and proposes small wiki edits — a new gotcha,
+a rule promotion, a patch to a stale concept page. Every proposal is
+validated (schema, confidence floor, size caps, eval gate) and staged
+into `_pending/auto-improve/` with a human-readable sidecar, then
+**auto-approved by default** through the normal wiki write path.
+
+What that means for you:
+
+- **Solo, zero-LLM install**: this never runs. Nothing to decide.
+- **Solo with an LLM**: the default is fine — proposals are small,
+  bounded, audited (every one lands in the pending-writes trail with
+  evidence quotes and a confidence score), and reversible via wiki
+  history. Run `ai-memory pending-writes list` for a week if you want to
+  build trust — that (and SQLite) is the source of truth for a proposal's
+  status. The `_pending/auto-improve/` sidecar files are a human-readable
+  snapshot frozen at staging time; they do not track a proposal to
+  approved/applied/rejected.
+- **Shared / team server**: set `[auto_improve] require_approval =
+  true`. On a server several people trust, an LLM should not
+  auto-apply edits nobody reviewed — proposals then wait in
+  `_pending/` until a human approves each one.
+- **Cost**: one bounded LLM call per completed session that passes the
+  preflight filters (minimum observations/duration); prompt and output
+  sizes are capped in `[auto_improve]`.
+
+A typical staged proposal sidecar looks like: the target path, the
+operation (create or patch), a confidence like `0.86`, the rationale,
+bounded evidence quotes from the session, and the exact body or edits
+— enough to approve or reject without opening anything else.
+
+The rest of this page is the original design research plus
+implementation notes, kept for depth.
+
+---
 
 > Status: research plus implemented production notes. The server schedules
 > auto-improvement for newly completed sessions in every project when an LLM provider is
@@ -31,7 +69,10 @@ The safe product shape is:
 Do not copy Hermes' agent-local skill system directly. ai-memory's durable unit
 is the project wiki page, not a `SKILL.md` package. The analogous targets are
 `gotchas/`, `decisions/`, `concepts/`, `procedures/`, `_rules/`, small
-`_slots/` state pages, and pending review pages under `_pending/`.
+`_slots/` state pages, and pending review pages under `_pending/`. The managed
+ai-memory Agent Skills installed with routing are a narrow prompt-packaging
+exception: static files that teach agents when to call MCP tools, not durable
+memory pages or auto-improvement outputs.
 
 ## Hermes Findings
 
@@ -73,7 +114,7 @@ The default is off, preserving existing behavior. When enabled:
 | Foreground memory, interactive CLI | Prompt inline when possible. |
 | Foreground memory, no prompt channel | Stage to pending storage. |
 | Background memory | Stage to pending storage. |
-| Skill writes | Always stage, because skill files can be large. |
+| Hermes skill writes | Always stage, because skill files can be large. |
 | User denies inline memory write | Block, do not stage. |
 | Prompt machinery fails | Stage rather than silently dropping the write. |
 
@@ -171,16 +212,33 @@ The shipped feature is an audit-first learning reviewer:
 1. Scheduled auto-improvement is enabled when an LLM provider is configured and
    `[auto_improve.scheduler] enabled = true`. Manual runs do not affect the
    scheduler.
-2. Reads a completed session, recent pages, and relevant existing wiki pages.
+2. Reads stored observations/session pages, recent pages, and relevant existing
+   wiki pages. Capture exclusions are upstream of storage: excluded content
+   cannot be recovered by `include_raw_fallback` because it was never stored.
 3. Produces a structured proposal containing small page creates or updates.
 4. Stores the proposal in a pending-review queue with evidence and diffs.
 5. Applies approved proposals through `Wiki::apply_batch`, admission webhooks,
-   auth capabilities, audit logging, and the single writer actor.
+    auth capabilities, audit logging, and the single writer actor.
 
 Auto-approval is the default, but it still records staged proposals and applies
 them through the same approval path. Admins who want a human queue set
 `[auto_improve] require_approval = true`; admins who want no automatic review set
 `[auto_improve.scheduler] enabled = false`.
+
+High-impact targets can also be guarded by an operator-supplied executable eval
+gate. `[auto_improve.eval]` defaults to disabled; when enabled, proposals whose
+paths match the configured prefixes (default `_rules` and `procedures`) are sent
+to the configured command after LLM review validation and before staging or
+auto-approval. The command receives JSON on stdin with proposal metadata plus
+before/after bodies and must return JSON like
+`{ "score_before": 0.72, "score_after": 0.76, "passed": true }`. Command errors,
+timeouts, invalid JSON, `passed = false`, missing `passed`, or score deltas below
+`min_delta` reject only that targeted proposal. Non-targeted proposals bypass the
+gate. If all proposals fail eval, the run is still staged with zero proposals and
+the rejected candidates so the rejection buffer can remember the failed attempt.
+Hooks never run the eval command. See
+[`auto-improve-eval-gates.md`](auto-improve-eval-gates.md) for the full stdin /
+stdout contract and example scorer scripts.
 
 ## Proposed Page Targets
 
@@ -243,6 +301,10 @@ Any implementation should preserve these invariants:
 14. Write a machine-readable audit row for every run and human-readable proposal
     sidecars whenever proposals exist.
 
+Capture policy is a client-side storage boundary, not a filter performed by the
+reviewer. Reviewers can only consume what was stored; see
+[Capture exclusions](marker-file.md#capture-exclusions).
+
 ## Existing User Upgrade Contract
 
 Default-available auto-improvement must not surprise existing installs:
@@ -262,8 +324,9 @@ Default-available auto-improvement must not surprise existing installs:
     preserve all existing wiki files and session/observation rows.
 5. Existing installed `CLAUDE.md`/`AGENTS.md` blocks remain valid. Operators pick
    up newer proactive retrieval guidance by running `ai-memory install-instructions`
-   or asking an agent to refresh the ai-memory routing block. The marker-based
-   replacement must remain idempotent.
+   or asking an agent to refresh the ai-memory routing package. The marker-based
+   replacement must remain idempotent, and the managed Agent Skill files should
+   refresh from the same binary-owned assets as the slim snippet.
 6. Target-page mutations must pass through proposal staging first and must keep
    approval attribution separate from the autonomous
    `auto_improve` proposal actor.
@@ -280,6 +343,17 @@ min_session_duration_secs = 120
 min_confidence = 0.75
 max_input_tokens = 24000
 max_proposals_per_run = 5
+max_patchable_pages = 8
+max_patchable_body_chars = 8000
+max_edits_per_proposal = 5
+max_edit_content_chars = 4000
+max_changed_chars_per_proposal = 12000
+max_patch_edits_per_run = 8
+max_rejection_context = 50
+rejection_context_days = 180
+max_final_body_chars = 32000
+max_rule_page_tokens = 2000
+max_procedure_page_tokens = 2000
 include_raw_fallback = false
 proposal_actor = "auto_improve"
 pending_path = "_pending/auto-improve"
@@ -295,6 +369,12 @@ min_session_age_secs = 600
 background review. `[auto_improve] require_approval` controls whether validated
 proposals are applied automatically or left pending. They intentionally do not
 imply each other.
+
+`max_rejection_context` and `rejection_context_days` bound the persistent
+rejection-buffer summary included in future reviewer prompts. The buffer is
+scoped by `workspace_id` + `project_id` and stores human rejects, approval
+conflicts/failures, and validator/model rejected candidates when they carry a
+reason.
 
 ## Proposal Format
 
@@ -341,7 +421,8 @@ them by default through the wiki mutation path. With `require_approval = true`,
 |---|---|
 | Background scheduler | Reviews newly completed sessions after the first-run watermark and applies or stages validated proposals according to approval policy. |
 | `ai-memory auto-improve --session-id <id>` | Manually review one session and apply or stage validated proposals through the auto-improvement approval path. |
-| `memory_auto_improve` | Manually review the latest completed session or a named session and apply or stage validated proposals through the same path. |
+| `ai-memory auto-improve-report --workspace <w> --project <p> [--days N] [--limit N] [--stage]` | Read-only telemetry report for recent auto-improvement runs, proposal outcomes, terminal rates, and findings by default. `--stage` creates exactly one pending telemetry report page for audit/approval. |
+| `memory_auto_improve` | Manually review the newest completed session with no persisted auto-improvement run, or explicitly rerun a named session, and apply or stage validated proposals through the same path. An empty run records a preflight skip so the next implicit call advances. |
 | `ai-memory curator` | Rule-based, report-only maintenance review. |
 | `ai-memory curator --stage` | Stage exactly one curator report page for pending-writes approval. |
 | `ai-memory pending-writes list` | Show staged wiki changes. |
@@ -355,11 +436,19 @@ proposal state, approval status, evidence metadata, and audit rows, but the
 review artifact itself should be inspectable and versioned like the rest of the
 wiki.
 
-Because this is now an MCP tool surface, the standard prompt snippets and
-regression tests assert `memory_auto_improve` appears in both prompt surfaces.
-Existing installed `CLAUDE.md`/`AGENTS.md` snippets update idempotently when the
-operator runs `ai-memory install-instructions` or asks an agent to refresh the
-ai-memory routing block.
+On deployments that distinguish operators, manually staged proposals record
+the qualified operator identity and enforce one pending proposal per target
+*per operator*. Unattributed scheduler, curator, and telemetry proposals stay
+in the shared bucket. A collision skips only that proposal, preserves its
+siblings, and appears in the command or API response with the target and
+reason; it must not become a silent partial run.
+
+Because this is now an MCP tool surface, the standard prompt snippets, managed
+Agent Skills, and regression tests assert `memory_auto_improve` appears in the
+combined prompt-routing surface. Existing installed `CLAUDE.md`/`AGENTS.md`
+snippets update idempotently when the operator runs
+`ai-memory install-instructions` or asks an agent to refresh the ai-memory
+routing package.
 
 ### Upgrade note for existing installs
 
@@ -425,6 +514,10 @@ Durable pending proposal storage lives under `_pending/auto-improve/` as
 non-indexed sidecars plus SQLite rows, with list/diff/approve/reject commands
 and audit rows. Approval applies through the existing wiki mutation boundaries
 with the `auto_improve` actor preserved in proposal provenance.
+
+Only the project-root `_pending/` directory is reserved proposal storage and
+excluded from the OKF migration scan. A nested path such as
+`notes/_pending/legacy.md` remains an ordinary wiki page and must still migrate.
 
 Tests:
 

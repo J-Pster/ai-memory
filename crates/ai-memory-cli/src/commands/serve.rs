@@ -1,31 +1,37 @@
 //! `ai-memory serve` — MCP server with optional filesystem watcher.
 
-use std::convert::Infallible;
+use std::future::{Future, IntoFuture};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Consolidator, run_auto_improve_review, run_lint, run_sweep,
+    AutoImproveReviewConfig, Consolidator, EmbedBackfillOptions, ObservationRetention,
+    ScheduledAutoImproveSettings, run_auto_improve_scheduler_tick, run_embedding_backfill,
+    run_lint, run_sweep_with_options,
 };
-use ai_memory_core::{
-    ActiveProject, ActorContext, PagePath, ProjectId, Sanitizer, SessionId, WorkspaceId,
-};
+use ai_memory_core::{ActiveProject, ProjectId, Sanitizer, WorkspaceId};
 use ai_memory_hooks::{
-    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, hook_router,
+    DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT, HookState, ProjectCacheStore, WorkstreamState, hook_router,
+    workstream_router,
 };
-use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder, build_provider};
-use ai_memory_mcp::{AdminState, AiMemoryServer, admin_router};
+use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, build_embedder};
+use ai_memory_mcp::human_auth::{Cidr, HumanAuthRuntime, LoginLimiter};
+use ai_memory_mcp::{
+    AdminState, AiMemoryServer, ScopeInvalidation, admin_router_with_sweep_tuning,
+    expire_legacy_cookie_mw, internal_auth_router, public_auth_router, require_dual_auth,
+    session_auth_router,
+};
 use ai_memory_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, EmbeddingWrite,
-    NewAutoImproveProposal, ReaderPool, StageAutoImproveRun, Store, WriterHandle, f32_vec_to_bytes,
+    ReaderPool, Store, TokenPepper, WriterHandle, hash_session_secret, hash_token,
 };
-use ai_memory_web;
+use ai_memory_web::{WebMountSpec, normalize_prefix, split_web_routers, web_base_href};
 use ai_memory_wiki::{WatcherHandle, Wiki, migrations, run_wiki_migrations};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rmcp::ServiceExt;
@@ -33,15 +39,13 @@ use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
-use tower::service_fn;
-use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
 use tracing::info;
 
-use crate::auth::{AuthState, require_bearer};
 use crate::cli::{ServeArgs, TransportKind};
-use crate::config::{AutoImproveSettings, Config, MaintenanceSettings};
+use crate::config::{AuthSettings, AutoImproveSettings, Config, MaintenanceSettings};
+use ai_memory_mcp::auth::{AuthState, require_bearer};
 
 /// 10 MB cap on inbound HTTP bodies. The /hook ingress accepts the
 /// agent's raw payload which can include a tool output excerpt
@@ -50,16 +54,796 @@ use crate::config::{AutoImproveSettings, Config, MaintenanceSettings};
 /// 10 MB is generous headroom; without a cap, axum streams unbounded
 /// bodies into memory (audit critical #2).
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
-const EMBEDDING_WRITE_BATCH: usize = 100;
 
 /// `POST /admin/bootstrap` may carry a large JSON array of sources even
 /// after client-side prune; keep hooks/MCP at [`MAX_BODY_BYTES`].
 const BOOTSTRAP_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Startup and failure retry delay, capped by each job's configured interval.
+const MAINTENANCE_STARTUP_DELAY_CAP: Duration = Duration::from_secs(60);
+/// How often the durable SessionEnd consolidation worker checks for work when
+/// no hook notification arrives (including jobs recovered after restart).
+const SESSION_CONSOLIDATION_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// A claimed job may be recovered after this long without completion. Provider
+/// requests are expected to finish well inside this lease.
+const SESSION_CONSOLIDATION_LEASE: Duration = Duration::from_secs(10 * 60);
+
+/// Lock file guarding a data dir against a second `ai-memory serve` (#563).
+const SERVE_LOCK_FILE: &str = ".serve.lock";
+
+/// How long a wait on the shutdown path may run before the drain it is
+/// waiting for is abandoned. axum's graceful shutdown waits for every
+/// in-flight connection and a stateful or SSE MCP client can hold one open
+/// indefinitely, so an unbounded drain is indistinguishable from ignoring the
+/// signal: `docker stop` and `systemctl stop` would still burn their own
+/// grace period and finish with SIGKILL (#699). Each wait is bounded on its
+/// own, so a stop can take a small multiple of this.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// The signals that stop a running server, listened for on both transports.
+///
+/// Installed before the transport starts. The server runs as PID 1 under
+/// `docker run` (no init shim), and for PID 1 the kernel discards any signal
+/// whose handler is not installed — so a SIGTERM arriving during a slow boot
+/// (the pre-migration archive, wiki migrations) must already have a listener
+/// waiting for it. A tokio `Signal` queues a signal received before the first
+/// `recv`, so registering early loses nothing (#699).
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    /// Install the listeners.
+    ///
+    /// A listener that cannot be registered degrades to the remaining one with
+    /// a warning: losing one way to stop the server is bad, refusing to start
+    /// over it is worse.
+    #[cfg(unix)]
+    fn install() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        fn listen(kind: SignalKind, name: &str) -> Option<tokio::signal::unix::Signal> {
+            match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        signal = name,
+                        "cannot listen for this shutdown signal; the server will not stop on it"
+                    );
+                    None
+                }
+            }
+        }
+
+        Self {
+            interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+            terminate: listen(SignalKind::terminate(), "SIGTERM"),
+        }
+    }
+
+    /// Install the listeners. Non-unix has only ctrl-c.
+    #[cfg(not(unix))]
+    fn install() -> Self {
+        Self {}
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(unix)]
+    async fn recv(&mut self) -> &'static str {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => tokio::select! {
+                _ = interrupt.recv() => "SIGINT",
+                _ = terminate.recv() => "SIGTERM",
+            },
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
+                "SIGINT"
+            }
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+                "SIGTERM"
+            }
+            // Both registrations failed: there is nothing left to wait for.
+            (None, None) => std::future::pending().await,
+        }
+    }
+
+    /// Resolve with the name of the first shutdown signal to arrive.
+    #[cfg(not(unix))]
+    async fn recv(&mut self) -> &'static str {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(%error, "ctrl-c listener failed; the server will not stop on it");
+            std::future::pending::<()>().await;
+        }
+        "ctrl-c"
+    }
+}
+
+/// The single-instance guard for `ai-memory serve`: an exclusive `flock` on
+/// `<data-dir>/.serve.lock` held for the process lifetime. The OS releases it
+/// when the process exits, so a crashed server never locks the operator out of
+/// their own data.
+#[derive(Debug)]
+struct ServeLock {
+    _file: std::fs::File,
+}
+
+/// Unlocked sidecar naming the lock holder (`pid=<n>`). Separate from the
+/// lock file because Windows' exclusive lock blocks reads of the locked
+/// file from other handles; informational only, rewritten by each holder.
+fn holder_info_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(".serve.lock.holder")
+}
+
+/// Take the single-instance serve lock for `data_dir`.
+///
+/// A contended lock refuses startup naming the holder, unless `force` is set:
+/// the operator who knows the previous server is gone (a hung holder, or a
+/// mount with unreliable locking) must not be stranded. A filesystem that
+/// cannot lock at all only downgrades the guard to a warning — refusing to
+/// start there would be worse than the unguarded risk.
+/// Transient failures `open`/`try_lock_exclusive` can raise on a healthy but
+/// loaded machine: fd exhaustion (EMFILE per-process, ENFILE system-wide) and
+/// interrupted syscalls (EINTR). These deserve a short retry. A `WouldBlock`
+/// (another server already holds the lock, classified by
+/// `is_drain_lock_busy_error`) is deliberately excluded — that is the correct
+/// "someone else owns it" refusal and must surface immediately, never retried.
+fn is_transient_serve_lock_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::Interrupted {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        // EMFILE (per-process fd limit) / ENFILE (system-wide fd limit).
+        const EMFILE: i32 = 24;
+        const ENFILE: i32 = 23;
+        if code == EMFILE || code == ENFILE {
+            return true;
+        }
+    }
+    false
+}
+
+fn acquire_serve_lock(data_dir: &Path, force: bool) -> Result<Option<ServeLock>> {
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    let path = data_dir.join(SERVE_LOCK_FILE);
+    use fs2::FileExt as _;
+
+    // Open the file and take the exclusive flock under a short bounded retry
+    // for transient errors only. A loaded machine (parallel test runs, an fd
+    // storm) can bounce `open` with EMFILE/ENFILE or interrupt the lock call
+    // with EINTR; a real server must not hard-fail on that. Mirrors
+    // `acquire_drain_lock`'s bounded ~25ms backoff. A `WouldBlock` (another
+    // holder) is never retried here — it falls through to the refusal path.
+    const SERVE_LOCK_ACQUIRE_ATTEMPTS: u32 = 5;
+    const SERVE_LOCK_ACQUIRE_BACKOFF: Duration = Duration::from_millis(25);
+    let mut attempt: u32 = 0;
+    let (file, lock_result) = loop {
+        attempt += 1;
+        let retriable = attempt < SERVE_LOCK_ACQUIRE_ATTEMPTS;
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if retriable && is_transient_serve_lock_error(&err) => {
+                std::thread::sleep(SERVE_LOCK_ACQUIRE_BACKOFF);
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("opening serve lock {}", path.display()));
+            }
+        };
+        match file.try_lock_exclusive() {
+            Err(err) if retriable && is_transient_serve_lock_error(&err) => {
+                std::thread::sleep(SERVE_LOCK_ACQUIRE_BACKOFF);
+                continue;
+            }
+            result => break (file, result),
+        }
+    };
+
+    match lock_result {
+        Ok(()) => {
+            // Informational only: the flock is the guard, and this names the
+            // holder in a later refusal message. Best-effort, and written to
+            // an UNLOCKED sidecar — on Windows the exclusive lock blocks
+            // other handles from reading the locked file itself, which made
+            // every refusal report "holder unknown".
+            let _ = std::fs::write(
+                holder_info_path(data_dir),
+                format!("pid={}\n", std::process::id()),
+            );
+            tracing::info!(lock = %path.display(), "single-instance serve lock held");
+            Ok(Some(ServeLock { _file: file }))
+        }
+        Err(err) if crate::commands::hook_spool::is_drain_lock_busy_error(&err) => {
+            let holder = std::fs::read_to_string(holder_info_path(data_dir))
+                .map(|text| text.trim().to_string())
+                .unwrap_or_default();
+            if force {
+                tracing::warn!(
+                    lock = %path.display(),
+                    holder = %holder,
+                    "another process holds the serve lock; continuing unguarded per --force"
+                );
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "another ai-memory serve process appears to be using {} ({}); two servers on one data directory corrupt wiki and index state — stop the other process, or pass --force if you are certain it is gone",
+                data_dir.display(),
+                if holder.is_empty() {
+                    "holder unknown".to_owned()
+                } else {
+                    holder
+                },
+            )
+        }
+        Err(err) => {
+            tracing::warn!(
+                lock = %path.display(),
+                error = %err,
+                "cannot lock the data directory; running without the single-instance guard"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn validate_api_credential_pepper(api_credentials_exist: bool, auth: &AuthSettings) -> Result<()> {
+    let pepper_present = auth
+        .token_pepper
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if api_credentials_exist && !pepper_present {
+        anyhow::bail!(
+            "api credentials exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+        );
+    }
+    Ok(())
+}
+
+/// Validate the credentials that keep an existing multi-user installation
+/// closed. Bootstrap installs have no user rows yet and retain their historical
+/// compatibility behavior regardless of placeholder auth values.
+fn validate_existing_users_auth(
+    users_exist: bool,
+    api_credentials_exist: bool,
+    human_mode: bool,
+    auth: &AuthSettings,
+) -> Result<()> {
+    validate_api_credential_pepper(api_credentials_exist, auth)?;
+    let pepper_present = auth
+        .token_pepper
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let bearer_present = auth
+        .bearer_token
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
+    if users_exist && !human_mode {
+        return match (pepper_present, bearer_present) {
+            (true, true) => Ok(()),
+            (false, false) => anyhow::bail!(
+                "users exist but [auth].token_pepper and [auth].bearer_token are missing or blank; restore both original secrets from configuration backup before serving"
+            ),
+            (false, true) => anyhow::bail!(
+                "users exist but [auth].token_pepper is missing or blank; restore the original pepper from configuration backup before serving"
+            ),
+            (true, false) => anyhow::bail!(
+                "users exist but [auth].bearer_token is missing or blank; configure the original static root bearer token before serving"
+            ),
+        };
+    }
+    Ok(())
+}
+
+fn secret_configured(secret: Option<&secrecy::SecretString>) -> bool {
+    secret.is_some_and(|s| !s.expose_secret().trim().is_empty())
+}
+
+fn parse_trusted_proxy_cidrs(auth: &AuthSettings) -> Result<Vec<Cidr>> {
+    auth.trusted_proxy_cidrs
+        .iter()
+        .map(|spec| {
+            Cidr::parse(spec).map_err(|e| {
+                anyhow::anyhow!("invalid [auth].trusted_proxy_cidrs entry {spec:?}: {e}")
+            })
+        })
+        .collect()
+}
+
+async fn maybe_bootstrap_root(store: &Store, auth: &AuthSettings) -> Result<()> {
+    if store.reader.bootstrap_completed().await? {
+        if secret_configured(auth.initial_root_password.as_ref()) {
+            tracing::warn!(
+                "[auth].initial_root_password is ignored because bootstrap already completed; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD"
+            );
+        }
+        return Ok(());
+    }
+    let Some(password) = auth
+        .initial_root_password
+        .as_ref()
+        .map(|s| s.expose_secret().to_string())
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let username = auth
+        .root_username
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("root");
+    let recovery = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|s| !s.trim().is_empty());
+    let reserved: Vec<&str> = [
+        auth.bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        auth.actor_proxy_bearer_token
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+        recovery,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    ai_memory_core::validate_human_password(&password, Some(username), &reserved)
+        .context("initial root password does not meet policy")?;
+    if let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+    {
+        let hash = hash_token(&password, &TokenPepper::new(pepper.to_string()));
+        if store.reader.token_hash_exists(hash).await? {
+            anyhow::bail!(
+                "[auth].initial_root_password collides with an existing API credential; choose a different password"
+            );
+        }
+    }
+    let phc = ai_memory_store::password::hash_password(password)
+        .await
+        .context("hashing initial root password")?;
+    store
+        .writer
+        .bootstrap_root(
+            username.to_string(),
+            auth.root_name.clone(),
+            auth.root_email.clone(),
+            phc,
+        )
+        .await
+        .context("bootstrapping root user")?;
+    tracing::warn!(
+        "root user bootstrapped; unset AI_MEMORY_AUTH__INITIAL_ROOT_PASSWORD so the plaintext is not kept in the process environment"
+    );
+    Ok(())
+}
+
+async fn validate_configured_secret_collisions(
+    store: &Store,
+    auth: &AuthSettings,
+    include_initial_password: bool,
+) -> Result<()> {
+    let Some(pepper) = auth
+        .token_pepper
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| TokenPepper::new(value.to_string()))
+    else {
+        return Ok(());
+    };
+    let mut secrets = Vec::new();
+    if let Some(value) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].bearer_token", value));
+    }
+    if let Some(value) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].actor_proxy_bearer_token", value));
+    }
+    if let Some(value) = auth
+        .recovery_token
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].recovery_token", value));
+    }
+    if include_initial_password
+        && let Some(value) = auth
+            .initial_root_password
+            .as_ref()
+            .map(ExposeSecret::expose_secret)
+            .filter(|value| !value.trim().is_empty())
+    {
+        secrets.push(("[auth].initial_root_password", value));
+    }
+    for (name, value) in secrets {
+        if store
+            .reader
+            .token_hash_exists(hash_token(value, &pepper))
+            .await?
+        {
+            anyhow::bail!(
+                "{name} collides with an existing API credential; configure a distinct secret"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn human_auth_intended(auth: &AuthSettings, bootstrap_completed: bool, any_password: bool) -> bool {
+    bootstrap_completed
+        || any_password
+        || secret_configured(auth.initial_root_password.as_ref())
+        || secret_configured(auth.recovery_token.as_ref())
+}
+
+fn require_recoverable_root_or_recovery(
+    human_mode: bool,
+    recoverable_roots: i64,
+    recovery_configured: bool,
+) -> Result<()> {
+    if human_mode && recoverable_roots == 0 && !recovery_configured {
+        anyhow::bail!(
+            "human authentication is enabled but no recoverable root user exists; set [auth].recovery_token to rebuild root via POST /auth/recovery"
+        );
+    }
+    Ok(())
+}
+
+fn reserved_human_passwords(auth: &AuthSettings) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = auth
+        .bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    if let Some(v) = auth
+        .actor_proxy_bearer_token
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(v.to_string());
+    }
+    out
+}
+
+fn configured(value: Option<&String>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// What the bound address tells us about network exposure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpExposure {
+    /// Loopback-only, or authenticated. Nothing to warn about.
+    Safe,
+    /// Unauthenticated on a non-loopback address, allowed because the
+    /// operator passed `--allow-insecure-no-auth`.
+    InsecureByOverride,
+    /// Unauthenticated on a non-loopback address inside a container, where
+    /// the bind address is not evidence either way. See
+    /// [`validate_http_exposure`].
+    UndeterminedInContainer,
+}
+
+/// Detect that this process is running inside a container.
+///
+/// `/.dockerenv` is created by Docker, `/run/.containerenv` by Podman. The
+/// official image also sets `AI_MEMORY_IN_CONTAINER`, so the signal survives
+/// runtimes that create neither file.
+fn running_in_container() -> bool {
+    if std::env::var("AI_MEMORY_IN_CONTAINER").is_ok_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+/// Refuse accidental unauthenticated network exposure after the listener has
+/// selected its actual local address (which may differ from the bind input).
+///
+/// The check reads the bind address as evidence of reachability. That
+/// inference holds on a host, but **not** inside a container: publishing a
+/// port with `-p` requires binding `0.0.0.0` inside the namespace, and
+/// whether that port reaches the network is decided by the host-side publish
+/// spec — `-p 127.0.0.1:49374:49374` versus `-p 0.0.0.0:49374:49374` — which
+/// the process cannot observe. Refusing there is a false positive that took
+/// down the documented Quick Start container (#407), so containers get a
+/// loud warning instead.
+///
+/// Note this is deliberately not backstopped by the `Host` allowlist: that
+/// allowlist defends against DNS rebinding, where a browser sets the header.
+/// A client that can route to the port sets `Host` freely, so it is not an
+/// access control and cannot substitute for a token here.
+fn validate_http_exposure(
+    local_addr: SocketAddr,
+    auth_enabled: bool,
+    human_mode: bool,
+    secure_cookie: bool,
+    allow_insecure_no_auth: bool,
+    containerized: bool,
+) -> Result<HttpExposure> {
+    if local_addr.ip().is_loopback() {
+        return Ok(HttpExposure::Safe);
+    }
+    if human_mode && !secure_cookie {
+        anyhow::bail!(
+            "refusing human authentication on non-loopback plain HTTP address {local_addr}: \
+             passwords and session cookies require [auth].secure_cookie=true behind a trusted \
+             HTTPS reverse proxy. Non-Secure human cookies are allowed only on loopback."
+        );
+    }
+    if auth_enabled {
+        return Ok(HttpExposure::Safe);
+    }
+    if allow_insecure_no_auth {
+        return Ok(HttpExposure::InsecureByOverride);
+    }
+    if containerized {
+        return Ok(HttpExposure::UndeterminedInContainer);
+    }
+
+    anyhow::bail!(
+        "refusing unauthenticated plain HTTP on non-loopback address {local_addr}: anyone on the network could access ai-memory. Configure AI_MEMORY_AUTH_TOKEN or bind to a loopback address. For intentional LAN use, pass --allow-insecure-no-auth explicitly and review TLS options in docs/https-via-proxy.md."
+    );
+}
+
+/// Validate the trusted proxy's least-privilege credential and optional stable
+/// root identity before binding the server.
+fn validate_trusted_proxy_auth(auth: &AuthSettings) -> Result<()> {
+    let proxy_enabled = configured(auth.actor_proxy_bearer_token.as_ref());
+    if proxy_enabled && !configured(auth.bearer_token.as_ref()) {
+        anyhow::bail!(
+            "[auth].actor_proxy_bearer_token requires [auth].bearer_token so administration keeps a distinct root credential"
+        );
+    }
+    if proxy_enabled
+        && auth.actor_proxy_bearer_token.as_deref().map(str::trim)
+            == auth.bearer_token.as_deref().map(str::trim)
+    {
+        anyhow::bail!(
+            "[auth].actor_proxy_bearer_token must differ from [auth].bearer_token; sharing the root credential would let a missing proxy identity fall through as root"
+        );
+    }
+    let root_issuer = configured(auth.root_issuer.as_ref());
+    let root_subject = configured(auth.root_subject.as_ref());
+    if root_issuer != root_subject {
+        anyhow::bail!(
+            "[auth].root_issuer and [auth].root_subject must be configured together because an OIDC subject is unique only within its issuer"
+        );
+    }
+    Ok(())
+}
+
+/// Can a trusted proxy actually assert identities on this server?
+///
+/// The MCP admin gates read this to know that distinct operators are in play
+/// even when a proxied deployment never writes a `users` row.
+fn trusted_proxy_identity_enabled(auth: &AuthSettings) -> bool {
+    configured(auth.actor_proxy_bearer_token.as_ref())
+}
 
 struct ConsolidatorSetup {
     server: AiMemoryServer,
     consolidator: Option<Arc<Consolidator>>,
     admin_llm: Option<Arc<dyn LlmProvider>>,
+}
+
+fn maintenance_start_delay(
+    last_success_at: Option<i64>,
+    now_microseconds: i64,
+    interval: Duration,
+) -> Duration {
+    let fallback = interval.min(MAINTENANCE_STARTUP_DELAY_CAP);
+    let Some(last_success_at) = last_success_at else {
+        return fallback;
+    };
+    let interval_microseconds = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+    let due_at = last_success_at.saturating_add(interval_microseconds);
+    if due_at <= now_microseconds {
+        fallback
+    } else {
+        // A future persisted timestamp (clock correction / restore) must not
+        // defer maintenance longer than its configured interval.
+        Duration::from_micros(due_at.saturating_sub(now_microseconds) as u64).min(interval)
+    }
+}
+
+async fn run_persisted_maintenance_job<F, Fut, R, RFut, N>(
+    writer: WriterHandle,
+    job: ai_memory_store::MaintenanceJob,
+    interval: Duration,
+    mut load_last_success: R,
+    now_microseconds: N,
+    mut tick: F,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send,
+    R: FnMut() -> RFut + Send + 'static,
+    RFut: Future<Output = Result<Option<i64>>> + Send,
+    N: Fn() -> i64 + Send + 'static,
+{
+    let retry_delay = interval.min(MAINTENANCE_STARTUP_DELAY_CAP);
+    let mut cadence_known = false;
+    let mut delay = Duration::ZERO;
+
+    loop {
+        tokio::time::sleep(delay).await;
+        if !cadence_known {
+            match load_last_success().await {
+                Ok(last_success_at) => {
+                    delay = maintenance_start_delay(last_success_at, now_microseconds(), interval);
+                    cadence_known = true;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, job = job.as_str(), "maintenance cadence state read failed; retrying before running work");
+                    delay = retry_delay;
+                }
+            }
+            continue;
+        }
+        match tick().await {
+            Ok(()) => match writer.record_maintenance_job_success(job).await {
+                Ok(()) => delay = interval,
+                Err(error) => {
+                    tracing::warn!(%error, job = job.as_str(), "maintenance success state write failed; retrying job");
+                    delay = retry_delay;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, job = job.as_str(), "scheduled maintenance job failed; retrying");
+                delay = retry_delay;
+            }
+        }
+    }
+}
+
+fn session_consolidation_retry_delay(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(4);
+    Duration::from_secs(30_u64.saturating_mul(1_u64 << exponent))
+}
+
+async fn run_session_consolidation_worker(
+    writer: WriterHandle,
+    consolidator: Arc<Consolidator>,
+    notify: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
+    #[cfg(test)] completed: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let now = jiff::Timestamp::now().as_microsecond();
+        let lease_micros =
+            i64::try_from(SESSION_CONSOLIDATION_LEASE.as_micros()).unwrap_or(i64::MAX);
+        let job = match writer
+            .claim_session_consolidation(now, now.saturating_sub(lease_micros))
+            .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(%error, "SessionEnd consolidation queue claim failed");
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = notify.notified() => {},
+                    () = tokio::time::sleep(SESSION_CONSOLIDATION_POLL_INTERVAL) => {},
+                }
+                continue;
+            }
+        };
+
+        let Some(job) = job else {
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = notify.notified() => {},
+                () = tokio::time::sleep(SESSION_CONSOLIDATION_POLL_INTERVAL) => {},
+            }
+            continue;
+        };
+
+        let session_id = job.session_id();
+        let generation = job.generation();
+        let attempts = job.attempts();
+        let consolidation = consolidator.consolidate_session(
+            session_id,
+            false,
+            ai_memory_core::ActorContext::anonymous(),
+            None,
+            None,
+        );
+        tokio::pin!(consolidation);
+        let result = tokio::select! {
+            () = cancel.cancelled() => {
+                if let Err(error) = writer.release_session_consolidation(job).await {
+                    tracing::warn!(%error, %session_id, generation, "failed to release SessionEnd consolidation during shutdown");
+                }
+                return;
+            }
+            result = &mut consolidation => result,
+        };
+
+        match result {
+            Ok(outcome) => match writer.complete_session_consolidation(job).await {
+                Ok(()) => {
+                    info!(
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        path = %outcome.path,
+                        "SessionEnd: queued LLM consolidation written (opt-in)",
+                    );
+                    #[cfg(test)]
+                    completed.notify_one();
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    session = %session_id,
+                    generation,
+                    "SessionEnd consolidation succeeded but queue completion failed",
+                ),
+            },
+            Err(error) => {
+                let retry_at = if attempts < ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS {
+                    let delay = session_consolidation_retry_delay(attempts);
+                    let delay_micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+                    Some(
+                        jiff::Timestamp::now()
+                            .as_microsecond()
+                            .saturating_add(delay_micros),
+                    )
+                } else {
+                    None
+                };
+                let terminal = retry_at.is_none();
+                if let Err(store_error) = writer
+                    .fail_session_consolidation(job, error.to_string(), retry_at)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %store_error,
+                        session = %session_id,
+                        generation,
+                        "failed to persist SessionEnd consolidation failure",
+                    );
+                } else if terminal {
+                    tracing::error!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        "SessionEnd LLM consolidation exhausted retries; heuristic page remains",
+                    );
+                } else {
+                    tracing::warn!(
+                        %error,
+                        session = %session_id,
+                        generation,
+                        attempts,
+                        "SessionEnd LLM consolidation failed; queued for retry",
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Run the `serve` subcommand.
@@ -68,15 +852,44 @@ struct ConsolidatorSetup {
 /// Returns an error if the store cannot be opened, the watcher cannot
 /// install, or the transport setup fails.
 pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
+    // Before anything slow: boot takes the pre-migration archive and runs the
+    // wiki migrations, and a signal arriving in that window has to be caught
+    // rather than fall through to the default disposition (#699).
+    let mut shutdown = ShutdownSignals::install();
+
     validate_web_ui_args(args.enable_web, args.web_ui_dir.as_deref())?;
+    config.require_llm_fallback_credentials()?;
 
     // Merge config + CLI CORS origins (config first, CLI adds new entries).
     // Validation runs before binding so a misconfigured origin is caught early.
     let cors_origins = merge_cors_origins(&config.cors_allow_origins, &args.cors_allow_origin);
     validate_cors_origins(&cors_origins)?;
 
-    let store = Store::open(&config.data_dir)
+    // Guard the data dir before anything opens it: a second serve process
+    // means a second writer actor, a second git handle on the wiki, and a
+    // second active-project pointer (#563). Held until `run` returns.
+    let _serve_lock = acquire_serve_lock(&config.data_dir, args.force)?;
+
+    // #633: take the pre-migration safety archive BEFORE `Store::open` advances
+    // the SQLite schema, so the archive captures the true pre-2.0 state a 1.x
+    // binary can reopen. `Store::open` below runs the DB migrations; if the
+    // backup ran after it (as it used to, inside the wiki migration), the
+    // archived `db/` would already be at the 2.x schema and the documented
+    // rollback to 1.x would be impossible. A no-op for a fresh install or an
+    // already-migrated store; the OKF wiki migration reuses this archive instead
+    // of taking a second, post-DB-migration one.
+    let backup_dest_override = std::env::var("AI_MEMORY_BACKUP_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
+    migrations::snapshot_before_db_migration(&config.data_dir, backup_dest_override.as_deref())
+        .with_context(|| "taking the pre-migration safety backup")?;
+
+    let mut store = Store::open(&config.data_dir)
         .with_context(|| format!("opening store at {}", config.data_dir.display()))?;
+    // Every reader handle below is cloned from this one, so the opt-in
+    // ranking signals are set once, here, and inherited everywhere.
+    store.reader.set_retrieval_tuning(config.retrieval.tuning());
+    let store = store;
 
     // One-shot legacy heal (issue #103): NULL out any project repo_path that
     // is a prefix-match catch-all. That means the $HOME and filesystem-root
@@ -94,6 +907,29 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             "healed catch-all project repo_path rows ($HOME, filesystem root, or non-git-root path)"
         );
     }
+
+    let api_credentials_exist = store.reader.api_credentials_exist().await?;
+    validate_api_credential_pepper(api_credentials_exist, &config.auth)?;
+    let bootstrap_completed_before_start = store.reader.bootstrap_completed().await?;
+    validate_configured_secret_collisions(&store, &config.auth, !bootstrap_completed_before_start)
+        .await?;
+    maybe_bootstrap_root(&store, &config.auth).await?;
+    let bootstrap_completed = store.reader.bootstrap_completed().await?;
+    let any_password = store.reader.any_password_hash().await?;
+    let human_mode = human_auth_intended(&config.auth, bootstrap_completed, any_password);
+    require_recoverable_root_or_recovery(
+        human_mode,
+        store.reader.count_recoverable_roots().await?,
+        secret_configured(config.auth.recovery_token.as_ref()),
+    )?;
+    validate_existing_users_auth(
+        store.reader.users_exist().await?,
+        api_credentials_exist,
+        human_mode,
+        &config.auth,
+    )?;
+    validate_trusted_proxy_auth(&config.auth)?;
+    let trusted_proxy_cidrs = parse_trusted_proxy_cidrs(&config.auth)?;
 
     // Run any outstanding wiki-structure migrations before the watcher starts
     // so file moves and renames are never raced by the reconciler.
@@ -185,12 +1021,22 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         max_entries = config.auto_scope.max_entries,
         "active-project isolation mode"
     );
+    let decay_params = config.decay.decay_params();
     let mut server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj)
         .with_wiki(wiki.clone())
-        .with_decay_params(config.decay)
+        .with_decay_params(decay_params)
+        .with_decay_breadth_weight(config.decay.breadth_weight)
+        .with_observation_retention(config.decay.observation_retention())
         .with_auto_improve_require_approval(config.auto_improve.require_approval)
+        .with_auto_improve_review_config(auto_improve_review_config_from_settings(
+            &config.auto_improve,
+        ))
         .with_active_project(active_project.clone())
-        .with_sanitizer(sanitizer.clone());
+        .with_sanitizer(sanitizer.clone())
+        .with_trusted_proxy_identity(trusted_proxy_identity_enabled(&config.auth))
+        .with_per_user_slots(config.slots.per_user)
+        .with_strip_root_combinators(config.strip_root_combinators)
+        .with_gemini_safe_schemas(config.gemini_safe_schemas);
     if let Some(e) = embedder.clone() {
         server = server.with_embedder(e);
     }
@@ -207,8 +1053,6 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
         wiki.clone(),
         embedder.clone(),
         admin_llm.clone(),
-        ws,
-        proj,
         config.decay,
     )
     .await;
@@ -216,12 +1060,78 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
     match args.transport {
         TransportKind::Stdio => {
             info!("MCP server ready on stdio (Ctrl-C to stop)");
-            let service = server.serve(stdio()).await?;
-            service.waiting().await?;
+            // `serve` resolves only once a client has completed the MCP
+            // `initialize` handshake, so the signal races the handshake as
+            // well as the session that follows it: a Ctrl-C before any client
+            // connected is the exact state a launched-but-unused server sits
+            // in, and until #699 nothing here listened for one at all.
+            let service = tokio::select! {
+                service = server.serve(stdio()) => Some(service?),
+                signal = shutdown.recv() => {
+                    info!(signal, "shutdown signal received before a client connected; stopping");
+                    None
+                }
+            };
+            if let Some(service) = service {
+                // Take the token before `waiting` consumes the service:
+                // stopping the transport is the only way out of that await.
+                let stop = service.cancellation_token();
+                let mut waiting = std::pin::pin!(service.waiting());
+                let signal = tokio::select! {
+                    result = &mut waiting => {
+                        result?;
+                        None
+                    }
+                    signal = shutdown.recv() => Some(signal),
+                };
+                if let Some(signal) = signal {
+                    info!(
+                        signal,
+                        "shutdown signal received; stopping the stdio transport"
+                    );
+                    stop.cancel();
+                    // A signal is a normal stop, so nothing below turns it
+                    // into a failing exit — but neither does it wait forever.
+                    match tokio::time::timeout(SHUTDOWN_GRACE, waiting).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "stdio transport ended abnormally during shutdown");
+                        }
+                        Err(_) => tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "stdio transport did not stop within the shutdown grace period; exiting anyway"
+                        ),
+                    }
+                }
+            }
         }
         TransportKind::Http => {
+            seed_active_project_fallback(&store.reader, &active_project).await;
             let bind = args.bind.unwrap_or_else(|| config.bind.clone());
             let cancel = CancellationToken::new();
+            let (session_consolidation_notify, session_consolidation_task) =
+                if config.consolidate_on_session_end {
+                    if let Some(consolidator) = consolidator.clone() {
+                        let notify = Arc::new(tokio::sync::Notify::new());
+                        let task = tokio::spawn(run_session_consolidation_worker(
+                            store.writer.clone(),
+                            consolidator,
+                            notify.clone(),
+                            cancel.child_token(),
+                            #[cfg(test)]
+                            Arc::new(tokio::sync::Notify::new()),
+                        ));
+                        info!(
+                            max_attempts = ai_memory_store::SESSION_CONSOLIDATION_MAX_ATTEMPTS,
+                            "durable SessionEnd consolidation worker started"
+                        );
+                        (Some(notify), Some(task))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
             let server_clone = server.clone();
             // `Host`-header allowlist for the HTTP DNS-rebinding guard.
             // Sourced from Config (which already handles the
@@ -256,20 +1166,32 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     .with_json_response(!args.http_stateful),
             );
             // Shared per-cwd project cache: the hook router owns it; the admin
-            // router gets a fire-and-forget eviction hook so a `move-project`
-            // can proactively drop the moved project's stale entries.
+            // router gets an awaited eviction hook so scope mutations can
+            // proactively drop stale entries before the next hook re-resolves.
             let project_cache: ai_memory_hooks::ProjectCache =
                 std::sync::Arc::new(tokio::sync::Mutex::new(ProjectCacheStore::default()));
-            let on_project_moved: std::sync::Arc<dyn Fn(ProjectId) + Send + Sync> = {
+            let scope_invalidator: ai_memory_mcp::ScopeInvalidator = {
                 let cache = project_cache.clone();
-                std::sync::Arc::new(move |proj: ProjectId| {
-                    let cache = cache.clone();
-                    tokio::spawn(async move {
-                        cache.lock().await.retain(|_, v| v.1 != proj);
-                    });
-                })
+                std::sync::Arc::new(
+                    move |target: ScopeInvalidation| -> std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send + 'static>,
+                    > {
+                        let cache = cache.clone();
+                        Box::pin(async move {
+                            cache.lock().await.retain(|_, v| match target {
+                                ScopeInvalidation::Project(proj) => v.1 != proj,
+                                ScopeInvalidation::Workspace(ws) => v.0 != ws,
+                            });
+                        })
+                    },
+                )
             };
+            // One shared counter set: the hook path writes it, /admin/status
+            // reads it. Two instances would report zeros to the operator
+            // while the real counts accumulated somewhere unreachable.
+            let ingest_metrics = std::sync::Arc::new(ai_memory_core::IngestMetrics::default());
             let hooks = hook_router(HookState {
+                ingest_metrics: ingest_metrics.clone(),
                 workspace_id: ws,
                 project_id: proj,
                 writer: store.writer.clone(),
@@ -282,51 +1204,109 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 ingest_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                     DEFAULT_HOOK_INGEST_MAX_IN_FLIGHT,
                 )),
+                ingest_gates: ai_memory_hooks::IngestGates::default(),
                 consolidate_on_session_end: config.consolidate_on_session_end,
+                session_consolidation_notify,
+                capture_assistant_enabled: config.capture_assistant,
+                per_user_slots: config.slots.per_user,
+                subagent_sessions: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    ai_memory_hooks::SubagentSessionSet::default(),
+                )),
+                ingest_rate: std::sync::Arc::new(tokio::sync::Mutex::new(
+                    ai_memory_hooks::IngestRateLimiter::new(
+                        config.hook_rate_per_sec.max(0.0),
+                        if config.hook_rate_burst > 0.0 {
+                            config.hook_rate_burst
+                        } else {
+                            config.hook_rate_per_sec.max(1.0)
+                        },
+                    ),
+                )),
                 home_dir: config.home_dir.clone(),
+                trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                mid_session_routing: config.routing.mid_session,
             });
-            let admin = admin_router(AdminState {
+            let workstreams = workstream_router(WorkstreamState {
                 writer: store.writer.clone(),
                 reader: store.reader.clone(),
-                wiki: wiki.clone(),
-                llm: admin_llm,
-                auto_improve_require_approval: config.auto_improve.require_approval,
-                embedder: embedder.clone(),
-                provider_health: provider_health.clone(),
-                decay_params: config.decay,
+                sanitizer: sanitizer.clone(),
                 data_dir: config.data_dir.clone(),
-                db_path: store.db_path().to_path_buf(),
-                bind: bind.clone(),
-                home_dir: config.home_dir.clone(),
-                bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-                token_pepper: config
-                    .auth
-                    .token_pepper
-                    .as_ref()
-                    .filter(|p| !p.trim().is_empty())
-                    .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
-                active_project: active_project.clone(),
-                on_project_moved: Some(on_project_moved),
             });
+            let admin = admin_router_with_sweep_tuning(
+                AdminState {
+                    ingest_metrics: ingest_metrics.clone(),
+                    writer: store.writer.clone(),
+                    reader: store.reader.clone(),
+                    wiki: wiki.clone(),
+                    llm: admin_llm,
+                    auto_improve_require_approval: config.auto_improve.require_approval,
+                    auto_improve_review_config: auto_improve_review_config_from_settings(
+                        &config.auto_improve,
+                    ),
+                    embedder: embedder.clone(),
+                    provider_health: provider_health.clone(),
+                    decay_params,
+                    data_dir: config.data_dir.clone(),
+                    db_path: store.db_path().to_path_buf(),
+                    bind: bind.clone(),
+                    home_dir: config.home_dir.clone(),
+                    bootstrap_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                    token_pepper: config
+                        .auth
+                        .token_pepper
+                        .as_ref()
+                        .filter(|p| !p.trim().is_empty())
+                        .map(|p| ai_memory_store::TokenPepper::new(p.clone())),
+                    active_project: active_project.clone(),
+                    scope_invalidator: Some(scope_invalidator),
+                    trusted_proxy_identity: trusted_proxy_identity_enabled(&config.auth),
+                },
+                config.decay.breadth_weight,
+                config.decay.observation_retention(),
+            );
             // Multi-rung auth assembly:
             //   - rung 0 (no bearer_token configured) → AuthState::new
             //     stays as-is, middleware injects anonymous actor.
             //   - rung 1 (bearer_token set, no token_pepper) → root_actor
             //     stamps writes with [auth].root_* identity.
-            //   - rung 2 (bearer_token + token_pepper + users in DB) →
-            //     unknown bearer routes through users-table lookup.
-            // The pepper is auto-generated by `ai-memory init`, so almost
-            // every operator-installed server reaches rung 2; the only
-            // rung-1-only setups are those whose config predates v0.8.
-            let mut auth_state = AuthState::new(config.auth.bearer_token.clone());
-            let root_user = config.auth.root_username.clone();
-            if root_user.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            //   - token_pepper present → unknown bearers always route through
+            //     the users-table lookup, including before the first user is
+            //     created. Admin mode separately switches on a fresh
+            //     store-backed users-exist read.
+            let mut auth_state = AuthState::new(config.auth.bearer_token.clone())
+                .with_secure_cookie(config.auth.secure_cookie);
+            let root_user = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_issuer = config
+                .auth
+                .root_issuer
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            let root_subject = config
+                .auth
+                .root_subject
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+            if root_user.is_some() || root_issuer.is_some() {
                 auth_state = auth_state.with_root_actor(ai_memory_core::ActorContext {
                     user: root_user,
+                    issuer: root_issuer,
+                    sub: root_subject,
                     name: config.auth.root_name.clone(),
                     email: config.auth.root_email.clone(),
                     ..ai_memory_core::ActorContext::default()
                 });
+            }
+            if let Some(proxy_token) = config
+                .auth
+                .actor_proxy_bearer_token
+                .as_ref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                auth_state = auth_state.with_trusted_proxy_bearer(proxy_token.clone());
             }
             if let Some(pepper) = config
                 .auth
@@ -340,13 +1320,50 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     store.writer.clone(),
                 );
             }
+            let recovery_token_hash = config
+                .auth
+                .recovery_token
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
+                .filter(|s| !s.trim().is_empty())
+                .map(hash_session_secret);
+            let root_username = config
+                .auth
+                .root_username
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "root".to_string());
+            auth_state = auth_state.with_human_runtime(
+                HumanAuthRuntime {
+                    reader: store.reader.clone(),
+                    writer: store.writer.clone(),
+                    recovery_token_hash,
+                    root_username,
+                    root_name: config.auth.root_name.clone(),
+                    root_email: config.auth.root_email.clone(),
+                    reserved_passwords: reserved_human_passwords(&config.auth),
+                    trusted_proxy_cidrs: trusted_proxy_cidrs.clone(),
+                    limiter: Arc::new(LoginLimiter::default()),
+                },
+                human_mode,
+            );
             let auth_state = Arc::new(auth_state);
             let auth_enabled = auth_state.enabled();
-            let router = axum::Router::new()
+            let machine = axum::Router::new()
                 .nest_service("/mcp", mcp_service)
                 .merge(hooks)
+                .merge(workstreams)
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .merge(admin.layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES)));
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_bearer,
+                ));
+            let admin = admin
+                .layer(DefaultBodyLimit::max(BOOTSTRAP_MAX_BODY_BYTES))
+                .layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                ));
             let base_path = normalize_prefix(&args.base_path);
             if base_path.is_empty() && !args.base_path.trim_matches('/').trim().is_empty() {
                 tracing::warn!(
@@ -367,8 +1384,7 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                 );
             }
             let base_href = web_base_href(&args.base_path, &args.web_slug);
-            let router = mount_web_router(
-                router,
+            let web = split_web_routers(
                 args.enable_web,
                 store.reader.clone(),
                 wiki.clone(),
@@ -380,7 +1396,20 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
                     base_path: &base_path,
                 },
             )?;
-            let router = apply_http_layers(router, auth_state, config.allowed_hosts.clone());
+            let router = machine
+                .merge(admin)
+                .merge(public_auth_router(auth_state.clone()))
+                .merge(session_auth_router(auth_state.clone()))
+                .merge(internal_auth_router(auth_state.clone()))
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    require_dual_auth,
+                )))
+                .merge(web.public.layer(axum::middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    expire_legacy_cookie_mw,
+                )));
+            let router = apply_host_layer(router, config.allowed_hosts.clone());
             // Host the entire surface under the configured base path. Empty
             // base = root (unchanged). The auth/host layers are already
             // attached to `router`, so they run for every nested route.
@@ -404,47 +1433,109 @@ pub async fn run(config: &Config, args: ServeArgs) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(&bind)
                 .await
                 .with_context(|| format!("binding {bind}"))?;
+            let local_addr = listener
+                .local_addr()
+                .context("reading bound HTTP listener address")?;
+            let exposure = validate_http_exposure(
+                local_addr,
+                auth_enabled,
+                human_mode,
+                config.auth.secure_cookie,
+                args.allow_insecure_no_auth,
+                running_in_container(),
+            )?;
             info!(
-                %bind,
+                %local_addr,
                 auth = auth_enabled,
                 body_limit_mb = MAX_BODY_BYTES / 1024 / 1024,
                 "MCP HTTP server ready (POST /mcp, POST /hook, Ctrl-C to stop)",
             );
-            if !auth_enabled && !bind.starts_with("127.") {
-                // Loud warning: a non-loopback bind with no auth is
-                // the audit's critical-#1 scenario. The operator gets
-                // a one-line "you sure?" instead of silent exposure.
+            if exposure == HttpExposure::InsecureByOverride {
                 tracing::warn!(
-                    %bind,
-                    "no AI_MEMORY_AUTH_TOKEN configured AND binding to a non-loopback \
-                     address — anyone on the network can call destructive MCP tools. \
-                     Generate a token with `ai-memory generate-auth-token` and set \
-                     AI_MEMORY_AUTH_TOKEN in the server's environment."
+                    %local_addr,
+                    "starting unauthenticated plain HTTP on a non-loopback address because \
+                     --allow-insecure-no-auth was supplied — anyone on the network can call \
+                     destructive MCP tools"
                 );
-            } else if auth_enabled && !bind.starts_with("127.") {
-                // Auth IS configured but the server is reachable from
-                // the network on plain HTTP. The bearer token (and
-                // multi-user per-user tokens from `ai-memory user
-                // add`) ride cleartext — sniffable on the LAN. Advise
-                // the operator to front with a TLS proxy. One-shot
-                // log at startup, not refusal to serve (operators may
-                // be testing, behind their own proxy already, etc.).
+            } else if exposure == HttpExposure::UndeterminedInContainer {
                 tracing::warn!(
-                    %bind,
-                    "AI_MEMORY_AUTH_TOKEN is set but the server is bound to a \
-                     non-loopback address on plain HTTP — bearer tokens travel \
+                    %local_addr,
+                    "no AI_MEMORY_AUTH_TOKEN configured. Inside a container the bind address \
+                     cannot show whether this port reaches the network — that is decided by \
+                     the host publish spec. If you published it with `-p 127.0.0.1:49374:49374` \
+                     you are fine; if you published it on 0.0.0.0 or to a LAN address, anyone \
+                     on the network can call destructive MCP tools. Generate a token with \
+                     `ai-memory generate-auth-token` and set AI_MEMORY_AUTH_TOKEN"
+                );
+            } else if auth_enabled && !local_addr.ip().is_loopback() {
+                // Auth IS configured but the server is reachable from
+                // the network on plain HTTP. Machine bearer credentials
+                // ride cleartext — sniffable on the LAN. Advise the
+                // operator to front with a TLS proxy. One-shot log at
+                // startup, not refusal to serve (operators may be testing,
+                // behind their own proxy already, etc.).
+                tracing::warn!(
+                    %local_addr,
+                    "authentication is enabled but the server is bound to a \
+                     non-loopback address on plain HTTP — bearer credentials travel \
                      cleartext on the network. Front ai-memory with a TLS-terminating \
                      reverse proxy (Caddy, Cloudflare Tunnel, nginx). See \
                      docs/https-via-proxy.md for copy-paste templates."
                 );
             }
-            axum::serve(listener, router)
+            let shutdown_cancel = cancel.clone();
+            let serve_result = {
+                let serve = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
                 .with_graceful_shutdown(async move {
-                    let _ = tokio::signal::ctrl_c().await;
-                    info!("ctrl-c received; shutting down");
-                    cancel.cancel();
+                    let signal = shutdown.recv().await;
+                    info!(signal, "shutdown signal received; draining");
+                    shutdown_cancel.cancel();
                 })
-                .await?;
+                .into_future();
+                let mut serve = std::pin::pin!(serve);
+                // Bound the drain. axum waits for every in-flight connection
+                // to close, and a stateful or SSE MCP client never closes one
+                // on its own — without this the shutdown outlives the
+                // supervisor's own patience and ends in SIGKILL (#699).
+                tokio::select! {
+                    result = &mut serve => Some(result),
+                    () = async {
+                        cancel.cancelled().await;
+                        tokio::time::sleep(SHUTDOWN_GRACE).await;
+                    } => {
+                        tracing::warn!(
+                            grace_secs = SHUTDOWN_GRACE.as_secs(),
+                            "connections still open past the shutdown grace period; exiting anyway"
+                        );
+                        None
+                    }
+                }
+            };
+            cancel.cancel();
+            if let Some(task) = session_consolidation_task {
+                // Bounded like the drain above. The worker can be parked in
+                // `claim_session_consolidation` or `release_session_consolidation`,
+                // neither of which races the cancellation, behind the
+                // single-writer actor's queue — an unbounded join here would
+                // sit outside the shutdown bound entirely (#699).
+                match tokio::time::timeout(SHUTDOWN_GRACE, task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "SessionEnd consolidation worker join failed");
+                    }
+                    Err(_) => tracing::warn!(
+                        grace_secs = SHUTDOWN_GRACE.as_secs(),
+                        "SessionEnd consolidation worker did not stop within the shutdown \
+                         grace period; exiting anyway"
+                    ),
+                }
+            }
+            if let Some(serve_result) = serve_result {
+                serve_result?;
+            }
         }
     }
     Ok(())
@@ -459,9 +1550,7 @@ async fn start_maintenance_scheduler(
     wiki: Wiki,
     embedder: Option<Arc<dyn Embedder>>,
     llm: Option<Arc<dyn LlmProvider>>,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
-    decay: ai_memory_store::DecayParams,
+    decay: crate::config::DecaySettings,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let maintenance_enabled = settings.enabled;
     if !maintenance_enabled {
@@ -476,47 +1565,188 @@ async fn start_maintenance_scheduler(
     if maintenance_enabled && forget_sweep_interval_secs > 0 {
         let reader = reader.clone();
         let writer = writer.clone();
+        let wiki = wiki.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(forget_sweep_interval_secs);
+            run_persisted_maintenance_job(
+                writer.clone(),
+                ai_memory_store::MaintenanceJob::ForgetSweep,
+                interval,
+                {
+                    let reader = reader.clone();
+                    move || {
+                        let reader = reader.clone();
+                        async move {
+                            Ok(reader
+                                .maintenance_job_last_success(
+                                    ai_memory_store::MaintenanceJob::ForgetSweep,
+                                )
+                                .await?)
+                        }
+                    }
+                },
+                || jiff::Timestamp::now().as_microsecond(),
+                move || {
+                    let reader = reader.clone();
+                    let writer = writer.clone();
+                    let wiki = wiki.clone();
+                    let decay = decay;
+                    async move {
+                        let started = std::time::Instant::now();
+                        let outcome = run_scheduled_sweep_tick(
+                            &reader,
+                            &writer,
+                            &wiki,
+                            &decay.decay_params(),
+                            decay.breadth_weight,
+                            decay.observation_retention(),
+                        )
+                        .await?;
+                        if outcome.errors > 0 {
+                            anyhow::bail!(
+                                "scheduled forget sweep had {} scope errors",
+                                outcome.errors
+                            );
+                        }
+                        info!(
+                            scopes = outcome.scopes,
+                            candidates_evaluated = outcome.candidates_evaluated,
+                            evicted = outcome.evicted,
+                            expired = outcome.expired,
+                            hard_deleted = outcome.hard_deleted,
+                            observations_pruned = outcome.observations_pruned,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled forget sweep completed"
+                        );
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }));
+    }
+
+    // Hollow-project sweep: deletes project rows with no pages, sessions,
+    // observations, handoffs, managed workstreams, or auto-improvement data
+    // once they are older than HOLLOW_PROJECT_MIN_AGE_DAYS. Safe by
+    // construction — nothing exists to lose — which is why it runs
+    // unconditionally under the maintenance flag with no extra config. Runs
+    // once shortly after startup (so upgrades clean up immediately) and then
+    // daily.
+    if maintenance_enabled {
+        /// A week of grace before a hollow row is considered noise, so a
+        /// project created moments before its first real event is never
+        /// racing the sweep.
+        const HOLLOW_PROJECT_MIN_AGE_DAYS: u32 = 7;
+        const HOLLOW_SWEEP_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(24 * 60 * 60);
+        /// Short startup delay so the sweep never competes with migration
+        /// and first-request work on boot.
+        const HOLLOW_SWEEP_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+        let writer = writer.clone();
+        tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(HOLLOW_SWEEP_STARTUP_DELAY).await;
             loop {
-                tokio::time::sleep(interval).await;
-                match run_sweep(&reader, &writer, workspace_id, project_id, &decay, false).await {
-                    Ok(report) => info!(
-                        evicted = report.evicted.len(),
-                        hard_deleted = report.hard_deleted,
-                        "scheduled forget sweep completed"
+                match writer
+                    .sweep_hollow_projects(HOLLOW_PROJECT_MIN_AGE_DAYS)
+                    .await
+                {
+                    Ok(deleted) if deleted.is_empty() => {}
+                    Ok(deleted) => info!(
+                        count = deleted.len(),
+                        projects = deleted.join(", "),
+                        "hollow-project sweep deleted empty project rows"
                     ),
-                    Err(e) => tracing::warn!(error = %e, "scheduled forget sweep failed"),
+                    Err(e) => tracing::warn!(error = %e, "hollow-project sweep failed"),
                 }
+                tokio::time::sleep(HOLLOW_SWEEP_INTERVAL).await;
             }
         }));
     }
 
     if maintenance_enabled && lint_interval_secs > 0 {
         let reader = reader.clone();
+        let writer = writer.clone();
         let wiki = wiki.clone();
         let llm = llm.clone();
         tasks.push(tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(lint_interval_secs);
-            loop {
-                tokio::time::sleep(interval).await;
-                match run_lint(
-                    &reader,
-                    &wiki,
-                    llm.as_ref(),
-                    workspace_id,
-                    project_id,
-                    false,
-                    false,
-                )
-                .await
+            run_persisted_maintenance_job(
+                writer,
+                ai_memory_store::MaintenanceJob::RuleLint,
+                interval,
                 {
-                    Ok(report) => info!(
-                        findings = report.findings.len(),
-                        "scheduled rule-based lint completed"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "scheduled lint failed"),
+                    let reader = reader.clone();
+                    move || {
+                        let reader = reader.clone();
+                        async move {
+                            Ok(reader
+                                .maintenance_job_last_success(
+                                    ai_memory_store::MaintenanceJob::RuleLint,
+                                )
+                                .await?)
+                        }
+                    }
+                },
+                || jiff::Timestamp::now().as_microsecond(),
+                move || {
+                    let reader = reader.clone();
+                    let wiki = wiki.clone();
+                    let llm = llm.clone();
+                    let decay_lambda = decay.decay_params().lambda;
+                    async move {
+                        let started = std::time::Instant::now();
+                        let outcome =
+                            run_scheduled_lint_tick(&reader, &wiki, llm.as_ref(), decay_lambda)
+                                .await?;
+                        if outcome.errors > 0 {
+                            anyhow::bail!(
+                                "scheduled rule-based lint had {} scope errors",
+                                outcome.errors
+                            );
+                        }
+                        info!(
+                            scopes = outcome.scopes,
+                            findings = outcome.findings,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled rule-based lint completed"
+                        );
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+        }));
+    }
+
+    // One-shot startup backfill (2.0): with an embedder present, pages
+    // written before it existed - a fresh upgrade onto the default local
+    // embedder, or a provider switch - get their vectors without any
+    // maintenance config. Skips already-embedded pages, so a settled
+    // store logs one cheap no-op pass. Runs in the background; startup
+    // is never blocked on it.
+    if let Some(embedder) = embedder.clone() {
+        let reader = reader.clone();
+        let writer = writer.clone();
+        let wiki = wiki.clone();
+        tasks.push(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder).await {
+                Ok(outcome) if outcome.embedded > 0 || outcome.failed > 0 || outcome.errors > 0 => {
+                    info!(
+                        scopes = outcome.scopes,
+                        embedded = outcome.embedded,
+                        skipped = outcome.skipped,
+                        failed = outcome.failed,
+                        errors = outcome.errors,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "startup embedding backfill completed"
+                    );
                 }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "startup embedding backfill failed"),
             }
         }));
     }
@@ -530,19 +1760,19 @@ async fn start_maintenance_scheduler(
                 let interval = std::time::Duration::from_secs(embedding_backfill_interval_secs);
                 loop {
                     tokio::time::sleep(interval).await;
-                    match run_embedding_backfill(
-                        &reader,
-                        &writer,
-                        &wiki,
-                        &embedder,
-                        workspace_id,
-                        project_id,
-                    )
-                    .await
+                    let started = std::time::Instant::now();
+                    match run_scheduled_embedding_backfill_tick(&reader, &writer, &wiki, &embedder)
+                        .await
                     {
-                        Ok((embedded, failed)) => {
-                            info!(embedded, failed, "scheduled embedding backfill completed")
-                        }
+                        Ok(outcome) => info!(
+                            scopes = outcome.scopes,
+                            embedded = outcome.embedded,
+                            skipped = outcome.skipped,
+                            failed = outcome.failed,
+                            errors = outcome.errors,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "scheduled embedding backfill completed"
+                        ),
                         Err(e) => tracing::warn!(error = %e, "scheduled embedding backfill failed"),
                     }
                 }
@@ -561,7 +1791,22 @@ async fn start_maintenance_scheduler(
         let reader = reader.clone();
         let writer = writer.clone();
         let wiki = wiki.clone();
-        match initialize_auto_improve_scheduler_scopes(&reader, &writer).await {
+        let scheduler_settings = ScheduledAutoImproveSettings {
+            review: auto_improve_review_config_from_settings(&auto_improve),
+            require_approval: auto_improve.require_approval,
+            min_session_age_secs: scheduler.min_session_age_secs,
+            max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            experience: (scheduler.experience_every_sessions > 0).then(|| {
+                ai_memory_consolidate::ExperienceConfig {
+                    sessions: scheduler.experience_sessions.max(1),
+                    min_new_sessions: scheduler.experience_every_sessions,
+                    ..ai_memory_consolidate::ExperienceConfig::default()
+                }
+            }),
+        };
+        match ai_memory_consolidate::initialize_auto_improve_scheduler_scopes(&reader, &writer)
+            .await
+        {
             Ok((scopes, errors)) => info!(
                 scopes,
                 errors, "auto-improve scheduler startup scope initialization completed"
@@ -580,13 +1825,20 @@ async fn start_maintenance_scheduler(
             loop {
                 tokio::time::sleep(interval).await;
                 let started = std::time::Instant::now();
-                match run_auto_improve_scheduler_tick(&reader, &writer, &wiki, &llm, &auto_improve)
-                    .await
+                match run_auto_improve_scheduler_tick(
+                    &reader,
+                    &writer,
+                    &wiki,
+                    &llm,
+                    &scheduler_settings,
+                )
+                .await
                 {
                     Ok(outcome) => info!(
                         scopes = outcome.scopes,
                         scopes_with_candidates = outcome.scopes_with_candidates,
                         reviewed = outcome.reviewed,
+                        skipped = outcome.skipped,
                         errors = outcome.errors,
                         elapsed_ms = started.elapsed().as_millis(),
                         "scheduled auto-improve tick completed"
@@ -609,258 +1861,60 @@ async fn start_maintenance_scheduler(
     tasks
 }
 
-async fn initialize_auto_improve_scheduler_scopes(
-    reader: &ReaderPool,
-    writer: &WriterHandle,
-) -> Result<(usize, usize)> {
-    let scopes = reader.list_all_scopes().await?;
-    let total = scopes.len();
-    let mut errors = 0usize;
-    for scope in scopes {
-        if let Err(e) = writer
-            .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
-            .await
-        {
-            errors += 1;
-            tracing::warn!(
-                workspace = %scope.workspace_name,
-                project = %scope.project_name,
-                error = %e,
-                "auto-improve scheduler startup state init failed"
-            );
-        }
-    }
-    Ok((total, errors))
-}
-
-async fn run_embedding_backfill(
-    reader: &ReaderPool,
-    writer: &WriterHandle,
-    wiki: &Wiki,
-    embedder: &Arc<dyn Embedder>,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
-) -> Result<(usize, usize)> {
-    let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
-    let dim = embedder.dim();
-    let candidates = reader.decay_candidates(workspace_id, project_id).await?;
-    let already: std::collections::HashSet<_> = reader
-        .embedded_page_ids(
-            workspace_id,
-            project_id,
-            provider.clone(),
-            model.clone(),
-            dim,
-        )
-        .await?
-        .into_iter()
-        .collect();
-
-    let mut embedded = 0usize;
-    let mut failed = 0usize;
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-    for cand in candidates {
-        if already.contains(&cand.id) {
-            continue;
-        }
-        let md = match wiki.read_page(workspace_id, project_id, &cand.path) {
-            Ok(md) => md,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(path = %cand.path, error = %e, "scheduled embed: unreadable page");
-                continue;
-            }
-        };
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(vec) => vec,
-            Err(e) => {
-                failed += 1;
-                tracing::warn!(path = %cand.path, error = %e, "scheduled embed: provider failed");
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(writer, &mut pending, &mut embedded, &mut failed).await;
-        }
-    }
-    flush_embedding_batch(writer, &mut pending, &mut embedded, &mut failed).await;
-    Ok((embedded, failed))
-}
-
-async fn flush_embedding_batch(
-    writer: &WriterHandle,
-    pending: &mut Vec<EmbeddingWrite>,
-    embedded: &mut usize,
-    failed: &mut usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
-    let count = batch.len();
-    if let Err(e) = writer.store_embeddings(batch).await {
-        *failed += count;
-        tracing::warn!(count, error = %e, "scheduled embed: batch store failed");
-    } else {
-        *embedded += count;
-    }
-}
-
-struct ScheduledAutoImproveOutcome {
-    run_id: ai_memory_core::AutoImproveRunId,
-    proposals: usize,
-    approved: usize,
-    pending: usize,
-    conflicts: usize,
-}
-
 #[derive(Debug, Default)]
-struct ScheduledAutoImproveTickOutcome {
+struct ScheduledSweepTickOutcome {
     scopes: usize,
-    scopes_with_candidates: usize,
-    reviewed: usize,
+    candidates_evaluated: usize,
+    evicted: usize,
+    expired: usize,
+    hard_deleted: usize,
+    observations_pruned: usize,
     errors: usize,
 }
 
-struct ScheduledAutoImproveContext<'a> {
-    reader: &'a ReaderPool,
-    writer: &'a WriterHandle,
-    wiki: &'a Wiki,
-    llm: &'a Arc<dyn LlmProvider>,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
-    settings: &'a AutoImproveSettings,
-}
-
-async fn run_auto_improve_scheduler_tick(
+async fn run_scheduled_sweep_tick(
     reader: &ReaderPool,
     writer: &WriterHandle,
     wiki: &Wiki,
-    llm: &Arc<dyn LlmProvider>,
-    settings: &AutoImproveSettings,
-) -> Result<ScheduledAutoImproveTickOutcome> {
+    decay: &ai_memory_store::DecayParams,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+) -> Result<ScheduledSweepTickOutcome> {
     let scopes = reader.list_all_scopes().await?;
-    let mut outcome = ScheduledAutoImproveTickOutcome {
+    let mut outcome = ScheduledSweepTickOutcome {
         scopes: scopes.len(),
-        ..ScheduledAutoImproveTickOutcome::default()
+        ..ScheduledSweepTickOutcome::default()
     };
 
     for scope in scopes {
-        if let Err(e) = writer
-            .ensure_auto_improve_scheduler_state(scope.workspace_id, scope.project_id)
-            .await
+        match run_sweep_with_options(
+            reader,
+            writer,
+            Some(wiki),
+            scope.workspace_id,
+            scope.project_id,
+            decay,
+            breadth_weight,
+            retention,
+            false,
+        )
+        .await
         {
-            outcome.errors += 1;
-            tracing::warn!(
-                workspace = %scope.workspace_name,
-                project = %scope.project_name,
-                error = %e,
-                "scheduled auto-improve state init failed"
-            );
-            continue;
-        }
-
-        let candidates = match reader
-            .auto_improve_candidate_sessions(
-                scope.workspace_id,
-                scope.project_id,
-                settings.scheduler.min_session_age_secs,
-                settings.scheduler.max_sessions_per_tick,
-            )
-            .await
-        {
-            Ok(candidates) => candidates,
+            Ok(report) => {
+                outcome.candidates_evaluated += report.candidates_evaluated;
+                outcome.evicted += report.evicted.iter().filter(|page| page.deleted).count();
+                outcome.expired += report.expired.len();
+                outcome.hard_deleted += report.hard_deleted;
+                outcome.observations_pruned += report.observations_pruned;
+            }
             Err(e) => {
                 outcome.errors += 1;
                 tracing::warn!(
                     workspace = %scope.workspace_name,
                     project = %scope.project_name,
                     error = %e,
-                    "scheduled auto-improve candidate query failed"
+                    "scheduled forget sweep failed for scope"
                 );
-                continue;
-            }
-        };
-        if candidates.is_empty() {
-            continue;
-        }
-
-        outcome.scopes_with_candidates += 1;
-        let ctx = ScheduledAutoImproveContext {
-            reader,
-            writer,
-            wiki,
-            llm,
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
-            settings,
-        };
-        for candidate in candidates {
-            let claimed = match ctx
-                .writer
-                .claim_auto_improve_scheduler_session(
-                    ctx.workspace_id,
-                    ctx.project_id,
-                    candidate.session_id,
-                    candidate.ended_at,
-                )
-                .await
-            {
-                Ok(claimed) => claimed,
-                Err(e) => {
-                    outcome.errors += 1;
-                    tracing::warn!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        "scheduled auto-improve claim failed"
-                    );
-                    continue;
-                }
-            };
-            if !claimed {
-                tracing::debug!(
-                    workspace = %scope.workspace_name,
-                    project = %scope.project_name,
-                    session_id = %candidate.session_id,
-                    "scheduled auto-improve candidate already claimed or reviewed"
-                );
-                continue;
-            }
-            match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
-                Ok(run) => {
-                    outcome.reviewed += 1;
-                    info!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        run_id = %run.run_id,
-                        proposals = run.proposals,
-                        approved = run.approved,
-                        pending = run.pending,
-                        conflicts = run.conflicts,
-                        "scheduled auto-improve completed"
-                    );
-                }
-                Err(e) => {
-                    outcome.errors += 1;
-                    tracing::warn!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        "scheduled auto-improve failed"
-                    );
-                }
             }
         }
     }
@@ -868,141 +1922,143 @@ async fn run_auto_improve_scheduler_tick(
     Ok(outcome)
 }
 
-async fn run_scheduled_auto_improve(
-    ctx: &ScheduledAutoImproveContext<'_>,
-    session_id: SessionId,
-) -> Result<ScheduledAutoImproveOutcome> {
-    let cfg = AutoImproveReviewConfig {
-        min_observations: ctx.settings.min_observations,
-        min_session_duration_secs: ctx.settings.min_session_duration_secs,
-        min_confidence: ctx.settings.min_confidence,
-        max_input_tokens: ctx.settings.max_input_tokens,
-        max_proposals_per_run: ctx.settings.max_proposals_per_run,
-        include_raw_fallback: ctx.settings.include_raw_fallback,
-        proposal_actor: ctx.settings.proposal_actor.clone(),
-        pending_path: ctx.settings.pending_path.clone(),
-    };
-    let report = run_auto_improve_review(
-        ctx.reader,
-        &**ctx.llm,
-        ctx.workspace_id,
-        ctx.project_id,
-        session_id,
-        cfg.clone(),
-    )
-    .await?;
-    let proposals =
-        scheduled_auto_improve_new_proposals(ctx.reader, ctx.workspace_id, ctx.project_id, &report)
-            .await?;
-    let staged = ctx
-        .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ctx.workspace_id,
-            project_id: ctx.project_id,
-            session_id: Some(session_id),
-            provider: Some(report.provider.clone()),
-            model: Some(report.model.clone()),
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::to_value(&report.warnings)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            config_json: serde_json::json!({
-                "trigger": "scheduler",
-                "min_observations": cfg.min_observations,
-                "min_session_duration_secs": cfg.min_session_duration_secs,
-                "min_confidence": cfg.min_confidence,
-                "max_input_tokens": cfg.max_input_tokens,
-                "max_proposals_per_run": cfg.max_proposals_per_run,
-                "include_raw_fallback": cfg.include_raw_fallback,
-                "require_approval": ctx.settings.require_approval,
-            }),
-            proposal_actor: ActorContext {
-                agent: Some(cfg.proposal_actor.clone()),
-                ..ActorContext::default()
-            },
-            proposals,
-        })
-        .await?;
-
-    for id in &staged.proposal_ids {
-        ctx.wiki
-            .write_auto_improve_sidecar(ctx.workspace_id, ctx.project_id, *id)
-            .await?;
-    }
-
-    let mut approved = 0usize;
-    let mut pending = 0usize;
-    let mut conflicts = 0usize;
-    for proposal_id in &staged.proposal_ids {
-        if ctx.settings.require_approval {
-            pending += 1;
-            continue;
-        }
-        match ctx
-            .wiki
-            .approve_auto_improve_proposal(
-                ctx.workspace_id,
-                ctx.project_id,
-                *proposal_id,
-                ActorContext {
-                    agent: Some("auto_improve_scheduler_auto_approve".into()),
-                    ..ActorContext::default()
-                },
-                None,
-                Some(ai_memory_wiki::AdmissionContext {
-                    op: ai_memory_wiki::AdmissionOp::WritePage,
-                    ..ai_memory_wiki::AdmissionContext::default()
-                }),
-            )
-            .await?
-        {
-            ApproveAutoImproveProposalResult::Approved { .. } => approved += 1,
-            ApproveAutoImproveProposalResult::Conflict => conflicts += 1,
-        }
-    }
-
-    Ok(ScheduledAutoImproveOutcome {
-        run_id: staged.run_id,
-        proposals: staged.proposal_ids.len(),
-        approved,
-        pending,
-        conflicts,
-    })
+#[derive(Debug, Default)]
+struct ScheduledLintTickOutcome {
+    scopes: usize,
+    findings: usize,
+    errors: usize,
 }
 
-async fn scheduled_auto_improve_new_proposals(
+async fn run_scheduled_lint_tick(
     reader: &ReaderPool,
-    workspace_id: WorkspaceId,
-    project_id: ProjectId,
-    report: &ai_memory_consolidate::AutoImproveReport,
-) -> Result<Vec<NewAutoImproveProposal>> {
-    let mut proposals = Vec::with_capacity(report.proposals.len());
-    for p in &report.proposals {
-        let path = PagePath::new(p.path.clone())?;
-        let operation = if reader
-            .page_body_by_ids(workspace_id, project_id, path.as_str())
-            .await?
-            .is_some()
+    wiki: &Wiki,
+    llm: Option<&Arc<dyn LlmProvider>>,
+    decay_lambda: f64,
+) -> Result<ScheduledLintTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledLintTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledLintTickOutcome::default()
+    };
+
+    for scope in scopes {
+        match run_lint(
+            reader,
+            wiki,
+            llm,
+            scope.workspace_id,
+            scope.project_id,
+            ai_memory_consolidate::LintOptions {
+                dry_run: false,
+                use_llm: false,
+                decay_lambda,
+            },
+        )
+        .await
         {
-            AutoImproveProposalOperation::Update
-        } else {
-            AutoImproveProposalOperation::Create
-        };
-        proposals.push(NewAutoImproveProposal {
-            operation,
-            target_path: path,
-            kind: p.kind.clone(),
-            title: p.title.clone(),
-            confidence: f64::from(p.confidence),
-            rationale: p.rationale.clone(),
-            evidence_json: serde_json::to_value(&p.evidence)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            body_markdown: p.body_markdown.clone(),
-            artifact_sha256: None,
-        });
+            Ok(report) => outcome.findings += report.findings.len(),
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled lint failed for scope"
+                );
+            }
+        }
     }
-    Ok(proposals)
+
+    Ok(outcome)
+}
+
+#[derive(Debug, Default)]
+struct ScheduledEmbeddingBackfillTickOutcome {
+    scopes: usize,
+    embedded: usize,
+    /// Pages that already had a current embedding. Reported because a
+    /// tick that skipped everything and a tick that had nothing to do
+    /// are otherwise indistinguishable in the log.
+    skipped: usize,
+    failed: usize,
+    errors: usize,
+}
+
+async fn run_scheduled_embedding_backfill_tick(
+    reader: &ReaderPool,
+    writer: &WriterHandle,
+    wiki: &Wiki,
+    embedder: &Arc<dyn Embedder>,
+) -> Result<ScheduledEmbeddingBackfillTickOutcome> {
+    let scopes = reader.list_all_scopes().await?;
+    let mut outcome = ScheduledEmbeddingBackfillTickOutcome {
+        scopes: scopes.len(),
+        ..ScheduledEmbeddingBackfillTickOutcome::default()
+    };
+
+    for scope in scopes {
+        match run_embedding_backfill(
+            reader,
+            writer,
+            wiki,
+            embedder,
+            scope.workspace_id,
+            scope.project_id,
+            EmbedBackfillOptions::default(),
+        )
+        .await
+        {
+            Ok(counts) => {
+                outcome.embedded += counts.embedded;
+                outcome.skipped += counts.skipped;
+                outcome.failed += counts.failed;
+            }
+            Err(e) => {
+                outcome.errors += 1;
+                tracing::warn!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    error = %e,
+                    "scheduled embedding backfill failed for scope"
+                );
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn auto_improve_review_config_from_settings(
+    settings: &AutoImproveSettings,
+) -> AutoImproveReviewConfig {
+    AutoImproveReviewConfig {
+        min_observations: settings.min_observations,
+        min_session_duration_secs: settings.min_session_duration_secs,
+        min_confidence: settings.min_confidence,
+        max_input_tokens: settings.max_input_tokens,
+        max_proposals_per_run: settings.max_proposals_per_run,
+        include_raw_fallback: settings.include_raw_fallback,
+        proposal_actor: settings.proposal_actor.clone(),
+        pending_path: settings.pending_path.clone(),
+        max_patchable_pages: settings.max_patchable_pages,
+        max_patchable_body_chars: settings.max_patchable_body_chars,
+        max_edits_per_proposal: settings.max_edits_per_proposal,
+        max_edit_content_chars: settings.max_edit_content_chars,
+        max_changed_chars_per_proposal: settings.max_changed_chars_per_proposal,
+        max_patch_edits_per_run: settings.max_patch_edits_per_run,
+        max_rejection_context: settings.max_rejection_context,
+        rejection_context_days: settings.rejection_context_days,
+        max_final_body_chars: settings.max_final_body_chars,
+        max_rule_page_tokens: settings.max_rule_page_tokens,
+        max_procedure_page_tokens: settings.max_procedure_page_tokens,
+        eval: ai_memory_consolidate::AutoImproveEvalConfig {
+            enabled: settings.eval.enabled,
+            command: settings.eval.command.clone(),
+            timeout_secs: settings.eval.timeout_secs,
+            targets: settings.eval.targets.clone(),
+            min_delta: settings.eval.min_delta,
+        },
+    }
 }
 
 async fn configure_embedder(
@@ -1014,13 +2070,69 @@ async fn configure_embedder(
     // M9 — pluggable embedder. Stored rows carry provider/model/dim so
     // query paths can ignore stale vectors after an embedding config change.
     let Some(cfg) = config.embedder_config()? else {
-        info!("AI_MEMORY_EMBEDDING_PROVIDER unset; hybrid search disabled (FTS5-only)");
+        info!(
+            "AI_MEMORY_EMBEDDING_PROVIDER unset; vector search disabled (FTS5 + entity + graph active)"
+        );
         return Ok((wiki, None));
     };
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let dim = cfg.dim;
-    let embedder = build_embedder(cfg).context("building embedder from config")?;
+    let defaulted = cfg.defaulted;
+    // Local embeddings: fetch the model once, checksum-pinned, before
+    // the loader runs (docs/local-embeddings.md). Offline installs drop
+    // the files into models/ by hand and never hit the network.
+    if cfg.provider == ai_memory_llm::EmbedderChoice::Local
+        && let Some(models_dir) = cfg.models_dir.as_deref()
+        && !ai_memory_llm::model_present(models_dir)
+    {
+        if defaulted {
+            // Best-effort default (docs/local-embeddings.md): never
+            // block startup on an ~87 MB download. Fetch in the
+            // background; THIS boot runs without an embedder (the
+            // pre-2.0 behaviour), the next start finds the files and
+            // enables hybrid search. Offline hosts just log the warn.
+            let models_dir = models_dir.to_path_buf();
+            tokio::spawn(async move {
+                tracing::info!(
+                    dir = %models_dir.display(),
+                    "fetching the default local embedding model in the \
+                     background (~87 MB, one time); hybrid search enables \
+                     on the next start"
+                );
+                if let Err(e) = ai_memory_llm::fetch_model(&models_dir).await {
+                    tracing::warn!(
+                        error = %e,
+                        "default local embedding model fetch failed; running \
+                         without an embedder. Set embedding_provider = \"none\" \
+                         to opt out, or install offline per \
+                         docs/local-embeddings.md"
+                    );
+                }
+            });
+            return Ok((wiki, None));
+        }
+        tracing::info!(
+            dir = %models_dir.display(),
+            "local embedding model not present; fetching (~87 MB, one time)"
+        );
+        ai_memory_llm::fetch_model(models_dir).await.context(
+            "fetching the local embedding model (set up offline per \
+             docs/local-embeddings.md if this host has no network)",
+        )?;
+    }
+    let embedder = match build_embedder(cfg) {
+        Ok(e) => e,
+        Err(e) if defaulted => {
+            tracing::warn!(
+                error = %e,
+                "default local embeddings unavailable (model load failed); \
+                 continuing without an embedder"
+            );
+            return Ok((wiki, None));
+        }
+        Err(e) => return Err(e).context("building embedder from config"),
+    };
     let mismatch = store
         .reader
         .embedding_meta_for_mismatch(
@@ -1077,6 +2189,10 @@ fn configure_consolidator(
     project_id: ProjectId,
     provider_health: &ProviderHealth,
 ) -> Result<ConsolidatorSetup> {
+    // Validate the reranker setting before the provider early-return, so
+    // a typo'd or provider-less `AI_MEMORY_RERANKER` surfaces instead of
+    // looking enabled while eligible queries keep their normal ranking.
+    let want_reranker = config.reranker_choice()?;
     // Build the consolidator (if LLM configured) once, then share the
     // Arc between the MCP server (for `memory_consolidate` + lint),
     // the hook router (for PreCompact checkpointing), and the admin
@@ -1086,6 +2202,13 @@ fn configure_consolidator(
             "AI_MEMORY_LLM_PROVIDER unset; memory_consolidate disabled, PreCompact \
              falls back to rule-based checkpoint, lint runs rule-based only"
         );
+        if want_reranker {
+            anyhow::bail!(
+                "AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER: the reranker \
+                 judges candidates with the configured LLM provider. Set a provider or \
+                 unset AI_MEMORY_RERANKER."
+            );
+        }
         return Ok(ConsolidatorSetup {
             server,
             consolidator: None,
@@ -1095,22 +2218,50 @@ fn configure_consolidator(
     let provider_name = cfg.provider.name().to_string();
     let model = cfg.model.clone();
     let retry_hint = llm_retry_hint(&provider_name, &model, cfg.base_url.as_deref());
-    let llm = build_provider(cfg).context("building LLM provider from config")?;
+    // Routes through the same construction `llm_provider_config` just
+    // confirmed is `Some`: wraps `[primary, fallbacks...]` in a
+    // `FallbackLlmProvider` when `llm_fallbacks` is non-empty, else returns
+    // the plain provider unchanged (existing single-provider behavior).
+    let llm = config
+        .llm_provider_chain()
+        .context("building LLM provider chain from config")?
+        .context("LLM provider configured but chain construction returned none")?;
     let llm = provider_health.wrap_llm_provider(llm, provider_name, model, Some(retry_hint));
     info!(
         provider = llm.name(),
         model = llm.model(),
+        max_input_tokens = config.consolidation.max_input_tokens,
+        max_output_tokens = config.consolidation.max_output_tokens,
         "memory_consolidate + PreCompact LLM checkpointing enabled",
     );
-    let consolidator = Arc::new(Consolidator::new(
-        store.reader.clone(),
-        store.writer.clone(),
-        wiki.clone(),
-        llm.clone(),
-        workspace_id,
-        project_id,
-    ));
+    let consolidator = Arc::new(
+        Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki.clone(),
+            llm.clone(),
+            workspace_id,
+            project_id,
+        )
+        .with_per_user_slots(config.slots.per_user)
+        .with_prompt_limits(
+            config.consolidation.max_input_tokens,
+            config.consolidation.max_output_tokens,
+        ),
+    );
     server = server.with_consolidator_arc(wiki.clone(), llm.clone(), consolidator.clone());
+    // Optional post-RRF reranking rides on the same provider, so it is
+    // only reachable once an LLM is configured at all. Off unless the
+    // operator asked for it: it puts an LLM call on the memory_query
+    // hot path.
+    if want_reranker {
+        info!(
+            provider = llm.name(),
+            model = llm.model(),
+            "project/scopes memory_query reranking enabled (adds LLM latency)",
+        );
+        server = server.with_reranker(Arc::new(ai_memory_llm::LlmReranker::new(llm.clone())));
+    }
     Ok(ConsolidatorSetup {
         server,
         consolidator: Some(consolidator),
@@ -1188,518 +2339,11 @@ fn llm_retry_hint(provider: &str, model: &str, base_url: Option<&str>) -> String
     command
 }
 
-/// Normalise an operator-supplied path prefix into either `""` (root) or
-/// `/<core>` — exactly one leading slash, no trailing slash, internal
-/// empty/`//` segments collapsed.
-///
-/// Each segment must be a non-trivial member of the RFC 3986 *unreserved*
-/// set (`ALPHA / DIGIT / "-" / "." / "_" / "~"`). Dot-segments `.` and
-/// `..` are rejected outright even though their characters are unreserved
-/// — at the segment level they re-encode "current directory" and "parent
-/// directory" and would let a malformed env var hand the operator a
-/// traversal vector through every URL the server emits.
-///
-/// Anything that falls outside the rule collapses to `""` (root) so a
-/// bad env var can never inject markup or a protocol-relative `//` into
-/// served HTML.
-pub(crate) fn normalize_prefix(raw: &str) -> String {
-    let segs: Vec<&str> = raw.trim().split('/').filter(|s| !s.is_empty()).collect();
-    if segs.is_empty() {
-        return String::new();
-    }
-    let safe = segs.iter().all(|s| {
-        // Reject dot-segments (`.` / `..`) — they pass the per-char
-        // unreserved test but mean "current" / "parent" at the segment
-        // boundary and turn `/<base>` into `/<base>/..` traversal.
-        *s != "." && *s != ".." && s.chars().all(is_unreserved_url_char)
-    });
-    if !safe {
-        return String::new();
-    }
-    format!("/{}", segs.join("/"))
-}
-
-/// RFC 3986 `unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"`. Kept
-/// here as a single source of truth for both the path-prefix charset
-/// check and any future per-segment validation.
-fn is_unreserved_url_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~')
-}
-
-/// Build the `<base href>` value (always trailing-slash-terminated, never
-/// the protocol-relative `//`) for the web UI mounted at `base_path` +
-/// `web_slug`.
-pub(crate) fn web_base_href(base_path: &str, web_slug: &str) -> String {
-    let combined = format!(
-        "{}{}",
-        normalize_prefix(base_path),
-        normalize_prefix(web_slug)
-    );
-    if combined.is_empty() {
-        "/".to_string()
-    } else {
-        format!("{combined}/")
-    }
-}
-
-/// Escape a string for safe inclusion inside a double-quoted HTML attribute.
-fn escape_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Insert `snippet` immediately after the first `<head…>` tag (or prepend
-/// it when there is no head).
-///
-/// Matches outside HTML comments only: `<!-- … <head … --> <head>` skips
-/// the comment-internal occurrence and injects after the real `<head>`.
-/// Anything inside `<textarea>`, `<script>`, or other raw-text elements
-/// is NOT specially handled — built-in askama templates never put
-/// `<head` in those, and a custom `--web-ui-dir` SPA that does is a
-/// misconfiguration the operator can fix at the source. Avoiding a
-/// full HTML parser here keeps injection a single pass + alloc.
-fn inject_into_head(html: &str, snippet: &str) -> String {
-    let bytes = html.as_bytes();
-    let mut cursor = 0usize;
-    while cursor < bytes.len() {
-        // Skip past any HTML comment opening here so a `<head` literal
-        // sitting inside it cannot win the search.
-        if html[cursor..].starts_with("<!--") {
-            match html[cursor..].find("-->") {
-                Some(end) => cursor += end + 3,
-                None => break, // Unterminated comment — bail out of injection.
-            }
-            continue;
-        }
-        if html[cursor..].starts_with("<head")
-            && let Some(gt) = html[cursor..].find('>')
-        {
-            let pos = cursor + gt + 1;
-            let mut out = String::with_capacity(html.len() + snippet.len());
-            out.push_str(&html[..pos]);
-            out.push_str(snippet);
-            out.push_str(&html[pos..]);
-            return out;
-        }
-        cursor += 1;
-    }
-    format!("{snippet}{html}")
-}
-
-/// Inject `<base href="{href}">` so the served SPA's relative asset/router
-/// URLs resolve under the configured prefix.
-pub(crate) fn inject_base_href(html: &str, href: &str) -> String {
-    inject_into_head(html, &format!("<base href=\"{}\">", escape_attr(href)))
-}
-
-/// Inject `<meta name="ai-memory-base-path" content="{base_path}">` so the
-/// SPA can build API URLs as `{base_path}/api/v1`. The `<base href>` alone is
-/// ambiguous for this because it also folds in the web slug (e.g. `/web`),
-/// whereas `/api/v1` hangs off the base path, not the web mount.
-pub(crate) fn inject_base_path_meta(html: &str, base_path: &str) -> String {
-    inject_into_head(
-        html,
-        &format!(
-            "<meta name=\"ai-memory-base-path\" content=\"{}\">",
-            escape_attr(base_path)
-        ),
-    )
-}
-
-#[cfg(test)]
-mod web_base_tests {
-    use super::{inject_base_href, inject_base_path_meta, normalize_prefix, web_base_href};
-
-    #[test]
-    fn normalize_prefix_edge_cases() {
-        assert_eq!(normalize_prefix(""), "");
-        assert_eq!(normalize_prefix("/"), "");
-        assert_eq!(normalize_prefix("//"), "");
-        assert_eq!(normalize_prefix("  /  "), "");
-        assert_eq!(normalize_prefix("wiki"), "/wiki");
-        assert_eq!(normalize_prefix("/wiki"), "/wiki");
-        assert_eq!(normalize_prefix("/wiki/"), "/wiki");
-        assert_eq!(normalize_prefix("//wiki//"), "/wiki");
-        assert_eq!(normalize_prefix("/wiki/sub"), "/wiki/sub");
-        // Unsafe chars fall back to root — never inject markup or `//`.
-        assert_eq!(normalize_prefix("/wi\"ki"), "");
-        assert_eq!(normalize_prefix("/wiki space"), "");
-        assert_eq!(normalize_prefix("/<script>"), "");
-    }
-
-    /// Dot-segments must NOT survive normalisation. Their characters
-    /// pass the unreserved per-char allowlist (`.` is unreserved), so
-    /// the segment-level rejection is what stops `/..` and `/.` from
-    /// turning the base prefix into a traversal vector. Regression
-    /// guard — without this, `AI_MEMORY_BASE_PATH=/..` would serve
-    /// `/..` and let an upstream redirect normalise it to `/`.
-    #[test]
-    fn normalize_prefix_rejects_dot_segments() {
-        assert_eq!(normalize_prefix("/.."), "", "/.. must collapse to root");
-        assert_eq!(normalize_prefix("/."), "", "/. must collapse to root");
-        assert_eq!(
-            normalize_prefix("/wiki/.."),
-            "",
-            "any embedded /.. fails the whole prefix"
-        );
-        assert_eq!(
-            normalize_prefix("/wiki/./sub"),
-            "",
-            "any embedded /. fails the whole prefix"
-        );
-        // Segments that merely START with a dot but aren't pure
-        // dot-segments are still valid (RFC 3986 unreserved chars).
-        assert_eq!(normalize_prefix("/.wellknown"), "/.wellknown");
-    }
-
-    /// Nested base paths (`/a/b/c`) are valid; the normaliser keeps the
-    /// hierarchy intact instead of collapsing to one level.
-    #[test]
-    fn normalize_prefix_keeps_nested_paths() {
-        assert_eq!(normalize_prefix("/a/b/c"), "/a/b/c");
-        assert_eq!(normalize_prefix("a/b/c"), "/a/b/c");
-        assert_eq!(normalize_prefix("//a//b//c//"), "/a/b/c");
-        assert_eq!(normalize_prefix("/a/b/c/d/e"), "/a/b/c/d/e");
-    }
-
-    /// `inject_into_head` must skip `<head` literals sitting inside an
-    /// HTML comment, otherwise a custom SPA whose `index.html` had a
-    /// `<!-- <head> placeholder -->` comment would have the snippet
-    /// injected at the wrong place.
-    #[test]
-    fn inject_base_href_skips_head_inside_html_comment() {
-        let html =
-            "<!-- <head fake --><html><head><meta charset=\"utf-8\"></head><body></body></html>";
-        let out = inject_base_href(html, "/w/");
-        // Snippet must follow the REAL <head>, not the commented one —
-        // the comment must remain unmodified.
-        assert!(out.contains("<!-- <head fake -->"));
-        assert!(out.contains("<head><base href=\"/w/\"><meta"));
-    }
-
-    /// `inject_into_head` falls back to the prepend path on an
-    /// unterminated comment instead of looping forever (defensive).
-    #[test]
-    fn inject_base_href_on_unterminated_comment_falls_back_to_prepend() {
-        let html = "<!-- never closes <head>";
-        let out = inject_base_href(html, "/w/");
-        assert!(out.starts_with("<base href=\"/w/\">"));
-    }
-
-    #[test]
-    fn web_base_href_never_protocol_relative() {
-        assert_eq!(web_base_href("", "/web"), "/web/");
-        assert_eq!(web_base_href("/wiki", "/web"), "/wiki/web/");
-        assert_eq!(web_base_href("/wiki", "/"), "/wiki/");
-        assert_eq!(web_base_href("", "/"), "/");
-        assert_eq!(web_base_href("/", "/"), "/");
-        assert_eq!(web_base_href("/wiki/", "web"), "/wiki/web/");
-        for (b, s) in [("", "/"), ("/", "/"), ("//", "//")] {
-            assert!(!web_base_href(b, s).starts_with("//"));
-        }
-    }
-
-    #[test]
-    fn inject_base_href_after_head() {
-        let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
-        let out = inject_base_href(html, "/wiki/web/");
-        assert!(out.contains("<head><base href=\"/wiki/web/\"><meta"));
-    }
-
-    #[test]
-    fn inject_base_href_no_head_prepends() {
-        let out = inject_base_href("<html></html>", "/x/");
-        assert!(out.starts_with("<base href=\"/x/\"><html>"));
-    }
-
-    #[test]
-    fn inject_base_href_escapes_attr() {
-        let out = inject_base_href("<head></head>", "/a\"b/");
-        assert!(out.contains("<base href=\"/a&quot;b/\">"));
-    }
-
-    #[test]
-    fn inject_base_path_meta_emits_meta() {
-        let out = inject_base_path_meta("<head></head>", "/wiki");
-        assert!(out.contains("<meta name=\"ai-memory-base-path\" content=\"/wiki\">"));
-        // Empty base path => empty content (SPA falls back to root).
-        let empty = inject_base_path_meta("<head></head>", "");
-        assert!(empty.contains("content=\"\""));
-    }
-}
-
-/// Path / URL config the web mount needs. Bundling these together
-/// keeps `mount_web_router` and its helpers under clippy's
-/// `too_many_arguments` threshold without `#[allow]` papering over
-/// the call shape.
-pub(crate) struct WebMountSpec<'a> {
-    pub web_ui_dir: Option<&'a Path>,
-    pub cors_origins: &'a [String],
-    pub web_slug: &'a str,
-    pub base_href: &'a str,
-    pub base_path: &'a str,
-}
-
-/// Orchestrator: assemble the `/api/v1` + web-UI surfaces on top of
-/// `router`. Skips everything when web is disabled. Each concern lives
-/// in a dedicated helper below so this function reads as a four-step
-/// recipe (CORS-scoped API, slug normalisation, SPA-vs-builtin choice,
-/// final mount).
-fn mount_web_router(
-    router: axum::Router,
-    enable_web: bool,
-    reader: ReaderPool,
-    wiki: Wiki,
-    spec: WebMountSpec<'_>,
-) -> Result<axum::Router> {
-    if !enable_web {
-        return Ok(router);
-    }
-    // Register the web surfaces BEFORE applying the bearer middleware. In
-    // axum 0.8, `.layer()` only attaches to routes registered before the
-    // call; nesting after the layer would silently bypass auth for /web/*.
-    let router = router.nest(
-        "/api/v1",
-        build_api_router(&reader, &wiki, spec.cors_origins),
-    );
-
-    // Where the UI is mounted WITHIN the (already-applied) base path.
-    // Empty slug => the UI is the root of the base path itself.
-    let slug = normalize_prefix(spec.web_slug);
-    let mount = if slug.is_empty() { "/" } else { slug.as_str() };
-
-    // Custom SPA via --web-ui-dir (SPA fallback to index.html), otherwise
-    // the built-in server-side wiki browser. In both cases the served
-    // index carries an injected `<base href>` so relative asset/router
-    // URLs resolve under `{base_path}{web_slug}`.
-    if let Some(dir) = spec.web_ui_dir {
-        return mount_custom_spa(router, dir, &slug, spec.base_href, spec.base_path, mount);
-    }
-    Ok(mount_builtin_browser(
-        router,
-        reader,
-        wiki,
-        &slug,
-        spec.base_href,
-        mount,
+fn apply_host_layer(router: axum::Router, allowed_hosts: Vec<String>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        Arc::new(allowed_hosts),
+        require_allowed_host,
     ))
-}
-
-/// Build the `/api/v1` router and apply the per-origin CORS layer if
-/// the operator configured any. The layer is scoped to this router only
-/// (CORS_NOT_APPLIED_TO_OTHER_ROUTES invariant — `/mcp`, `/hook`,
-/// `/admin`, and `/web` must remain CORS-free).
-fn build_api_router(reader: &ReaderPool, wiki: &Wiki, cors_origins: &[String]) -> axum::Router {
-    let api = ai_memory_web::api_router(reader.clone(), wiki.clone());
-    if cors_origins.is_empty() {
-        return api;
-    }
-    // Origins were already validated before binding, so parsing here
-    // is expected to succeed; `.expect` surfaces a logic bug if it does not.
-    let parsed: Vec<axum::http::HeaderValue> = cors_origins
-        .iter()
-        .map(|o| o.parse().expect("pre-validated origin must parse"))
-        .collect();
-    let cors = CorsLayer::new()
-        .allow_origin(parsed)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
-        .allow_credentials(true)
-        .max_age(Duration::from_secs(600));
-    info!(origins = ?cors_origins, "CORS layer attached to /api/v1");
-    api.layer(cors)
-}
-
-/// Mount the operator's custom SPA from `--web-ui-dir`. Reads
-/// `index.html`, injects `<base href>` plus the `ai-memory-base-path`
-/// meta, and serves the rest as static assets with an SPA fallback to
-/// the injected shell. Errors surface as `anyhow` with the dir path.
-fn mount_custom_spa(
-    router: axum::Router,
-    dir: &Path,
-    slug: &str,
-    base_href: &str,
-    base_path: &str,
-    mount: &str,
-) -> Result<axum::Router> {
-    let dir = dir.to_path_buf();
-    let raw = std::fs::read_to_string(dir.join("index.html"))
-        .with_context(|| format!("reading custom web UI index at {}", dir.display()))?;
-    let injected = inject_base_path_meta(&inject_base_href(&raw, base_href), base_path);
-    info!(mount, base_href, base_path, "custom web UI mounted");
-    let spa = custom_spa_router(dir, injected.clone());
-    Ok(if slug.is_empty() {
-        router.merge(spa)
-    } else {
-        // `nest(slug, …)` routes `{slug}` (→ inner `/`) and `{slug}/<path>`
-        // (→ inner `/{*path}`), but NOT the bare trailing-slash root
-        // `{slug}/` — that empty sub-path matches neither, so it 404s. The
-        // SPA router normalises its home to exactly that URL, so a refresh on
-        // the app root returned a hard 404 (`custom_spa_trailing_slash_root_*`).
-        // Serve the injected shell there too. Unlike the builtin browser —
-        // which redirects `{slug}/` → `{slug}` — a SPA is happier staying put
-        // on a 200 than bouncing through a redirect on every root refresh.
-        let slash_index = Arc::new(injected);
-        router
-            .route(
-                &format!("{slug}/"),
-                axum::routing::get(move || {
-                    let body = slash_index.clone();
-                    async move { axum::response::Html((*body).clone()) }
-                }),
-            )
-            .nest(slug, spa)
-    })
-}
-
-/// Mount the built-in server-rendered wiki browser at `slug` with
-/// `<base href>` injection middleware. When `slug` is non-empty also
-/// register the trailing-slash → canonical redirect, preserving any
-/// query string the caller passed.
-fn mount_builtin_browser(
-    router: axum::Router,
-    reader: ReaderPool,
-    wiki: Wiki,
-    slug: &str,
-    base_href: &str,
-    mount: &str,
-) -> axum::Router {
-    // The built-in browser emits RELATIVE asset/link URLs (`static/…`,
-    // `w/…`, `search`, `.`). Inject a `<base href>` into every HTML
-    // response so they resolve under `{base_path}{web_slug}/` — the
-    // same anchoring the custom SPA gets via its injected index.
-    let web_router = ai_memory_web::router(reader, wiki).layer(
-        axum::middleware::from_fn_with_state(Arc::new(base_href.to_string()), inject_web_base_href),
-    );
-    info!(mount, base_href, "read-only wiki browser mounted");
-    if slug.is_empty() {
-        return router.merge(web_router);
-    }
-    // Strip-trailing-slash redirect. The target must carry the full
-    // external prefix because the surrounding `nest(&base_path, …)`
-    // does NOT rewrite Location headers. Derive it from base_href
-    // (which already folds in base_path + slug). The closure takes
-    // `Uri` so `?q=x` survives — see
-    // `trailing_slash_redirect_preserves_query_string`.
-    let canonical = {
-        let trimmed = base_href.trim_end_matches('/');
-        if trimmed.is_empty() {
-            "/".to_string()
-        } else {
-            trimmed.to_string()
-        }
-    };
-    router
-        .route(
-            &format!("{slug}/"),
-            axum::routing::get(move |uri: axum::http::Uri| {
-                let to = match uri.query() {
-                    Some(q) if !q.is_empty() => format!("{canonical}?{q}"),
-                    _ => canonical.clone(),
-                };
-                async move { axum::response::Redirect::permanent(&to) }
-            }),
-        )
-        .nest(slug, web_router)
-}
-
-fn custom_spa_router(dir: std::path::PathBuf, injected_index: String) -> axum::Router {
-    let index = Arc::new(injected_index);
-    let root_index = index.clone();
-    let direct_index = index.clone();
-    let fallback_index = index.clone();
-
-    // Assets are served as files; any missing asset path falls back to the
-    // injected index for SPA client routes. Direct `/index.html` is routed
-    // explicitly so it cannot bypass injection by being served from disk.
-    let assets = ServeDir::new(dir)
-        .append_index_html_on_directories(false)
-        .fallback(service_fn(move |_req: Request<Body>| {
-            let body = fallback_index.clone();
-            async move {
-                Ok::<_, Infallible>(axum::response::Html((*body).clone()).into_response())
-            }
-        }));
-
-    axum::Router::new()
-        .route(
-            "/",
-            axum::routing::get(move || {
-                let body = root_index.clone();
-                async move { axum::response::Html((*body).clone()) }
-            }),
-        )
-        .route(
-            "/index.html",
-            axum::routing::get(move || {
-                let body = direct_index.clone();
-                async move { axum::response::Html((*body).clone()) }
-            }),
-        )
-        .route_service("/{*path}", assets)
-}
-
-/// Response middleware: inject `<base href>` into `text/html` responses from
-/// the built-in server-rendered web browser, so its relative URLs resolve
-/// under the configured `{base_path}{web_slug}` prefix. Non-HTML responses
-/// (static assets, redirects) pass through untouched.
-async fn inject_web_base_href(
-    State(base_href): State<Arc<String>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let resp = next.run(req).await;
-    let is_html = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("text/html"));
-    if !is_html {
-        return resp;
-    }
-    let (mut parts, body) = resp.into_parts();
-    // Bound the buffer at MAX_BODY_BYTES — same cap inbound bodies use.
-    // A custom-SPA `index.html` over the cap is misconfigured at the
-    // operator level; refusing here keeps a runaway template (or a
-    // hostile asset masquerading as text/html) from streaming
-    // unbounded into memory before injection.
-    let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "response body too large or read error\n",
-            )
-                .into_response();
-        }
-    };
-    match std::str::from_utf8(&bytes) {
-        Ok(html) => {
-            let injected = inject_base_href(html, &base_href);
-            // Stale length from the pre-injection body; let hyper recompute.
-            parts.headers.remove(header::CONTENT_LENGTH);
-            Response::from_parts(parts, Body::from(injected))
-        }
-        Err(_) => Response::from_parts(parts, Body::from(bytes)),
-    }
-}
-
-fn apply_http_layers(
-    router: axum::Router,
-    auth_state: Arc<AuthState>,
-    allowed_hosts: Vec<String>,
-) -> axum::Router {
-    router
-        .layer(axum::middleware::from_fn_with_state(
-            auth_state,
-            require_bearer,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(allowed_hosts),
-            require_allowed_host,
-        ))
 }
 
 async fn require_allowed_host(
@@ -1727,6 +2371,60 @@ fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
     })
 }
 
+/// Seed the read-side active-project fallback from the most recently active
+/// project already on disk.
+///
+/// The pointer lives only in process memory, so restarting the daemon
+/// mid-session drops it. An unscoped read then resolves through the baked
+/// default scope and answers zero counts for a project holding thousands of
+/// observations — through the SUCCESS path, with nothing in the log, so
+/// neither the agent nor the operator can tell it apart from a genuinely
+/// empty project (#678). Failing such a read closed is not the fix: a keyed
+/// miss is also the normal shape of the pre-publish window (hooks are
+/// fire-and-forget) and of TTL/cap eviction, both of which must keep
+/// degrading gracefully.
+///
+/// So make the degraded answer a real one. The seed lands in a slot only READS
+/// consult: a keyed hit still wins, an unscoped write from an unrecognized
+/// caller still fails closed rather than being attributed to a reconstructed
+/// project, and the first hook event publishes straight over it. The recency
+/// bound is the pointer's own per-key TTL: activity older than that would have
+/// aged out of a live pointer anyway. Non-fatal — a server that cannot read
+/// this starts exactly as it does today.
+async fn seed_active_project_fallback(reader: &ReaderPool, active_project: &ActiveProject) {
+    if active_project.get().is_some() {
+        return;
+    }
+    let ttl_us = i64::try_from(active_project.per_key_ttl().as_micros()).unwrap_or(i64::MAX);
+    let since = jiff::Timestamp::now()
+        .as_microsecond()
+        .saturating_sub(ttl_us);
+    match reader.most_recently_active_scope(since).await {
+        Ok(Some((workspace_id, project_id))) => {
+            active_project.seed_read_fallback(workspace_id, project_id);
+            let workspace = reader
+                .workspace_name_by_id(workspace_id)
+                .await
+                .ok()
+                .flatten();
+            let project = reader
+                .project_name_by_id(workspace_id, project_id)
+                .await
+                .ok()
+                .flatten();
+            info!(
+                workspace = workspace.as_deref().unwrap_or("<unknown>"),
+                project = project.as_deref().unwrap_or("<unknown>"),
+                "seeded active-project fallback from the last recorded activity"
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "active-project fallback seed skipped (non-fatal)");
+        }
+    }
+}
+
 fn host_without_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[')
         && let Some((inside, _)) = rest.split_once(']')
@@ -1744,14 +2442,764 @@ fn host_without_port(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewSession, PagePath, Tier};
+    use ai_memory_core::{
+        AgentKind, ApiCredentialId, NewObservation, NewSession, NewUser, ObservationKind, PagePath,
+        Sanitized, Sanitizer, SessionId, Tier,
+    };
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult, SyntheticEmbedder};
     use ai_memory_wiki::WritePageRequest;
     use axum::http::Request;
+    use secrecy::SecretString;
     use std::future::Future;
     use std::pin::Pin;
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    async fn wait_for_maintenance_success(
+        store: &Store,
+        job: ai_memory_store::MaintenanceJob,
+    ) -> i64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(last_success) = store
+                .reader
+                .maintenance_job_last_success(job)
+                .await
+                .unwrap()
+            {
+                return last_success;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "maintenance writer did not persist successful completion"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Assert `acquire_serve_lock` returned a real held lock, panicking with
+    /// the concrete cause otherwise. The bare `.unwrap()...is_some()` collapsed
+    /// a transient `Err` (EMFILE/ENFILE/EINTR under parallel fd pressure) or an
+    /// `Ok(None)` downgrade into an un-actionable flake; this turns the next
+    /// occurrence into a one-line errno diagnosis while still requiring the
+    /// lock to be genuinely held.
+    fn assert_serve_lock_held(result: Result<Option<ServeLock>>) -> ServeLock {
+        match result {
+            Ok(Some(lock)) => lock,
+            Ok(None) => panic!(
+                "acquire_serve_lock downgraded to an unguarded start (Ok(None)) although no other holder exists in this test"
+            ),
+            Err(err) => panic!("acquire_serve_lock failed: {err:?}"),
+        }
+    }
+
+    /// Acquire the serve lock after a prior holder was released, tolerating the
+    /// brief window in which a just-released `flock` can still report busy when
+    /// the release and the re-acquire race in the *same* process under heavy
+    /// parallel test load. This asserts the guarantee that actually matters — a
+    /// released lock is not *permanently* held — rather than instant
+    /// availability; a real server releases on process exit, so production never
+    /// hits this same-process window (and `acquire_serve_lock` rightly never
+    /// retries a genuine `WouldBlock`). Still requires the lock to be genuinely
+    /// acquired within the window, and panics with the concrete cause otherwise.
+    fn acquire_released_serve_lock(dir: &Path) -> ServeLock {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match acquire_serve_lock(dir, false) {
+                Ok(Some(lock)) => return lock,
+                other => {
+                    if std::time::Instant::now() >= deadline {
+                        return assert_serve_lock_held(other);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_retriable_but_a_busy_lock_is_not() {
+        use std::io::{Error, ErrorKind};
+        // EINTR is transient and cross-platform via ErrorKind::Interrupted.
+        assert!(is_transient_serve_lock_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        #[cfg(unix)]
+        {
+            // EMFILE / ENFILE fd exhaustion is transient.
+            assert!(is_transient_serve_lock_error(&Error::from_raw_os_error(24)));
+            assert!(is_transient_serve_lock_error(&Error::from_raw_os_error(23)));
+        }
+        // A contended lock (WouldBlock) is the "someone else owns it" signal:
+        // it is busy, never transient, and must not be retried away.
+        let busy = Error::from(ErrorKind::WouldBlock);
+        assert!(!is_transient_serve_lock_error(&busy));
+        assert!(crate::commands::hook_spool::is_drain_lock_busy_error(&busy));
+    }
+
+    #[test]
+    fn second_server_on_the_same_data_dir_is_refused_and_names_the_holder() {
+        let dir = TempDir::new().unwrap();
+        let _first = assert_serve_lock_held(acquire_serve_lock(dir.path(), false));
+        let err = acquire_serve_lock(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--force"),
+            "refusal must name the override: {err}"
+        );
+        assert!(
+            err.contains(&format!("pid={}", std::process::id())),
+            "refusal must name the holding process: {err}"
+        );
+    }
+
+    #[test]
+    fn force_starts_unguarded_while_the_holder_keeps_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let _first = assert_serve_lock_held(acquire_serve_lock(dir.path(), false));
+        assert!(acquire_serve_lock(dir.path(), true).unwrap().is_none());
+        // --force bypasses the refusal, not the holder: a plain attempt still sees it.
+        assert!(acquire_serve_lock(dir.path(), false).is_err());
+    }
+
+    #[test]
+    fn a_released_serve_lock_does_not_lock_out_the_next_server() {
+        let dir = TempDir::new().unwrap();
+        {
+            let _first = acquire_serve_lock(dir.path(), false).unwrap();
+            // Dropping the holder is what process exit does to the flock: the
+            // leftover .serve.lock file must not outlive the lock it named.
+        }
+        // Under heavy parallel `cargo test --workspace` load the just-released
+        // flock can momentarily still report busy in this same process; retry
+        // briefly so the assertion checks "not permanently locked out" rather
+        // than instant availability.
+        let _ = acquire_released_serve_lock(dir.path());
+    }
+
+    #[test]
+    fn existing_users_require_nonempty_pepper_and_root_bearer() {
+        for users_exist in [false, true] {
+            for (pepper_label, token_pepper) in [
+                ("missing", None),
+                ("blank", Some("  ")),
+                ("present", Some("pepper")),
+            ] {
+                for (bearer_label, bearer_token) in [
+                    ("missing", None),
+                    ("blank", Some("\t")),
+                    ("present", Some("root-token")),
+                ] {
+                    let auth = AuthSettings {
+                        token_pepper: token_pepper.map(str::to_string),
+                        bearer_token: bearer_token.map(str::to_string),
+                        ..AuthSettings::default()
+                    };
+                    let result =
+                        validate_existing_users_auth(users_exist, users_exist, false, &auth);
+                    let should_pass =
+                        !users_exist || (pepper_label == "present" && bearer_label == "present");
+                    assert_eq!(
+                        result.is_ok(),
+                        should_pass,
+                        "users={users_exist}, pepper={pepper_label}, bearer={bearer_label}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_api_key_pepper_preflight_is_independent_of_human_mode() {
+        let missing = AuthSettings::default();
+        assert!(validate_api_credential_pepper(true, &missing).is_err());
+
+        let configured = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_api_credential_pepper(true, &configured).is_ok());
+        assert!(validate_api_credential_pepper(false, &missing).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_non_loopback_http_requires_explicit_override() {
+        let addresses = [
+            ("127.0.0.1:49374", true),
+            ("[::1]:49374", true),
+            ("0.0.0.0:49374", false),
+            ("[::]:49374", false),
+            ("192.168.1.90:49374", false),
+        ];
+
+        for (address, loopback) in addresses {
+            let local_addr: SocketAddr = address.parse().expect("valid test address");
+            for auth_enabled in [false, true] {
+                for allow_override in [false, true] {
+                    // On a host, the bind address IS the evidence: an
+                    // unauthenticated non-loopback bind is refused unless
+                    // the operator overrode it.
+                    let allowed = loopback || auth_enabled || allow_override;
+                    assert_eq!(
+                        validate_http_exposure(
+                            local_addr,
+                            auth_enabled,
+                            false,
+                            false,
+                            allow_override,
+                            false,
+                        )
+                        .is_ok(),
+                        allowed,
+                        "address={address}, auth={auth_enabled}, override={allow_override}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn human_auth_non_loopback_requires_secure_cookie_posture() {
+        let remote: SocketAddr = "192.168.1.90:49374".parse().unwrap();
+        assert!(validate_http_exposure(remote, true, true, false, false, false).is_err());
+        assert!(validate_http_exposure(remote, true, true, false, true, true).is_err());
+        assert_eq!(
+            validate_http_exposure(remote, true, true, true, false, false).unwrap(),
+            HttpExposure::Safe
+        );
+
+        let loopback: SocketAddr = "127.0.0.1:49374".parse().unwrap();
+        assert_eq!(
+            validate_http_exposure(loopback, true, true, false, false, false).unwrap(),
+            HttpExposure::Safe
+        );
+    }
+
+    /// Regression for #407. The published image binds `0.0.0.0` because that
+    /// is the only way `-p` publishing works, so the host-side rule above
+    /// refused every container started from the documented Quick Start and
+    /// left it crash-looping under `--restart unless-stopped`.
+    #[test]
+    fn containers_warn_instead_of_refusing_because_the_bind_proves_nothing() {
+        let quick_start: SocketAddr = "0.0.0.0:49374".parse().expect("valid test address");
+
+        // The exact Quick Start shape: no token, no override, in a container.
+        assert_eq!(
+            validate_http_exposure(quick_start, false, false, false, false, true)
+                .expect("must not refuse"),
+            HttpExposure::UndeterminedInContainer,
+        );
+
+        // Identical inputs on a host still refuse — the carve-out is scoped
+        // to the container case and does not soften the host rule.
+        assert!(validate_http_exposure(quick_start, false, false, false, false, false).is_err());
+
+        // A container is not a blanket downgrade: with machine auth configured
+        // the verdict is Safe, so the operator gets no spurious warning.
+        assert_eq!(
+            validate_http_exposure(quick_start, true, false, false, false, true)
+                .expect("auth is fine"),
+            HttpExposure::Safe,
+        );
+
+        // An explicit override still reports as an override, not as the
+        // container case, so the startup log keeps naming the real reason.
+        assert_eq!(
+            validate_http_exposure(quick_start, false, false, false, true, true)
+                .expect("override is fine"),
+            HttpExposure::InsecureByOverride,
+        );
+
+        // Loopback inside a container is plain Safe.
+        let loopback: SocketAddr = "127.0.0.1:49374".parse().expect("valid test address");
+        assert_eq!(
+            validate_http_exposure(loopback, false, false, false, false, true)
+                .expect("loopback is fine"),
+            HttpExposure::Safe,
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_configuration_requires_distinct_credentials() {
+        let missing_root = AuthSettings {
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&missing_root).is_err());
+
+        let shared = AuthSettings {
+            bearer_token: Some("same-token".into()),
+            actor_proxy_bearer_token: Some(" same-token ".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&shared).is_err());
+
+        let valid = AuthSettings {
+            bearer_token: Some("root-token".into()),
+            actor_proxy_bearer_token: Some("proxy-token".into()),
+            ..AuthSettings::default()
+        };
+        assert!(validate_trusted_proxy_auth(&valid).is_ok());
+        assert!(trusted_proxy_identity_enabled(&valid));
+    }
+
+    #[test]
+    fn root_oidc_identity_requires_issuer_and_subject_together() {
+        for (issuer, subject, valid) in [
+            (None, None, true),
+            (Some("https://idp.example"), None, false),
+            (None, Some("root-subject"), false),
+            (Some("https://idp.example"), Some("root-subject"), true),
+        ] {
+            let auth = AuthSettings {
+                root_issuer: issuer.map(str::to_string),
+                root_subject: subject.map(str::to_string),
+                ..AuthSettings::default()
+            };
+            assert_eq!(
+                validate_trusted_proxy_auth(&auth).is_ok(),
+                valid,
+                "issuer={issuer:?}, subject={subject:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_start_delay_handles_never_overdue_and_remaining_cadence() {
+        let interval = Duration::from_secs(120);
+        let now = 1_000_000_000i64;
+        assert_eq!(
+            maintenance_start_delay(None, now, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(now - 120_000_000), now, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(now - 30_000_000), now, interval),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            maintenance_start_delay(None, now, Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(i64::MAX), now, interval),
+            interval,
+            "future/extreme persisted timestamps cannot defer beyond interval"
+        );
+        assert_eq!(
+            maintenance_start_delay(Some(i64::MIN), i64::MAX, interval),
+            MAINTENANCE_STARTUP_DELAY_CAP,
+            "opposite-sign extremes must not overflow"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_maintenance_retries_failures_and_waits_after_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let attempts_for_tick = attempts.clone();
+        let reader_for_state = store.reader.clone();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(2),
+            move || {
+                let reader = reader_for_state.clone();
+                async move {
+                    Ok(reader
+                        .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                        .await?)
+                }
+            },
+            || jiff::Timestamp::now().as_microsecond(),
+            move || {
+                let attempts = attempts_for_tick.clone();
+                let events = events.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    events.send(attempt).unwrap();
+                    if attempt == 1 {
+                        anyhow::bail!("injected failure");
+                    }
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(received.recv().await, Some(1));
+        assert_eq!(
+            store
+                .reader
+                .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                .await
+                .unwrap(),
+            None,
+            "failed ticks must not advance persisted cadence"
+        );
+
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err(), "failure retry is not early");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok(2));
+        wait_for_maintenance_success(&store, ai_memory_store::MaintenanceJob::ForgetSweep).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            received.try_recv().is_err(),
+            "next tick waits full interval"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(received.recv().await, Some(3));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_state_read_failure_retries_before_running_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let work = Arc::new(AtomicUsize::new(0));
+        let reads_for_loader = reads.clone();
+        let work_for_tick = work.clone();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            move || {
+                let reads = reads_for_loader.clone();
+                async move {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        anyhow::bail!("injected cadence read failure");
+                    }
+                    Ok(None)
+                }
+            },
+            || jiff::Timestamp::now().as_microsecond(),
+            move || {
+                let work = work_for_tick.clone();
+                async move {
+                    work.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            work.load(Ordering::SeqCst),
+            0,
+            "read failure must not run work"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            work.load(Ordering::SeqCst),
+            0,
+            "successful retry still observes startup delay"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(work.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_runs_one_bounded_startup_catchup_for_never_and_overdue() {
+        const NOW: i64 = 10_000_000;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let never_events = events.clone();
+        let overdue_events = events.clone();
+        let never = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(2),
+            || async { Ok(None) },
+            || NOW,
+            move || {
+                let events = never_events.clone();
+                async move {
+                    events.send("never").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        let overdue = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            || async { Ok(Some(NOW - 2_000_000)) },
+            || NOW,
+            move || {
+                let events = overdue_events.clone();
+                async move {
+                    events.send("overdue").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        let mut seen = [false, false];
+        while let Ok(event) = received.try_recv() {
+            match event {
+                "never" => seen[0] = true,
+                "overdue" => seen[1] = true,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(seen, [true, true]);
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "no immediate repeat after catch-up"
+        );
+        never.abort();
+        overdue.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_waits_exact_remaining_interval_when_not_due() {
+        const NOW: i64 = 20_000_000;
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            Duration::from_secs(4),
+            || async { Ok(Some(NOW - 1_000_000)) },
+            || NOW,
+            move || {
+                let events = events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(received.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok(()));
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_waits_after_long_tick_without_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::RuleLint,
+            Duration::from_secs(2),
+            || async { Ok(None) },
+            || 0,
+            move || {
+                let events = events.clone();
+                async move {
+                    events.send("start").unwrap();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    events.send("end").unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok("start"));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "second tick cannot overlap long first tick"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(received.try_recv(), Ok("end"));
+        wait_for_maintenance_success(&store, ai_memory_store::MaintenanceJob::RuleLint).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "interval starts after completion"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            received.try_recv(),
+            Ok("start"),
+            "next tick starts after the full post-completion interval"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persisted_loop_restart_waits_remaining_interval_from_real_state() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let interval = Duration::from_secs(4);
+        let (first_events, mut first_received) = tokio::sync::mpsc::unbounded_channel();
+        let first = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            interval,
+            || async { Ok(None) },
+            || 0,
+            move || {
+                let events = first_events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(interval).await;
+        tokio::task::yield_now().await;
+        assert_eq!(first_received.try_recv(), Ok(()));
+
+        let persisted =
+            wait_for_maintenance_success(&store, ai_memory_store::MaintenanceJob::ForgetSweep)
+                .await;
+        first.abort();
+
+        // Restart one second into the persisted cadence: exactly three seconds remain.
+        let (second_events, mut second_received) = tokio::sync::mpsc::unbounded_channel();
+        let (state_loaded, mut state_loaded_received) = tokio::sync::mpsc::unbounded_channel();
+        let second_reader = store.reader.clone();
+        let second = tokio::spawn(run_persisted_maintenance_job(
+            store.writer.clone(),
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            interval,
+            move || {
+                let reader = second_reader.clone();
+                let state_loaded = state_loaded.clone();
+                async move {
+                    let state = reader
+                        .maintenance_job_last_success(ai_memory_store::MaintenanceJob::ForgetSweep)
+                        .await?;
+                    state_loaded.send(()).unwrap();
+                    Ok(state)
+                }
+            },
+            move || persisted + 1_000_000,
+            move || {
+                let events = second_events.clone();
+                async move {
+                    events.send(()).unwrap();
+                    Ok(())
+                }
+            },
+        ));
+        assert_eq!(state_loaded_received.recv().await, Some(()));
+        tokio::time::advance(Duration::from_millis(2999)).await;
+        tokio::task::yield_now().await;
+        assert!(second_received.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(second_received.try_recv(), Ok(()));
+        second.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_maintenance_creates_no_persisted_job_state() {
+        let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+        let tasks = start_maintenance_scheduler(
+            MaintenanceSettings {
+                enabled: false,
+                forget_sweep_interval_secs: 1,
+                lint_interval_secs: 1,
+                embedding_backfill_interval_secs: 1,
+            },
+            AutoImproveSettings::default(),
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            None,
+            None,
+            crate::config::DecaySettings::default(),
+        )
+        .await;
+        assert!(tasks.is_empty());
+        for job in [
+            ai_memory_store::MaintenanceJob::ForgetSweep,
+            ai_memory_store::MaintenanceJob::RuleLint,
+        ] {
+            assert_eq!(
+                store
+                    .reader
+                    .maintenance_job_last_success(job)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_interval_omits_only_that_maintenance_job() {
+        for settings in [
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 0,
+                lint_interval_secs: 60,
+                embedding_backfill_interval_secs: 0,
+            },
+            MaintenanceSettings {
+                enabled: true,
+                forget_sweep_interval_secs: 60,
+                lint_interval_secs: 0,
+                embedding_backfill_interval_secs: 0,
+            },
+        ] {
+            let (_tmp, store, wiki, _ws, _first, _second) = two_project_wiki().await;
+            let tasks = start_maintenance_scheduler(
+                settings,
+                AutoImproveSettings::default(),
+                store.reader.clone(),
+                store.writer.clone(),
+                wiki,
+                None,
+                None,
+                crate::config::DecaySettings::default(),
+            )
+            .await;
+            // One enabled lint/sweep job plus the independent hollow-project job.
+            assert_eq!(tasks.len(), 2);
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
 
     struct PanicLlm;
 
@@ -1786,6 +3234,574 @@ mod tests {
         {
             Box::pin(async move { panic!("preflight-skipped scheduler test must not call LLM") })
         }
+    }
+
+    struct SuccessfulConsolidationLlm;
+
+    impl LlmProvider for SuccessfulConsolidationLlm {
+        fn name(&self) -> &'static str {
+            "successful-consolidation"
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "test".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "title": "Compiled session",
+                    "body_markdown": "Durable worker completed this session.",
+                    "tags": ["test"]
+                }))
+            })
+        }
+    }
+
+    /// #678: the pointer is process memory, so `systemctl restart` mid-session
+    /// drops it. An unscoped read then resolved through the baked default scope
+    /// and reported zero counts for a project holding thousands of observations,
+    /// through the success path. Seeding the shared slot from the last recorded
+    /// activity makes that degraded answer a real one.
+    #[tokio::test]
+    async fn a_restart_seeds_the_active_project_fallback_from_the_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        // The baked default scope: empty, and where the bug parked every read.
+        let scratch = store
+            .writer
+            .get_or_create_project(workspace_id, "scratch", None)
+            .await
+            .unwrap();
+        let worked_in = store
+            .writer
+            .get_or_create_project(workspace_id, "real-project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: worked_in,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: worked_in,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "the session that outlived the daemon".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        // A pointer as empty as it is one instruction after a restart.
+        let active_project = ActiveProject::new();
+        seed_active_project_fallback(&store.reader, &active_project).await;
+        assert_eq!(
+            active_project.seeded(),
+            Some((workspace_id, worked_in)),
+            "the seed must name the project the last activity landed in"
+        );
+        assert_eq!(
+            active_project.get(),
+            None,
+            "a reconstruction is not a publish: the shared slot stays empty"
+        );
+
+        // The live session's keyed entry died with the process, so its read
+        // misses the map — and must now degrade to real data, not to `scratch`.
+        let actor = ai_memory_core::ActorKey {
+            user: None,
+            session_id: Some(session_id.to_string()),
+        };
+        let resolved = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.as_tuple(),
+            (workspace_id, worked_in),
+            "an unscoped read after a restart must not silently answer for the baked default"
+        );
+
+        // ...while an unscoped WRITE from a caller the pointer cannot place is
+        // untouched by the seed: it resolves exactly where it did before, so a
+        // page is never attributed to a project reconstructed from a session
+        // that is not this caller's.
+        let written = ai_memory_store::ScopeResolver::new(&store.reader, workspace_id, scratch)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project)
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(
+            written.as_tuple(),
+            (workspace_id, scratch),
+            "the seed must not retarget unscoped writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_never_overwrites_a_pointer_a_hook_already_published() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let published = store
+            .writer
+            .get_or_create_project(workspace_id, "published", None)
+            .await
+            .unwrap();
+        // Activity in a DIFFERENT project, or the seed no-ops and this test
+        // passes with the guard deleted.
+        let elsewhere = store
+            .writer
+            .get_or_create_project(workspace_id, "elsewhere", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id: elsewhere,
+                agent_kind: AgentKind::ClaudeCode,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id: elsewhere,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "work".into(),
+                    body: "activity the seed would otherwise reach for".into(),
+                    importance: 5,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+
+        let active_project = ActiveProject::new();
+        active_project.set(workspace_id, published);
+        seed_active_project_fallback(&store.reader, &active_project).await;
+
+        assert_eq!(
+            active_project.get(),
+            Some((workspace_id, published)),
+            "a live pointer outranks anything the DB remembers"
+        );
+        assert_eq!(
+            active_project.seeded(),
+            None,
+            "no seed is taken while a real publish already stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_consolidation_worker_consumes_and_completes_durable_job() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let workspace_id = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let project_id = store
+            .writer
+            .get_or_create_project(workspace_id, "project", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id,
+                project_id,
+                agent_kind: AgentKind::Codex,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id,
+                    project_id,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "finish".into(),
+                    body: "complete the durable job".into(),
+                    importance: 8,
+                },
+                &Sanitizer::default(),
+            ))
+            .await
+            .unwrap();
+        store.writer.end_session(session_id, None).await.unwrap();
+        store
+            .writer
+            .enqueue_session_consolidation(workspace_id, project_id, session_id)
+            .await
+            .unwrap();
+
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let consolidator = Arc::new(Consolidator::new(
+            store.reader.clone(),
+            store.writer.clone(),
+            wiki,
+            Arc::new(SuccessfulConsolidationLlm),
+            workspace_id,
+            project_id,
+        ));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run_session_consolidation_worker(
+            store.writer.clone(),
+            consolidator,
+            notify.clone(),
+            cancel.child_token(),
+            completed.clone(),
+        ));
+        notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), completed.notified())
+            .await
+            .expect("worker should complete the queued job");
+
+        let path = format!("sessions/{session_id}.md");
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(workspace_id, project_id, &path)
+                .await
+                .unwrap()
+                .is_some_and(|page| page.body.contains("Durable worker completed")),
+            "queue completion must follow the durable wiki write"
+        );
+
+        cancel.cancel();
+        task.await.unwrap();
+        let now = jiff::Timestamp::now().as_microsecond();
+        assert!(
+            store
+                .writer
+                .claim_session_consolidation(now, now - 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "completed work must not be claimed again"
+        );
+    }
+
+    async fn two_project_wiki() -> (TempDir, Store, Wiki, WorkspaceId, ProjectId, ProjectId) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let first = store
+            .writer
+            .get_or_create_project(ws, "first", None)
+            .await
+            .unwrap();
+        let second = store
+            .writer
+            .get_or_create_project(ws, "second", None)
+            .await
+            .unwrap();
+        (tmp, store, wiki, ws, first, second)
+    }
+
+    async fn write_test_page(
+        wiki: &Wiki,
+        ws: WorkspaceId,
+        project: ProjectId,
+        path: &str,
+        title: &str,
+        tier: Tier,
+    ) {
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: project,
+            path: PagePath::new(path).unwrap(),
+            frontmatter: serde_json::json!({"title": title}),
+            body: format!("# {title}\n\nbody for {path}"),
+            tier,
+            pinned: false,
+            title: Some(title.into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_sweep_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Episodic,
+            )
+            .await;
+        }
+
+        let decay = ai_memory_store::DecayParams {
+            cold_threshold: 2.0,
+            ..ai_memory_store::DecayParams::default()
+        };
+        let outcome = run_scheduled_sweep_tick(
+            &store.reader,
+            &store.writer,
+            &wiki,
+            &decay,
+            0.0,
+            ObservationRetention::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.candidates_evaluated, 2);
+        assert_eq!(outcome.evicted, 2);
+        for project in [first, second] {
+            assert!(
+                store
+                    .reader
+                    .decay_candidates(ws, project)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "sweep should evict the eligible page in every project"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_lint_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for project in [first, second] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                "notes/a.md",
+                "Duplicate",
+                Tier::Semantic,
+            )
+            .await;
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                "notes/b.md",
+                "Duplicate",
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let panic_llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let outcome = run_scheduled_lint_tick(
+            &store.reader,
+            &wiki,
+            Some(&panic_llm),
+            ai_memory_store::DecayParams::default().lambda,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.findings, 2);
+        for project in [first, second] {
+            assert!(
+                wiki.read_page(ws, project, &PagePath::new("_lint".to_string()).unwrap())
+                    .is_err(),
+                "lint reports are dated pages, not the directory itself"
+            );
+            let lint_pages = store
+                .reader
+                .decay_candidates(ws, project)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.path.as_str().starts_with("_lint/"))
+                .count();
+            assert_eq!(lint_pages, 1, "lint should write one report per project");
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_maintenance_embedding_backfill_tick_covers_all_projects() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let outcome =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+
+        assert_eq!(outcome.scopes, 2);
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.embedded, 2);
+        for project in [first, second] {
+            let embedded = store
+                .reader
+                .embedded_page_ids(
+                    ws,
+                    project,
+                    embedder.provider().to_string(),
+                    embedder.model().to_string(),
+                    embedder.dim(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(embedded.len(), 1, "each project should get embeddings");
+        }
+    }
+
+    /// A tick that skipped every page and a tick that had nothing to do
+    /// both embed zero pages. Without `skipped` in the completion line
+    /// they are the same log entry, so a page being passed over every
+    /// hour reads as a quiet, healthy scheduler (#509).
+    #[tokio::test]
+    async fn scheduled_embedding_tick_distinguishes_skipped_work_from_an_idle_pass() {
+        let (_tmp, store, wiki, ws, first, second) = two_project_wiki().await;
+        let embedder: Arc<dyn Embedder> = Arc::new(SyntheticEmbedder::new(16));
+
+        let idle =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (idle.embedded, idle.skipped),
+            (0, 0),
+            "no pages yet: nothing embedded and nothing skipped"
+        );
+
+        for (project, name) in [(first, "first"), (second, "second")] {
+            write_test_page(
+                &wiki,
+                ws,
+                project,
+                &format!("notes/{name}.md"),
+                name,
+                Tier::Semantic,
+            )
+            .await;
+        }
+
+        let first_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!((first_pass.embedded, first_pass.skipped), (2, 0));
+
+        let second_pass =
+            run_scheduled_embedding_backfill_tick(&store.reader, &store.writer, &wiki, &embedder)
+                .await
+                .unwrap();
+        assert_eq!(
+            (second_pass.embedded, second_pass.failed),
+            (0, 0),
+            "the work is done, so the tick embeds nothing"
+        );
+        assert_eq!(
+            second_pass.skipped, 2,
+            "but it must still say it passed over two pages, or it is              indistinguishable from the idle tick above"
+        );
     }
 
     #[test]
@@ -1852,13 +3868,22 @@ mod tests {
         validate_web_ui_args(true, Some(ui.path())).unwrap();
     }
 
+    #[test]
+    fn human_mode_does_not_require_root_bearer() {
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            bearer_token: None,
+            ..AuthSettings::default()
+        };
+        assert!(validate_existing_users_auth(true, false, true, &auth).is_ok());
+    }
+
     #[tokio::test]
     async fn web_routes_are_inside_auth_layer() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let router = mount_web_router(
-            axum::Router::new(),
+        let web = split_web_routers(
             true,
             store.reader.clone(),
             wiki,
@@ -1871,9 +3896,12 @@ mod tests {
             },
         )
         .unwrap();
-        let router = apply_http_layers(
-            router,
-            Arc::new(AuthState::new(Some("secret".to_string()))),
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )),
             vec!["localhost".to_string()],
         );
 
@@ -1891,305 +3919,18 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// Assemble the web/API surface under `base_path` + `web_slug` exactly the
-    /// way the `serve` handler does (mount, then `nest(&base_path, …)`), with
-    /// no auth/host layers so tests probe routing + injection in isolation.
-    /// Returns the `TempDir` guard too — the caller must keep it alive for the
-    /// router's lifetime (the store's SQLite + wiki files live under it).
-    fn based_web_router(base_path: &str, web_slug: &str) -> (TempDir, axum::Router) {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let base = normalize_prefix(base_path);
-        let base_href = web_base_href(base_path, web_slug);
-        let router = mount_web_router(
-            axum::Router::new(),
-            true,
-            store.reader.clone(),
-            wiki,
-            WebMountSpec {
-                web_ui_dir: None,
-                cors_origins: &[],
-                web_slug,
-                base_href: &base_href,
-                base_path: &base,
-            },
-        )
-        .unwrap();
-        let router = if base.is_empty() {
-            router
-        } else {
-            axum::Router::new().nest(&base, router)
-        };
-        // Mirror the production favicon mount in serve handler: at the
-        // absolute host root, outside the base-path nest.
-        let router = router.merge(ai_memory_web::favicon_router());
-        (tmp, router)
-    }
-
     #[tokio::test]
-    async fn base_path_nests_all_surfaces_and_root_404s() {
-        let (_tmp, router) = based_web_router("/wiki", "/web");
-
-        // The web UI is reachable UNDER the prefix…
-        let under = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(under.status(), StatusCode::OK);
-
-        // …and the API too.
-        let api = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/api/v1/projects")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(api.status(), StatusCode::OK);
-
-        // The same paths at the host ROOT must 404 — nothing leaks outside the
-        // prefix (the whole point of base-path hosting behind a shared proxy).
-        for uri in ["/web", "/api/v1/projects"] {
-            let root = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                root.status(),
-                StatusCode::NOT_FOUND,
-                "{uri} must 404 at root"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn inject_web_base_href_targets_html_only() {
-        let (_tmp, router) = based_web_router("/wiki", "/web");
-
-        // HTML response carries the injected <base href> under the prefix.
-        let html_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(html_resp.status(), StatusCode::OK);
-        let html = axum::body::to_bytes(html_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let html = std::str::from_utf8(&html).unwrap();
-        assert!(
-            html.contains(r#"<base href="/wiki/web/">"#),
-            "expected injected base href, got: {html}"
-        );
-
-        // A non-HTML asset passes through untouched (no <base> smuggled in).
-        let css_resp = router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web/static/tailwind.css")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(css_resp.status(), StatusCode::OK);
-        let css = axum::body::to_bytes(css_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            !std::str::from_utf8(&css).unwrap().contains("<base href"),
-            "non-HTML asset must not receive a <base href> injection"
-        );
-    }
-
-    #[tokio::test]
-    async fn trailing_slash_redirect_carries_the_prefix() {
-        let (_tmp, router) = based_web_router("/wiki", "/web");
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
-        // Location must include the external prefix — the surrounding base nest
-        // does NOT rewrite Location headers, so a bare `/web` would drop `/wiki`.
-        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/wiki/web",);
-    }
-
-    /// Trailing-slash redirect must preserve the query string. The
-    /// original handler took `()` and silently dropped `?q=x`, so a
-    /// link in the SPA that appended a filter param round-tripped to
-    /// the canonical URL with the param missing. Fragments are
-    /// client-only and never reach the server, so we only assert query.
-    #[tokio::test]
-    async fn trailing_slash_redirect_preserves_query_string() {
-        let (_tmp, router) = based_web_router("/wiki", "/web");
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web/?q=foo&limit=5")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            resp.headers().get(header::LOCATION).unwrap(),
-            "/wiki/web?q=foo&limit=5",
-            "redirect must carry the original query, not drop it"
-        );
-    }
-
-    /// Nested base paths (`/a/b/c`) — exercised by the normaliser
-    /// unit test but not previously end-to-end. Routes must be
-    /// reachable under the full prefix and 404 at any shorter prefix.
-    #[tokio::test]
-    async fn nested_base_path_nests_web_and_api() {
-        let (_tmp, router) = based_web_router("/a/b/c", "/web");
-        // Full nested prefix reaches both surfaces.
-        for uri in ["/a/b/c/web", "/a/b/c/api/v1/projects"] {
-            let resp = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{uri} must reach the surface"
-            );
-        }
-        // A SHORTER prefix (e.g. only /a/b) must NOT leak — the nest is
-        // exactly `/a/b/c` and any partial mount is unmapped.
-        for uri in ["/a/b/web", "/a/api/v1/projects"] {
-            let resp = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::NOT_FOUND,
-                "{uri} must 404 — leaks the prefix otherwise"
-            );
-        }
-    }
-
-    /// Custom-SPA index that already carries its own `<base href>` —
-    /// today we prepend another one; HTML5 says the browser honours
-    /// the FIRST `<base>` so the injection becomes a silent no-op.
-    /// Documented behaviour (see `inject_into_head` doc-comment) but
-    /// also exercised here so a future change to "replace existing"
-    /// gets noticed by a failing test rather than silently shipping.
-    #[test]
-    fn inject_base_href_with_existing_base_tag_does_not_replace() {
-        let html = "<html><head><base href=\"/old/\"><title>x</title></head></html>";
-        let out = inject_base_href(html, "/new/");
-        // Injected snippet appears first, the old <base> remains too.
-        let new_pos = out.find("<base href=\"/new/\">").expect("new injected");
-        let old_pos = out.find("<base href=\"/old/\">").expect("old preserved");
-        assert!(
-            new_pos < old_pos,
-            "injected base must appear before the pre-existing one (browser ignores duplicates after the first)"
-        );
-    }
-
-    /// Post-merge audit (Phase 7 live test) caught that PR #79's
-    /// `/favicon.ico` route was nested inside `/web`, so it lived at
-    /// `/web/favicon.ico` and the browser's automatic root fetch always
-    /// 404'd. Fix: a separate `favicon_router()` mounted at the absolute
-    /// HOST root, outside `--base-path` and outside the `/web` nest.
-    /// This test pins both:
-    ///   * `/favicon.ico` at the host root returns the PNG.
-    ///   * Under `--base-path /wiki`, the favicon STAYS at root —
-    ///     browsers fetch `<host>/favicon.ico` regardless of where the
-    ///     app is mounted; the route must not move with the prefix.
-    #[tokio::test]
-    async fn favicon_lives_at_host_root_regardless_of_base_path() {
-        for base_path in ["", "/wiki"] {
-            let (_tmp, router) = based_web_router(base_path, "/web");
-            let resp = router
-                .oneshot(
-                    Request::builder()
-                        .uri("/favicon.ico")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "/favicon.ico must be reachable at host root (base_path={base_path:?})"
-            );
-            assert_eq!(
-                resp.headers()
-                    .get(axum::http::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok()),
-                Some("image/png"),
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn no_base_path_is_byte_equivalent_at_root() {
-        let (_tmp, router) = based_web_router("", "/web");
-        let resp = router
-            .clone()
-            .oneshot(Request::builder().uri("/web").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert!(
-            std::str::from_utf8(&body)
-                .unwrap()
-                .contains(r#"<base href="/web/">"#),
-            "default mount should inject the root-relative base href"
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_spa_index_routes_are_injected_under_base_path() {
+    async fn custom_spa_is_public_while_api_stays_authenticated() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let ui = TempDir::new().unwrap();
         std::fs::write(
             ui.path().join("index.html"),
-            "<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
+            "<html><body>spa</body></html>",
         )
         .unwrap();
-        std::fs::write(ui.path().join("app.js"), "console.log('asset');").unwrap();
-
-        let base = normalize_prefix("/wiki");
-        let base_href = web_base_href("/wiki", "/web");
-        let router = mount_web_router(
-            axum::Router::new(),
+        let web = split_web_routers(
             true,
             store.reader.clone(),
             wiki,
@@ -2197,136 +3938,59 @@ mod tests {
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/web",
-                base_href: &base_href,
-                base_path: &base,
-            },
-        )
-        .unwrap();
-        let router = axum::Router::new().nest(&base, router);
-
-        for uri in [
-            "/wiki/web",
-            "/wiki/web/", // trailing-slash root: SPA home after router normalises it
-            "/wiki/web/index.html",
-            "/wiki/web/client/route",
-        ] {
-            let resp = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let html = std::str::from_utf8(&body).unwrap();
-            assert!(
-                html.contains(r#"<base href="/wiki/web/">"#),
-                "{uri} must receive injected base href: {html}"
-            );
-            assert!(
-                html.contains(r#"<meta name="ai-memory-base-path" content="/wiki">"#),
-                "{uri} must receive injected API base-path meta: {html}"
-            );
-            assert!(html.contains("shell"), "{uri} returns the SPA shell");
-        }
-
-        let asset = router
-            .oneshot(
-                Request::builder()
-                    .uri("/wiki/web/app.js")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(asset.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(asset.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let js = std::str::from_utf8(&body).unwrap();
-        assert_eq!(js, "console.log('asset');");
-    }
-
-    /// Regression for the prod 404: with `base_path=""` (host root) the custom
-    /// SPA mounts at slug `/web`. `nest("/web", …)` served `/web` and
-    /// `/web/<route>` but left the bare trailing-slash root `/web/` unrouted →
-    /// hard 404. The SPA normalises its home to exactly `/web/`, so refreshing
-    /// the app root broke (both a host-root deploy and one mounted under a base
-    /// path like `/wiki`).
-    #[tokio::test]
-    async fn custom_spa_trailing_slash_root_serves_shell() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let ui = TempDir::new().unwrap();
-        std::fs::write(
-            ui.path().join("index.html"),
-            "<!doctype html><html><head><title>spa</title></head><body>shell</body></html>",
-        )
-        .unwrap();
-
-        let base_href = web_base_href("", "/web");
-        let router = mount_web_router(
-            axum::Router::new(),
-            true,
-            store.reader.clone(),
-            wiki,
-            WebMountSpec {
-                web_ui_dir: Some(ui.path()),
-                cors_origins: &[],
-                web_slug: "/web",
-                base_href: &base_href,
+                base_href: "/web/",
                 base_path: "",
             },
         )
         .unwrap();
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = apply_host_layer(
+            web.public
+                .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_dual_auth,
+                ))),
+            vec!["localhost".to_string()],
+        );
 
-        // `/web`, the trailing-slash root `/web/`, and a deep client route all
-        // serve the injected shell — none may 404.
-        for uri in ["/web", "/web/", "/web/projects/x"] {
-            let resp = router
-                .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{uri} must serve the SPA shell, not 404"
-            );
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let html = std::str::from_utf8(&body).unwrap();
-            assert!(
-                html.contains("shell"),
-                "{uri} returns the SPA shell: {html}"
-            );
-            assert!(
-                html.contains(r#"<base href="/web/">"#),
-                "{uri} must receive the injected base href: {html}"
-            );
-        }
+        let spa = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/web")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spa.status(), StatusCode::OK);
+
+        let api = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("Host", "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn custom_spa_root_slug_does_not_shadow_api_routes() {
+    async fn custom_spa_root_fallback_preserves_host_owned_routes() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let ui = TempDir::new().unwrap();
         std::fs::write(
             ui.path().join("index.html"),
-            "<!doctype html><html><head><title>spa</title></head><body>root shell</body></html>",
+            "<html><head></head><body>root spa shell</body></html>",
         )
         .unwrap();
-        std::fs::write(ui.path().join("app.js"), "console.log('root asset');").unwrap();
-
-        let base = normalize_prefix("/wiki");
-        let base_href = web_base_href("/wiki", "/");
-        let router = mount_web_router(
-            axum::Router::new(),
+        let web = split_web_routers(
             true,
             store.reader.clone(),
             wiki,
@@ -2334,71 +3998,165 @@ mod tests {
                 web_ui_dir: Some(ui.path()),
                 cors_origins: &[],
                 web_slug: "/",
-                base_href: &base_href,
-                base_path: &base,
+                base_href: "/",
+                base_path: "",
             },
         )
         .unwrap();
-        let router = axum::Router::new().nest(&base, router);
 
-        for uri in ["/wiki", "/wiki/index.html", "/wiki/client/route"] {
-            let resp = router
+        let mut protected_host = axum::Router::new();
+        for path in [
+            "/admin/status",
+            "/mcp",
+            "/hook",
+            "/handoff",
+            "/workstream/runs",
+        ] {
+            protected_host = protected_host.route(
+                path,
+                axum::routing::any(|| async { StatusCode::UNAUTHORIZED }),
+            );
+        }
+        let public_auth = axum::Router::new().route(
+            "/auth/login",
+            axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+        );
+        let auth = Arc::new(AuthState::new(Some("secret".to_string())));
+        let router = protected_host
+            .merge(public_auth)
+            .merge(web.protected.layer(axum::middleware::from_fn_with_state(
+                auth,
+                require_dual_auth,
+            )))
+            .merge(web.public)
+            .merge(ai_memory_web::favicon_router());
+
+        // Mutation captured: dropping any host-owned route merge lets the root SPA
+        // wildcard return its HTML shell instead of the reserved route response.
+        for (method, path) in [
+            (axum::http::Method::GET, "/admin/status"),
+            (axum::http::Method::POST, "/mcp"),
+            (axum::http::Method::POST, "/hook"),
+            (axum::http::Method::GET, "/handoff"),
+            (axum::http::Method::POST, "/workstream/runs"),
+        ] {
+            let response = router
                 .clone()
-                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let html = std::str::from_utf8(&body).unwrap();
-            assert!(
-                html.contains(r#"<base href="/wiki/">"#),
-                "{uri} must receive injected base href: {html}"
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must reach its authenticated host route"
             );
-            assert!(
-                html.contains(r#"<meta name="ai-memory-base-path" content="/wiki">"#),
-                "{uri} must receive injected API base-path meta: {html}"
-            );
-            assert!(html.contains("root shell"), "{uri} returns the SPA shell");
         }
 
         let api = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/wiki/api/v1/projects")
+                    .uri("/api/v1/projects")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(api.status(), StatusCode::OK);
-        let content_type = api
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or_default();
-        assert!(
-            content_type.starts_with("application/json"),
-            "API route must not be shadowed by the root SPA: {content_type}"
-        );
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
 
-        let asset = router
+        let auth = router
+            .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/wiki/app.js")
+                    .method(axum::http::Method::POST)
+                    .uri("/auth/login")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(asset.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(asset.into_body(), usize::MAX)
+        assert_eq!(auth.status(), StatusCode::NO_CONTENT);
+
+        let favicon = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let js = std::str::from_utf8(&body).unwrap();
-        assert_eq!(js, "console.log('root asset');");
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(
+            favicon.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+
+        let shell = router
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shell.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(shell.into_body(), 4096).await.unwrap();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("root spa shell"),
+            "/login must still use the root SPA fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_without_llm_provider_fails_server_setup() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let server = AiMemoryServer::new(store.reader.clone(), store.writer.clone(), ws, proj);
+        let config = Config {
+            reranker: Some("llm".into()),
+            ..Config::default()
+        };
+
+        let result = configure_consolidator(
+            &config,
+            server,
+            &store,
+            &wiki,
+            ws,
+            proj,
+            &ProviderHealth::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("provider-less reranking must fail server setup"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("AI_MEMORY_RERANKER=llm requires AI_MEMORY_LLM_PROVIDER"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2432,6 +4190,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2457,98 +4216,299 @@ mod tests {
         );
     }
 
+    #[test]
+    fn human_auth_intended_from_bootstrap_password_or_recovery() {
+        let empty = AuthSettings::default();
+        assert!(!human_auth_intended(&empty, false, false));
+        assert!(human_auth_intended(&empty, true, false));
+        assert!(human_auth_intended(&empty, false, true));
+        let recovery = AuthSettings {
+            recovery_token: Some(SecretString::from("break-glass-recovery-token-32chr")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&recovery, false, false));
+        let initial = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        assert!(human_auth_intended(&initial, false, false));
+    }
+
+    #[test]
+    fn human_mode_fails_closed_without_recoverable_root_or_recovery() {
+        let err = require_recoverable_root_or_recovery(true, 0, false).unwrap_err();
+        assert!(err.to_string().contains("no recoverable root"));
+        require_recoverable_root_or_recovery(true, 0, true).unwrap();
+        require_recoverable_root_or_recovery(true, 1, false).unwrap();
+        require_recoverable_root_or_recovery(false, 0, false).unwrap();
+    }
+
     #[tokio::test]
-    async fn auto_improve_scheduler_startup_init_preserves_first_interval_sessions() {
+    async fn maybe_bootstrap_root_is_one_shot() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        let ws = store
-            .writer
-            .get_or_create_workspace("default")
+        let first = AuthSettings {
+            initial_root_password: Some(SecretString::from("twelve-chars!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &first).await.unwrap();
+        assert!(store.reader.bootstrap_completed().await.unwrap());
+        assert_eq!(store.reader.count_recoverable_roots().await.unwrap(), 1);
+        let second = AuthSettings {
+            initial_root_password: Some(SecretString::from("different-pass!!")),
+            ..AuthSettings::default()
+        };
+        maybe_bootstrap_root(&store, &second).await.unwrap();
+        let login = store
+            .reader
+            .find_login_user_by_username("root".into())
             .await
+            .unwrap()
             .unwrap();
-        let first_project = store
-            .writer
-            .get_or_create_project(ws, "first", None)
+        assert!(
+            ai_memory_store::password::verify_password(
+                "twelve-chars!!".into(),
+                login.password_hash.clone().unwrap(),
+            )
             .await
-            .unwrap();
-        let second_project = store
-            .writer
-            .get_or_create_project(ws, "second", None)
+            .unwrap()
+        );
+        assert!(
+            !ai_memory_store::password::verify_password(
+                "different-pass!!".into(),
+                login.password_hash.unwrap(),
+            )
             .await
-            .unwrap();
+            .unwrap()
+        );
+    }
 
-        for project_id in [first_project, second_project] {
-            let before_startup_init = SessionId::new();
-            store
-                .writer
-                .begin_session(NewSession {
-                    id: before_startup_init,
-                    workspace_id: ws,
-                    project_id,
-                    agent_kind: AgentKind::OpenCode,
-                    cwd: None,
-                })
-                .await
-                .unwrap();
-            store
-                .writer
-                .end_session(before_startup_init, None)
-                .await
-                .unwrap();
-        }
+    #[tokio::test]
+    async fn maybe_bootstrap_root_fails_closed_on_api_credential_collision() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let password = "twelve-chars!!";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(password, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+        let auth = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(password)),
+            ..AuthSettings::default()
+        };
+        let err = maybe_bootstrap_root(&store, &auth).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("collides with an existing API credential"),
+            "{err}"
+        );
+        assert!(!store.reader.bootstrap_completed().await.unwrap());
 
-        assert_eq!(
-            initialize_auto_improve_scheduler_scopes(&store.reader, &store.writer)
+        let state =
+            AuthState::new(None).with_multiuser(pepper, store.reader.clone(), store.writer.clone());
+        let mut machine_request = Request::builder()
+            .header("authorization", format!("Bearer {password}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            ai_memory_mcp::auth::authenticate_bearer(&state, &mut machine_request)
                 .await
                 .unwrap(),
-            (2, 0)
+            ai_memory_mcp::auth::BearerAuth::Authenticated
+        ));
+        assert_eq!(
+            machine_request
+                .extensions()
+                .get::<ai_memory_core::AuthLevel>(),
+            Some(&ai_memory_core::AuthLevel::User)
         );
 
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        let mut first_interval_sessions = Vec::new();
-        for project_id in [first_project, second_project] {
-            let session_id = SessionId::new();
-            store
-                .writer
-                .begin_session(NewSession {
-                    id: session_id,
-                    workspace_id: ws,
-                    project_id,
-                    agent_kind: AgentKind::OpenCode,
-                    cwd: None,
-                })
-                .await
-                .unwrap();
-            store.writer.end_session(session_id, None).await.unwrap();
-            first_interval_sessions.push((project_id, session_id));
-        }
+        let login = public_auth_router(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "username": "legacy",
+                            "password": password,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+    }
 
-        let mut settings = AutoImproveSettings::default();
-        settings.scheduler.min_session_age_secs = 0;
-        settings.scheduler.max_sessions_per_tick = 10;
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
-        let outcome =
-            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
-                .await
-                .unwrap();
+    #[tokio::test]
+    async fn internal_session_introspect_is_inside_host_guard_not_require_bearer() {
+        let state = std::sync::Arc::new(
+            AuthState::new(Some("root-bearer".into()))
+                .with_trusted_proxy_bearer("proxy-bearer-token"),
+        );
+        let router = apply_host_layer(internal_auth_router(state), vec!["memory.example".into()]);
+        let body = Body::from(r#"{"session":"","method":"GET"}"#);
 
-        assert_eq!(outcome.scopes, 2);
-        assert_eq!(outcome.scopes_with_candidates, 2);
-        assert_eq!(outcome.reviewed, 4);
-        assert_eq!(outcome.errors, 0);
-
-        for (project_id, session_id) in first_interval_sessions {
-            let candidates = store
-                .reader
-                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+        let missing_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_host.status(), StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(
+            axum::body::to_bytes(missing_host.into_body(), 4096)
                 .await
-                .unwrap();
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("missing Host"), "{text}");
+
+        let bad_host = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "evil.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_host.status(), StatusCode::FORBIDDEN);
+
+        let allowed = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/auth/session-introspect")
+                    .header("Host", "memory.example")
+                    .header("authorization", "Bearer proxy-bearer-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"session":"","method":"GET"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(allowed.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["authenticated"], false);
+        let body_text = json.to_string();
+        assert!(
+            !body_text.contains("X-Memory-Actor"),
+            "proxy bearer without actor headers must reach introspect, not MissingIdentity: {body_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_authority_secrets_cannot_match_api_credentials() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let mut user = NewUser {
+            username: "legacy".into(),
+            name: None,
+            email: None,
+        };
+        user.validate().unwrap();
+        let user_id = store
+            .writer
+            .create_human_user(user, ai_memory_core::UserRole::User, None, false)
+            .await
+            .unwrap();
+        let pepper = TokenPepper::new("pepper");
+        let secret = "configured-authority-collision-32chars";
+        store
+            .writer
+            .create_api_credential(
+                ApiCredentialId::new(),
+                user_id,
+                "legacy".into(),
+                hash_token(secret, &pepper),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let cases = [
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                actor_proxy_bearer_token: Some(secret.into()),
+                ..AuthSettings::default()
+            },
+            AuthSettings {
+                token_pepper: Some("pepper".into()),
+                recovery_token: Some(SecretString::from(secret)),
+                ..AuthSettings::default()
+            },
+        ];
+        for auth in cases {
+            let err = validate_configured_secret_collisions(&store, &auth, false)
+                .await
+                .unwrap_err();
             assert!(
-                candidates.iter().all(|c| c.session_id != session_id),
-                "first-interval session should have been reviewed or claimed"
+                err.to_string()
+                    .contains("collides with an existing API credential")
             );
+            assert!(!err.to_string().contains(secret));
         }
+
+        let ignored_initial = AuthSettings {
+            token_pepper: Some("pepper".into()),
+            initial_root_password: Some(SecretString::from(secret)),
+            ..AuthSettings::default()
+        };
+        validate_configured_secret_collisions(&store, &ignored_initial, false)
+            .await
+            .unwrap();
+        assert!(
+            validate_configured_secret_collisions(&store, &ignored_initial, true)
+                .await
+                .is_err()
+        );
     }
 
     // ── Part B: CORS validation tests ──────────────────────────────────────
@@ -2613,150 +4573,6 @@ mod tests {
                 "https://b.example.com",
                 "https://c.example.com"
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn cors_layer_on_api_v1_allows_configured_origin() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-
-        let cors_origins = ["https://app.example.com".to_string()];
-        let router = mount_web_router(
-            axum::Router::new(),
-            true,
-            store.reader.clone(),
-            wiki,
-            WebMountSpec {
-                web_ui_dir: None,
-                cors_origins: &cors_origins,
-                web_slug: "/web",
-                base_href: "/web/",
-                base_path: "",
-            },
-        )
-        .unwrap();
-        // No auth layer so we can reach /api/v1 directly.
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/workspaces")
-                    .header("Origin", "https://app.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let acao = resp
-            .headers()
-            .get("access-control-allow-origin")
-            .expect("ACAO header must be present for allowed origin")
-            .to_str()
-            .unwrap();
-        assert_eq!(acao, "https://app.example.com");
-        let acac = resp
-            .headers()
-            .get("access-control-allow-credentials")
-            .expect("ACAC header must be present")
-            .to_str()
-            .unwrap();
-        assert_eq!(acac, "true");
-    }
-
-    #[tokio::test]
-    async fn cors_layer_on_api_v1_denies_unlisted_origin() {
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-        store
-            .writer
-            .get_or_create_workspace("default")
-            .await
-            .unwrap();
-
-        let cors_origins = ["https://app.example.com".to_string()];
-        let router = mount_web_router(
-            axum::Router::new(),
-            true,
-            store.reader.clone(),
-            wiki,
-            WebMountSpec {
-                web_ui_dir: None,
-                cors_origins: &cors_origins,
-                web_slug: "/web",
-                base_href: "/web/",
-                base_path: "",
-            },
-        )
-        .unwrap();
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/api/v1/workspaces")
-                    .header("Origin", "https://evil.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // The request is still served (CORS does not block on the server side),
-        // but the ACAO header must be absent so the browser enforces the policy.
-        assert!(
-            resp.headers().get("access-control-allow-origin").is_none(),
-            "unlisted origin must not receive ACAO header"
-        );
-    }
-
-    #[tokio::test]
-    async fn cors_not_applied_to_other_routes() {
-        // /mcp and /admin routes must not carry CORS headers even when
-        // a CORS origin list is configured (CORS_NOT_APPLIED_TO_OTHER_ROUTES
-        // invariant). We verify by checking that a request to a non-/api/v1
-        // path that 404s (no actual handler mounted here) still lacks ACAO.
-        let tmp = TempDir::new().unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
-
-        let cors_origins = ["https://app.example.com".to_string()];
-        let router = mount_web_router(
-            axum::Router::new(),
-            true,
-            store.reader.clone(),
-            wiki,
-            WebMountSpec {
-                web_ui_dir: None,
-                cors_origins: &cors_origins,
-                web_slug: "/web",
-                base_href: "/web/",
-                base_path: "",
-            },
-        )
-        .unwrap();
-        // /web is a non-api route; sending an Origin header must not trigger CORS.
-        let resp = router
-            .oneshot(
-                Request::builder()
-                    .uri("/web")
-                    .header("Origin", "https://app.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            resp.headers().get("access-control-allow-origin").is_none(),
-            "/web must not carry CORS headers: {:?}",
-            resp.headers()
         );
     }
 }

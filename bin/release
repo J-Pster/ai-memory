@@ -56,11 +56,14 @@ cd "$REPO_ROOT"
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 
+echo "==> git diff --check"
+git diff --check
+
 echo "==> cargo clippy"
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "==> cargo test"
-cargo test --workspace
+echo "==> cargo test --workspace --all-targets"
+cargo test --workspace --all-targets
 
 echo "==> cargo deny check (warn-only)"
 if command -v cargo-deny &>/dev/null; then
@@ -148,14 +151,16 @@ new_block = (
     + unreleased_body
 )
 
-new_text = unreleased_pattern.sub(new_block + r"\n## [", text, count=1)
+new_text = unreleased_pattern.sub(lambda _: new_block + "\n## [", text, count=1)
 
 # Update the reference links at the bottom.
 # Replace the Unreleased compare link to point from this version to HEAD.
 new_text = re.sub(
     r'^\[Unreleased\]:.*$',
-    "[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/$TAG...HEAD\n"
-    "[$VERSION]: https://github.com/akitaonrails/ai-memory/releases/tag/$TAG",
+    lambda _: (
+        "[Unreleased]: https://github.com/akitaonrails/ai-memory/compare/$TAG...HEAD\n"
+        "[$VERSION]: https://github.com/akitaonrails/ai-memory/releases/tag/$TAG"
+    ),
     new_text,
     flags=re.MULTILINE,
 )

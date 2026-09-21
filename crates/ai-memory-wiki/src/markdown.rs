@@ -28,6 +28,12 @@ pub struct Markdown {
 /// Recognises only the canonical `---\n<yaml>\n---\n` block at the very
 /// start of the document. Anything else is treated as body.
 ///
+/// A leading UTF-8 BOM is dropped either way. It only means "this file is
+/// UTF-8" while it sits at offset zero; carried into `body` it is a
+/// zero-width no-break space in front of the first line, which hides an H1
+/// from [`derive_title`] and rides into the body a later re-emit writes
+/// back after the frontmatter fence.
+///
 /// # Errors
 /// Returns [`WikiError::Yaml`] if the frontmatter block exists but does
 /// not parse as YAML.
@@ -47,7 +53,7 @@ pub fn parse(input: &str) -> WikiResult<Markdown> {
     }
     Ok(Markdown {
         frontmatter: serde_json::Value::Null,
-        body: input.to_string(),
+        body: trimmed.to_string(),
     })
 }
 
@@ -138,9 +144,101 @@ pub fn extract_links(body: &str, page_path: &PagePath) -> Vec<LinkTarget> {
                 workspace,
                 project,
                 path,
+                relation: None,
             })
         })
         .collect()
+}
+
+/// Body wikilinks plus typed `relations:` frontmatter edges — the full
+/// outgoing link set every page-write path stores. One entry point so a
+/// new writer cannot forget the typed half.
+pub fn extract_all_links(
+    frontmatter: &serde_json::Value,
+    body: &str,
+    page_path: &PagePath,
+) -> Vec<LinkTarget> {
+    let mut links = extract_links(body, page_path);
+    links.extend(extract_relation_links(frontmatter));
+    links
+}
+
+/// Upper bound (bytes) on an untrusted frontmatter value echoed into a
+/// log line. Frontmatter is agent/operator-authored and, on a shared
+/// server, one caller's page is parsed and logged by a process others
+/// read the logs of; a relation key or target is meant to be a short
+/// identifier, so bounding the logged form keeps a crafted or oversized
+/// value from bloating or polluting the log without losing diagnostic
+/// value. Mirrors the bounding every other untrusted-content sink uses.
+const RELATION_LOG_FIELD_MAX_BYTES: usize = 200;
+
+/// Bound an untrusted frontmatter value for safe logging.
+fn log_bounded(value: &str) -> String {
+    ai_memory_core::truncate_utf8_bytes(value, RELATION_LOG_FIELD_MAX_BYTES)
+}
+
+/// Extract typed relation edges from a page's `relations:` frontmatter
+/// (2.0 item 3):
+///
+/// ```yaml
+/// relations:
+///   fixes: ["gotchas/build.md"]
+///   contradicts: ["decisions/0007.md", "other-project:notes/x.md"]
+/// ```
+///
+/// Values use the same target grammar as wikilinks (`path`,
+/// `project:path`, `workspace/project:path`). Keys outside the closed
+/// [`Relation`] vocabulary are skipped (a typo must not silently mint a
+/// new edge kind); malformed paths are skipped likewise.
+pub fn extract_relation_links(frontmatter: &serde_json::Value) -> Vec<LinkTarget> {
+    let Some(relations) = frontmatter.get("relations").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (key, targets) in relations {
+        let Some(relation) = ai_memory_core::Relation::parse(key) else {
+            tracing::warn!(key = %log_bounded(key), "unknown relation key in frontmatter; skipping");
+            continue;
+        };
+        let Some(list) = targets.as_array() else {
+            continue;
+        };
+        for target in list.iter().filter_map(|v| v.as_str()) {
+            let (workspace, project, raw_path) = match target.split_once(':') {
+                None => (None, None, target),
+                Some((scope, path)) => match scope.split_once('/') {
+                    None => (None, Some(scope.to_string()), path),
+                    Some((ws, proj)) => (Some(ws.to_string()), Some(proj.to_string()), path),
+                },
+            };
+            // Same terminal normalization as wikilinks: extension-less
+            // targets gain `.md`; anything with a non-md extension is
+            // not a page and is skipped.
+            let raw_path = raw_path.trim();
+            let last = raw_path.rsplit_once('/').map_or(raw_path, |(_, s)| s);
+            let normalized = if last.contains('.') {
+                if raw_path.ends_with(".md") {
+                    raw_path.to_string()
+                } else {
+                    tracing::warn!(target = %log_bounded(target), "relation target is not a page; skipping");
+                    continue;
+                }
+            } else {
+                format!("{raw_path}.md")
+            };
+            let Ok(path) = PagePath::new(normalized) else {
+                tracing::warn!(target = %log_bounded(target), "unparseable relation target; skipping");
+                continue;
+            };
+            out.push(LinkTarget {
+                workspace,
+                project,
+                path,
+                relation: Some(relation),
+            });
+        }
+    }
+    out
 }
 
 /// Split an optional `[workspace/]project:` scope qualifier off the front
@@ -308,6 +406,103 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_relation_values_are_bounded_before_logging() {
+        // A crafted, oversized relation key/target must not reach the log
+        // unbounded (security-audit: untrusted frontmatter -> log sink).
+        let short = "fixes";
+        assert_eq!(log_bounded(short), short, "short values pass through");
+
+        let huge = "x".repeat(10_000);
+        let bounded = log_bounded(&huge);
+        assert!(
+            bounded.len() <= RELATION_LOG_FIELD_MAX_BYTES,
+            "logged value must be bounded: {} bytes",
+            bounded.len()
+        );
+
+        // Never split a UTF-8 code point mid-truncation.
+        let multibyte = "é".repeat(10_000);
+        let bounded = log_bounded(&multibyte);
+        assert!(bounded.len() <= RELATION_LOG_FIELD_MAX_BYTES);
+        assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+
+        // A malicious relation block still yields no edges and does not
+        // panic — the bound is applied on the skip path.
+        let fm = serde_json::json!({
+            "relations": { "x".repeat(5_000): ["ok.md"] }
+        });
+        assert!(extract_relation_links(&fm).is_empty());
+    }
+
+    #[test]
+    fn relations_frontmatter_becomes_typed_edges() {
+        let fm = serde_json::json!({
+            "relations": {
+                "fixes": ["gotchas/build.md", "concepts/writer"],
+                "contradicts": ["other-proj:decisions/0007.md"],
+                "causes": ["ws/proj:notes/x.md"],
+            }
+        });
+        let mut links = extract_relation_links(&fm);
+        links.sort();
+        assert_eq!(links.len(), 4);
+        let fixes: Vec<_> = links
+            .iter()
+            .filter(|l| l.relation == Some(ai_memory_core::Relation::Fixes))
+            .collect();
+        assert_eq!(fixes.len(), 2);
+        // extension-less target gains .md
+        assert!(
+            fixes
+                .iter()
+                .any(|l| l.path.as_str() == "concepts/writer.md")
+        );
+        let contra = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Contradicts))
+            .unwrap();
+        assert_eq!(contra.project.as_deref(), Some("other-proj"));
+        let causes = links
+            .iter()
+            .find(|l| l.relation == Some(ai_memory_core::Relation::Causes))
+            .unwrap();
+        assert_eq!(causes.workspace.as_deref(), Some("ws"));
+        assert_eq!(causes.project.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn unknown_relation_keys_and_bad_targets_are_skipped() {
+        let fm = serde_json::json!({
+            "relations": {
+                "blames": ["notes/a.md"],
+                "fixes": ["../escape.md", "notes/data.json", "notes/ok.md"],
+            }
+        });
+        let links = extract_relation_links(&fm);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].path.as_str(), "notes/ok.md");
+    }
+
+    #[test]
+    fn pages_without_relations_extract_nothing() {
+        assert!(extract_relation_links(&serde_json::json!({})).is_empty());
+        assert!(extract_relation_links(&serde_json::json!({"relations": "not a map"})).is_empty());
+    }
+
+    #[test]
+    fn extract_all_links_merges_body_and_frontmatter() {
+        let fm = serde_json::json!({"relations": {"fixes": ["gotchas/g.md"]}});
+        let links = extract_all_links(&fm, "see [[notes/n.md]]", &page());
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|l| l.relation.is_none()));
+        assert!(
+            links
+                .iter()
+                .any(|l| l.relation == Some(ai_memory_core::Relation::Fixes))
+        );
+    }
+
+    #[test]
     fn extract_links_bare_wikilink_is_local() {
         let links = extract_links("see [[decisions/0001.md]] and [[other]]", &page());
         assert!(links.iter().all(|l| !l.is_cross_project()));
@@ -360,6 +555,26 @@ mod tests {
         let md = parse(src).unwrap();
         assert_eq!(md.frontmatter["title"], "Hello");
         assert_eq!(md.body, "Body\n");
+    }
+
+    /// A page a Windows editor saved with a UTF-8 BOM and no frontmatter:
+    /// the mark belongs to the file, not to the first line. Left in `body`
+    /// it sits in front of the `#`, so the H1 stops being a heading and the
+    /// page is indexed under its filename instead of its title.
+    #[test]
+    fn parses_bom_prefixed_body_without_frontmatter() {
+        let src = "\u{FEFF}# Hand written\n\nBody.\n";
+        let md = parse(src).unwrap();
+        assert!(md.frontmatter.is_null());
+        assert_eq!(md.body, "# Hand written\n\nBody.\n");
+        assert_eq!(
+            derive_title(
+                &md.frontmatter,
+                &md.body,
+                &PagePath::new("notes/hand-written.md").unwrap(),
+            ),
+            "Hand written"
+        );
     }
 
     #[test]

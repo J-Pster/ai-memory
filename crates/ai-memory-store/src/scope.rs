@@ -9,13 +9,19 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use ai_memory_core::{ActiveProject, ActorKey, ProjectId, WorkspaceId};
+use ai_memory_core::{ActiveProject, ActiveProjectLookup, ActorKey, ProjectId, WorkspaceId};
 
 use crate::error::StoreError;
 use crate::{ReaderPool, WriterHandle};
 
 /// Canonical error for partial explicit scope arguments.
 pub const WORKSPACE_PROJECT_PAIR_REQUIRED: &str = "workspace and project must be provided together";
+
+/// Message for [`ScopeResolutionError::AmbiguousUnscopedWrite`]. Names both fixes,
+/// because the caller cannot tell from the failure alone which one applies to them.
+pub const AMBIGUOUS_UNSCOPED_WRITE: &str = "cannot resolve a target for this write: the active-project pointer does not match this \
+     caller. Pass an explicit workspace and project, or install the lifecycle hooks so the \
+     pointer is populated";
 
 /// Human-readable workspace/project pair supplied by an API caller.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,6 +94,9 @@ pub enum ScopeResolutionError {
         /// Project name supplied by the caller.
         project: String,
     },
+    /// An unscoped write from a caller whose active-project pointer did not
+    /// resolve. Writing it to the server default would silently misfile it.
+    AmbiguousUnscopedWrite,
     /// A write-create policy was requested without a writer handle.
     WriterRequired,
     /// Underlying store failure.
@@ -105,6 +114,7 @@ impl ScopeResolutionError {
                 | ScopeResolutionError::ScopeWorkspaceEmpty
                 | ScopeResolutionError::ScopeProjectEmpty
                 | ScopeResolutionError::TooManyScopes { .. }
+                | ScopeResolutionError::AmbiguousUnscopedWrite
         )
     }
 
@@ -130,6 +140,7 @@ impl fmt::Display for ScopeResolutionError {
                 f.write_str("scope workspace cannot be empty")
             }
             ScopeResolutionError::ScopeProjectEmpty => f.write_str("scope project cannot be empty"),
+            ScopeResolutionError::AmbiguousUnscopedWrite => f.write_str(AMBIGUOUS_UNSCOPED_WRITE),
             ScopeResolutionError::TooManyScopes { max, .. } => {
                 write!(f, "at most {max} scopes are allowed")
             }
@@ -183,12 +194,7 @@ pub async fn lookup_existing_scope(
     workspace: &str,
     project: &str,
 ) -> Result<ResolvedScope, ScopeResolutionError> {
-    let workspace_id = reader
-        .find_workspace(workspace.to_owned())
-        .await?
-        .ok_or_else(|| ScopeResolutionError::WorkspaceNotFound {
-            workspace: workspace.to_owned(),
-        })?;
+    let workspace_id = lookup_existing_workspace(reader, workspace).await?;
     let project_id = reader
         .find_project(workspace_id, project.to_owned())
         .await?
@@ -200,6 +206,22 @@ pub async fn lookup_existing_scope(
         workspace_id,
         project_id,
     })
+}
+
+/// Look up an explicit workspace by name without creating anything.
+///
+/// This is for admin/destructive surfaces that operate at workspace granularity
+/// and must fail closed on typos instead of auto-creating a scope.
+pub async fn lookup_existing_workspace(
+    reader: &ReaderPool,
+    workspace: &str,
+) -> Result<WorkspaceId, ScopeResolutionError> {
+    reader
+        .find_workspace(workspace.to_owned())
+        .await?
+        .ok_or_else(|| ScopeResolutionError::WorkspaceNotFound {
+            workspace: workspace.to_owned(),
+        })
 }
 
 /// Create or fetch an explicit workspace/project pair.
@@ -219,6 +241,54 @@ pub async fn create_explicit_scope(
         workspace_id,
         project_id,
     })
+}
+
+/// Look up the reserved global preferences scope
+/// ([`ai_memory_core::GLOBAL_SCOPE_PROJECT`] in the default workspace)
+/// without creating it. Returns `Ok(None)` when it doesn't exist yet — the
+/// scope participates in default reads by existence, so an absent scope
+/// means "nothing to union in", never an error (issue #154).
+///
+/// # Errors
+/// Propagates store failures only; a missing workspace or project is `None`.
+pub async fn lookup_global_scope(
+    reader: &ReaderPool,
+) -> Result<Option<ResolvedScope>, ScopeResolutionError> {
+    let Some(workspace_id) = reader
+        .find_workspace(ai_memory_core::DEFAULT_WORKSPACE_NAME.to_owned())
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(project_id) = reader
+        .find_project(
+            workspace_id,
+            ai_memory_core::GLOBAL_SCOPE_PROJECT.to_owned(),
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedScope {
+        workspace_id,
+        project_id,
+    }))
+}
+
+/// Create or fetch the reserved global preferences scope. Write-path only —
+/// the counterpart of [`lookup_global_scope`] for `scope: "global"` writes.
+///
+/// # Errors
+/// Propagates store failures.
+pub async fn create_global_scope(
+    writer: &WriterHandle,
+) -> Result<ResolvedScope, ScopeResolutionError> {
+    create_explicit_scope(
+        writer,
+        ai_memory_core::DEFAULT_WORKSPACE_NAME,
+        ai_memory_core::GLOBAL_SCOPE_PROJECT,
+    )
+    .await
 }
 
 /// Resolve and de-duplicate explicit multi-scope names without creating
@@ -318,7 +388,13 @@ impl<'a> ScopeResolver<'a> {
         explicit_project: Option<&str>,
         actor: &ActorKey,
     ) -> Result<ResolvedScope, ScopeResolutionError> {
-        let active = self.active_project.and_then(|a| a.get_for(actor));
+        // Read path, so `get_for_read`: it adds the startup seed for a caller
+        // the pointer knows nothing about, which is every caller in the window
+        // between a restart and the first hook event (#678). `resolve_write_args`
+        // below deliberately stays on `get_for` / `lookup_for` — a write must
+        // not be attributed to a project reconstructed from history the caller
+        // never named.
+        let active = self.active_project.and_then(|a| a.get_for_read(actor));
         if let Some(project) = trimmed_opt(explicit_project) {
             if let Some((active_ws, _)) = active
                 && let Some(project_id) = self
@@ -366,9 +442,23 @@ impl<'a> ScopeResolver<'a> {
             if trimmed_opt(explicit_workspace).is_some() {
                 return Err(ScopeResolutionError::WorkspaceProjectPairRequired);
             }
-            let active = self.active_project.and_then(|a| a.get_for(actor));
-            let (workspace_id, project_id) =
-                active.unwrap_or((self.default_workspace_id, self.default_project_id));
+            // #564: a caller carrying a coordinate that resolves to nothing is not
+            // asking for the server default — it is a mismatch, and the page it
+            // writes would be real, attributed, searchable, and in a project nobody
+            // looks in. Refuse and name the two fixes. Callers with no coordinate at
+            // all (anonymous/legacy) keep resolving through the default as before.
+            let (workspace_id, project_id) = match self.active_project.map(|a| a.lookup_for(actor))
+            {
+                Some(ActiveProjectLookup::Resolved(workspace_id, project_id)) => {
+                    (workspace_id, project_id)
+                }
+                Some(ActiveProjectLookup::Mismatch) => {
+                    return Err(ScopeResolutionError::AmbiguousUnscopedWrite);
+                }
+                Some(ActiveProjectLookup::Unset) | None => {
+                    (self.default_workspace_id, self.default_project_id)
+                }
+            };
             return Ok(ResolvedScope {
                 workspace_id,
                 project_id,
@@ -391,19 +481,6 @@ impl<'a> ScopeResolver<'a> {
             workspace_id,
             project_id,
         })
-    }
-
-    /// Create or fetch an explicit workspace/project pair. Admin write-style
-    /// operations use this when there is no current-project fallback involved.
-    pub async fn create_explicit(
-        &self,
-        workspace: &str,
-        project: &str,
-    ) -> Result<ResolvedScope, ScopeResolutionError> {
-        let Some(writer) = self.writer else {
-            return Err(ScopeResolutionError::WriterRequired);
-        };
-        create_explicit_scope(writer, workspace, project).await
     }
 
     /// Resolve and de-duplicate an explicit multi-scope list.
@@ -473,7 +550,7 @@ mod tests {
             user: Some("alice".into()),
             session_id: Some("s1".into()),
         };
-        active_project.set_for(&actor, active_ws, active_scratch);
+        active_project.set_for(&actor, active_ws, active_scratch, false);
 
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch)
             .with_active_project(&active_project);
@@ -520,7 +597,7 @@ mod tests {
             user: None,
             session_id: Some("s1".into()),
         };
-        active_project.set_for(&actor, active_ws, active_project_id);
+        active_project.set_for(&actor, active_ws, active_project_id, false);
         let resolver = ScopeResolver::new(&store.reader, default_ws, default_project)
             .with_writer(&store.writer)
             .with_active_project(&active_project);
@@ -597,5 +674,537 @@ mod tests {
             err,
             ScopeResolutionError::TooManyScopes { max: 1, actual: 2 }
         );
+    }
+
+    #[tokio::test]
+    async fn global_scope_lookup_is_none_until_created_then_stable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        // Reads never materialise the reserved scope.
+        assert_eq!(lookup_global_scope(&store.reader).await.unwrap(), None);
+        assert_eq!(
+            lookup_global_scope(&store.reader).await.unwrap(),
+            None,
+            "lookup must stay a pure read"
+        );
+
+        // The write path creates it once; lookup then resolves the same ids.
+        let created = create_global_scope(&store.writer).await.unwrap();
+        let looked_up = lookup_global_scope(&store.reader).await.unwrap();
+        assert_eq!(looked_up, Some(created));
+
+        // Idempotent create.
+        let again = create_global_scope(&store.writer).await.unwrap();
+        assert_eq!(again, created);
+    }
+
+    /// Expected outcome for one table-driven read-resolution row.
+    #[derive(Debug)]
+    enum Expected {
+        Resolved(WorkspaceId, ProjectId),
+        Failed(ScopeResolutionError),
+    }
+
+    struct ReadCase {
+        name: &'static str,
+        workspace: Option<&'static str>,
+        project: Option<&'static str>,
+        active: Option<(WorkspaceId, ProjectId)>,
+        expected: Expected,
+    }
+
+    /// AGENTS.md mandates a table-driven suite over the scope-resolution
+    /// policies: partial scope, missing explicit scope, active-project
+    /// precedence, and cross-workspace isolation. One fixture with two
+    /// workspaces carrying a same-named project feeds every row.
+    #[tokio::test]
+    async fn read_resolution_table_driven() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let default_scratch = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        let alpha_ws = store.writer.get_or_create_workspace("alpha").await.unwrap();
+        let alpha_app = store
+            .writer
+            .get_or_create_project(alpha_ws, "app", None)
+            .await
+            .unwrap();
+        let alpha_shared = store
+            .writer
+            .get_or_create_project(alpha_ws, "shared", None)
+            .await
+            .unwrap();
+        let beta_ws = store.writer.get_or_create_workspace("beta").await.unwrap();
+        let beta_shared = store
+            .writer
+            .get_or_create_project(beta_ws, "shared", None)
+            .await
+            .unwrap();
+        let beta_other = store
+            .writer
+            .get_or_create_project(beta_ws, "other", None)
+            .await
+            .unwrap();
+        assert_ne!(
+            alpha_shared, beta_shared,
+            "same-named projects must get distinct ids per workspace"
+        );
+
+        let cases = vec![
+            // --- Partial scope fails closed ---
+            ReadCase {
+                name: "workspace without project is rejected",
+                workspace: Some("alpha"),
+                project: None,
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Failed(ScopeResolutionError::WorkspaceProjectPairRequired),
+            },
+            ReadCase {
+                name: "project-only read does not scan every workspace",
+                workspace: None,
+                project: Some("app"), // exists only in alpha; no active pointer
+                active: None,
+                expected: Expected::Failed(
+                    ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
+                        project: "app".into(),
+                    },
+                ),
+            },
+            ReadCase {
+                name: "project-only read of a missing project fails closed",
+                workspace: None,
+                project: Some("ghost"),
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Failed(
+                    ScopeResolutionError::ProjectNotFoundInActiveOrDefault {
+                        project: "ghost".into(),
+                    },
+                ),
+            },
+            // --- Missing explicit scope errors without creating ---
+            ReadCase {
+                name: "missing workspace errors",
+                workspace: Some("ghost"),
+                project: Some("app"),
+                active: None,
+                expected: Expected::Failed(ScopeResolutionError::WorkspaceNotFound {
+                    workspace: "ghost".into(),
+                }),
+            },
+            ReadCase {
+                name: "missing project in existing workspace errors",
+                workspace: Some("alpha"),
+                project: Some("ghost"),
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Failed(ScopeResolutionError::ProjectNotFoundInWorkspace {
+                    workspace: "alpha".into(),
+                    project: "ghost".into(),
+                }),
+            },
+            // --- Active-project precedence ---
+            ReadCase {
+                name: "explicit pair beats active project",
+                workspace: Some("beta"),
+                project: Some("other"),
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Resolved(beta_ws, beta_other),
+            },
+            ReadCase {
+                name: "no args resolves the active project",
+                workspace: None,
+                project: None,
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Resolved(alpha_ws, alpha_app),
+            },
+            ReadCase {
+                name: "no args and no active resolves the default",
+                workspace: None,
+                project: None,
+                active: None,
+                expected: Expected::Resolved(default_ws, default_scratch),
+            },
+            ReadCase {
+                name: "whitespace-only args resolve the default",
+                workspace: Some("  "),
+                project: Some(" "),
+                active: None,
+                expected: Expected::Resolved(default_ws, default_scratch),
+            },
+            ReadCase {
+                name: "project-only prefers the active workspace",
+                workspace: None,
+                project: Some("shared"),
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Resolved(alpha_ws, alpha_shared),
+            },
+            ReadCase {
+                name: "project-only falls back to the default workspace",
+                workspace: None,
+                project: Some("scratch"), // exists only in default
+                active: Some((alpha_ws, alpha_app)),
+                expected: Expected::Resolved(default_ws, default_scratch),
+            },
+            // --- Cross-workspace isolation ---
+            ReadCase {
+                name: "shared resolves in alpha when alpha is named",
+                workspace: Some("alpha"),
+                project: Some("shared"),
+                active: None,
+                expected: Expected::Resolved(alpha_ws, alpha_shared),
+            },
+            ReadCase {
+                name: "shared resolves in beta when beta is named",
+                workspace: Some("beta"),
+                project: Some("shared"),
+                active: None,
+                expected: Expected::Resolved(beta_ws, beta_shared),
+            },
+            ReadCase {
+                name: "project-only with beta active stays in beta",
+                workspace: None,
+                project: Some("shared"),
+                active: Some((beta_ws, beta_other)),
+                expected: Expected::Resolved(beta_ws, beta_shared),
+            },
+        ];
+
+        let actor = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+        for case in &cases {
+            let active_project = ActiveProject::new();
+            if let Some((ws, proj)) = case.active {
+                active_project.set_for(&actor, ws, proj, false);
+            }
+            let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch)
+                .with_active_project(&active_project);
+            let result = resolver
+                .resolve_read_args(case.workspace, case.project, &actor)
+                .await;
+            match (&result, &case.expected) {
+                (Ok(scope), Expected::Resolved(ws, proj)) => {
+                    assert_eq!(
+                        scope.as_tuple(),
+                        (*ws, *proj),
+                        "case '{}' resolved the wrong scope",
+                        case.name
+                    );
+                }
+                (Err(err), Expected::Failed(expected)) => {
+                    assert_eq!(err, expected, "case '{}' failed the wrong way", case.name);
+                }
+                (result, expected) => panic!(
+                    "case '{}': expected {expected:?}, got {result:?}",
+                    case.name
+                ),
+            }
+        }
+
+        // The failing read rows must not have auto-created anything.
+        assert!(
+            store
+                .reader
+                .find_workspace("ghost".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "read resolution must never create workspaces"
+        );
+        assert!(
+            store
+                .reader
+                .find_project(alpha_ws, "ghost".into())
+                .await
+                .unwrap()
+                .is_none(),
+            "read resolution must never create projects"
+        );
+
+        // The write-style helper is the only path that may create, and once it
+        // does, the no-create lookup resolves the same ids.
+        let created = create_explicit_scope(&store.writer, "ghost", "app")
+            .await
+            .unwrap();
+        assert_eq!(
+            lookup_existing_scope(&store.reader, "ghost", "app")
+                .await
+                .unwrap(),
+            created
+        );
+
+        // Multi-scope resolution keeps same-named projects in their own
+        // workspaces and fails closed when one entry is missing.
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_scratch);
+        let both = resolver
+            .resolve_many_existing(
+                &[
+                    ScopeName::new("alpha", "shared"),
+                    ScopeName::new("beta", "shared"),
+                ],
+                25,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            both,
+            vec![
+                ResolvedScope {
+                    workspace_id: alpha_ws,
+                    project_id: alpha_shared
+                },
+                ResolvedScope {
+                    workspace_id: beta_ws,
+                    project_id: beta_shared
+                },
+            ]
+        );
+        let err = resolver
+            .resolve_many_existing(
+                &[
+                    ScopeName::new("alpha", "shared"),
+                    ScopeName::new("beta", "ghost"),
+                ],
+                25,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ScopeResolutionError::ProjectNotFoundInWorkspace {
+                workspace: "beta".into(),
+                project: "ghost".into()
+            }
+        );
+    }
+
+    /// Build a store with a `default/scratch` fallback plus an `ActiveProject`.
+    async fn scoped_fixture(
+        tmp: &tempfile::TempDir,
+    ) -> (Store, WorkspaceId, ProjectId, WorkspaceId, ProjectId) {
+        let store = Store::open(tmp.path()).unwrap();
+        let default_ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let default_proj = store
+            .writer
+            .get_or_create_project(default_ws, "scratch", None)
+            .await
+            .unwrap();
+        let team_ws = store.writer.get_or_create_workspace("team").await.unwrap();
+        let team_proj = store
+            .writer
+            .get_or_create_project(team_ws, "real-work", None)
+            .await
+            .unwrap();
+        (store, default_ws, default_proj, team_ws, team_proj)
+    }
+
+    #[tokio::test]
+    async fn unscoped_write_with_unresolvable_coordinate_errors() {
+        // #564: a caller that HAS a coordinate but whose pointer misses used to be
+        // written into the server default — a real, attributed, searchable page that
+        // nobody goes looking for. Refuse instead.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        let publisher = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+        active_project.set_for(&publisher, team_ws, team_proj, false);
+
+        // A different operator entirely: carries a coordinate, matches nothing.
+        let stranger = ActorKey {
+            user: Some("bob".into()),
+            session_id: Some("s9".into()),
+        };
+
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project);
+
+        let err = resolver
+            .resolve_write_args(None, None, &stranger)
+            .await
+            .unwrap_err();
+        assert_eq!(err, ScopeResolutionError::AmbiguousUnscopedWrite);
+        assert!(err.is_bad_request());
+    }
+
+    #[tokio::test]
+    async fn unscoped_write_without_any_coordinate_uses_the_shared_slot() {
+        // Anonymous/legacy callers resolve through the shared slot by design and must
+        // keep working — the error is only for a caller that HAS a coordinate. Note
+        // this resolves to the last published pointer, not the server default:
+        // `set_for` writes the shared slot alongside the per-actor entry.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        let publisher = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+        active_project.set_for(&publisher, team_ws, team_proj, false);
+
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project);
+
+        let scope = resolver
+            .resolve_write_args(None, None, &ActorKey::default())
+            .await
+            .unwrap();
+        assert_eq!(scope.as_tuple(), (team_ws, team_proj));
+    }
+
+    #[tokio::test]
+    async fn unscoped_write_on_an_install_with_no_pointer_uses_the_default() {
+        // An install with no lifecycle hooks feeding the pointer has never keyed
+        // anything and has an empty shared slot. There is no better information
+        // anywhere, so the configured default stays the answer — including for a
+        // caller that does carry a coordinate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, _team_ws, _team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        let actor = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project);
+
+        let scope = resolver
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(scope.as_tuple(), (default_ws, default_proj));
+    }
+
+    #[tokio::test]
+    async fn unscoped_write_with_resolving_pointer_uses_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        let actor = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+        active_project.set_for(&actor, team_ws, team_proj, false);
+
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_writer(&store.writer)
+            .with_active_project(&active_project);
+
+        let scope = resolver
+            .resolve_write_args(None, None, &actor)
+            .await
+            .unwrap();
+        assert_eq!(scope.as_tuple(), (team_ws, team_proj));
+    }
+
+    #[tokio::test]
+    async fn unscoped_read_with_unresolvable_coordinate_still_falls_back() {
+        // Reads keep the fallback: a read answering from the default project is a
+        // wrong answer the caller can see; a write is a misfile they cannot.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        let publisher = ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("s1".into()),
+        };
+        active_project.set_for(&publisher, team_ws, team_proj, false);
+        let stranger = ActorKey {
+            user: Some("bob".into()),
+            session_id: Some("s9".into()),
+        };
+
+        let resolver = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_active_project(&active_project);
+
+        let scope = resolver
+            .resolve_read_args(None, None, &stranger)
+            .await
+            .unwrap();
+        assert_eq!(scope.as_tuple(), (default_ws, default_proj));
+    }
+
+    #[tokio::test]
+    async fn the_startup_seed_answers_reads_and_never_retargets_a_write() {
+        // #678: after a restart the pointer is empty, so an unscoped read
+        // resolved through the baked default and reported an empty project.
+        // The seed fixes the read. It must not follow into the write path:
+        // `resolve_write_args` still resolves as if nothing were published, so
+        // no page is attributed to a project rebuilt from someone else's
+        // history.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (store, default_ws, default_proj, team_ws, team_proj) = scoped_fixture(&tmp).await;
+
+        let active_project = ActiveProject::new();
+        active_project.seed_read_fallback(team_ws, team_proj);
+
+        for actor in [
+            // The session that outlived the daemon: coordinate intact, keyed
+            // entry gone with the process.
+            ActorKey {
+                user: Some("alice".into()),
+                session_id: Some("s1".into()),
+            },
+            // And a caller with no coordinate at all.
+            ActorKey::default(),
+        ] {
+            let read = ScopeResolver::new(&store.reader, default_ws, default_proj)
+                .with_active_project(&active_project)
+                .resolve_read_args(None, None, &actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                read.as_tuple(),
+                (team_ws, team_proj),
+                "read must degrade to the seeded scope, not the empty default"
+            );
+
+            let write = ScopeResolver::new(&store.reader, default_ws, default_proj)
+                .with_writer(&store.writer)
+                .with_active_project(&active_project)
+                .resolve_write_args(None, None, &actor)
+                .await
+                .unwrap();
+            assert_eq!(
+                write.as_tuple(),
+                (default_ws, default_proj),
+                "write target must be exactly what it was before the seed existed"
+            );
+        }
+
+        // A named project still resolves inside the workspace the seed points
+        // at — that is a find-only read, and cross-workspace isolation holds:
+        // `real-work` exists only in `team`.
+        let named = ScopeResolver::new(&store.reader, default_ws, default_proj)
+            .with_active_project(&active_project)
+            .resolve_read_args(None, Some("real-work"), &ActorKey::default())
+            .await
+            .unwrap();
+        assert_eq!(named.as_tuple(), (team_ws, team_proj));
     }
 }

@@ -51,7 +51,7 @@ struct RehomeResponseBody {
 /// Bails when the project cannot be resolved or the server request fails.
 pub async fn run(config: &Config, args: RehomeArgs) -> Result<()> {
     let project = super::resolve_project_name(config, args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     run_rehome(&endpoint, &args.workspace, &project, args.dry_run).await
 }
 

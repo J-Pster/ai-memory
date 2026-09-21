@@ -1,26 +1,37 @@
 //! [`Wiki`] — the only correct write path for the markdown source-of-truth.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ai_memory_core::{
-    ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer, Tier,
-    UserId, WorkspaceId,
+    ActorContext, AutoImproveProposalId, NewPage, PageId, PagePath, ProjectId, Sanitizer,
+    SessionId, Tier, UserId, WorkspaceId,
 };
 use ai_memory_llm::Embedder;
 use ai_memory_store::{
     ApproveAutoImproveProposal, ApproveAutoImproveProposalResult, AutoImproveProposalDetail,
-    FailAutoImproveProposal, MoveSummary, ReaderPool, WriterHandle, artifact_path_for,
-    f32_vec_to_bytes,
+    FailAutoImproveProposal, MoveSessionSummary, MoveSummary, PagesMode, PurgeSessionSummary,
+    ReaderPool, WriterHandle, artifact_path_for, f32_vec_to_bytes,
 };
 use tokio::sync::RwLock;
 
 use crate::admission::{AdmissionChain, AdmissionContext, AdmissionOp};
-use crate::atomic;
 use crate::error::{WikiError, WikiResult};
 use crate::git::{Checkpoint, GitAdapter};
-use crate::markdown::{Markdown, derive_title, emit, extract_links, parse};
+use crate::markdown::{Markdown, derive_title, emit, parse};
 use crate::watcher::is_pending_path;
+
+/// Store deletion and best-effort file cleanup from [`Wiki::purge_session`].
+#[derive(Debug, Clone)]
+pub struct PurgeSessionOutcome {
+    /// Committed database deletion counts and paths.
+    pub summary: PurgeSessionSummary,
+    /// Paths successfully removed from disk.
+    pub files_deleted: Vec<PagePath>,
+    /// Paths whose file cleanup failed after the database committed.
+    pub files_failed: Vec<PagePath>,
+}
 
 /// Summary of a [`Wiki::reindex_all`] run.
 #[derive(Debug, Default, Clone)]
@@ -31,6 +42,80 @@ pub struct ReindexSummary {
     pub projects: usize,
     /// Pages reindexed from the wiki tree.
     pub pages: usize,
+    /// Project directories skipped because their scope was purged and
+    /// tombstoned (#607) — a purge whose on-disk removal did not complete.
+    /// Their pages are deliberately not resurrected.
+    pub skipped_purged: usize,
+    /// Session pages skipped because the session was purged and tombstoned
+    /// (#701) — the same case one level down, for a purge whose page-file
+    /// removal did not complete.
+    pub skipped_purged_sessions: usize,
+    /// Pages skipped because another page in the same scope differs from them
+    /// only by case or Unicode normalization. A wiki authored on a
+    /// case-sensitive filesystem can hold such a pair; indexing both is what
+    /// the write guard now refuses, and one bad pair must not fail the whole
+    /// rebuild.
+    pub skipped_collisions: usize,
+}
+
+/// The session a page belongs to, for paths that name one.
+///
+/// Pure path shape, no I/O: only `sessions/<id>.md` can be resurrected by a
+/// purge whose file cleanup failed, so this is what decides whether the
+/// tombstone set is worth consulting — or, on the single-event path, whether
+/// it is worth loading at all.
+pub(crate) fn session_id_for_page(path: &PagePath) -> Option<SessionId> {
+    path.as_str()
+        .strip_prefix("sessions/")
+        .and_then(|rest| rest.strip_suffix(".md"))
+        .and_then(|id| id.parse::<SessionId>().ok())
+}
+
+/// Whether `path` is the page of a session this scope has tombstoned.
+///
+/// For callers that already hold the scope's set. The empty-set and
+/// path-shape checks come first so a sweep over a project with no purges
+/// never parses an id.
+pub(crate) fn is_purged_session_page(path: &PagePath, purged: &HashSet<SessionId>) -> bool {
+    if purged.is_empty() {
+        return false;
+    }
+    session_id_for_page(path).is_some_and(|id| purged.contains(&id))
+}
+
+enum PageStoreRemoval {
+    Delete {
+        author_id: Option<UserId>,
+        expected_latest_id: Option<PageId>,
+    },
+    Decay {
+        expected_latest_id: PageId,
+    },
+}
+
+/// What [`Wiki::move_session_page`] did with the on-disk
+/// `sessions/<session_id>.md` file of the moved session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPageFile {
+    /// Renamed from the source project directory into the destination one
+    /// ([`PagesMode::Move`]).
+    Moved,
+    /// Removed from the source project directory ([`PagesMode::Regenerate`]),
+    /// so the watcher cannot re-index it as a live page after its rows were
+    /// retired; the next consolidation writes a fresh page in the destination.
+    Removed,
+    /// No file existed in the source project directory.
+    Absent,
+}
+
+/// Result of [`Wiki::move_session_page`]: the store summary plus what
+/// happened to the page file.
+#[derive(Debug, Clone)]
+pub struct MoveSessionOutcome {
+    /// Row counts and scopes as reported by the store re-stamp.
+    pub summary: MoveSessionSummary,
+    /// Disposition of the on-disk session page file.
+    pub file: SessionPageFile,
 }
 
 /// Wiki filesystem handle.
@@ -75,7 +160,24 @@ pub struct Wiki {
     /// the directory rename and SQLite re-stamp so stale writes cannot land
     /// files under the old workspace while the project is in flight.
     mutation_lock: Arc<RwLock<()>>,
+    /// Per-page write serialization (#607, item 3). Two concurrent writes to
+    /// the *same* `(ws, proj, path)` would otherwise interleave their
+    /// file-rename and DB-upsert under the shared `mutation_lock` read guard,
+    /// transiently leaving on-disk markdown disagreeing with the DB `latest`
+    /// row. Each path gets its own async mutex, so same-path writers serialize
+    /// while different paths still run concurrently. The map is GC'd
+    /// opportunistically — entries no writer currently holds are dropped on the
+    /// next acquisition — so it stays bounded to currently-contended paths.
+    page_locks: Arc<std::sync::Mutex<HashMap<PageKey, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Scopes this process has already materialized `_meta.md` manifests for.
+    /// Keeps [`Wiki::ensure_scope_manifests`] to one hash lookup per page
+    /// write after the scope's first — the store query and the two manifest
+    /// reads happen once per scope per process, never per page.
+    manifested_scopes: Arc<Mutex<HashSet<(WorkspaceId, ProjectId)>>>,
 }
+
+/// Key uniquely identifying a page for per-path write serialization.
+type PageKey = (WorkspaceId, ProjectId, PagePath);
 
 impl Wiki {
     /// Construct a wiki handle rooted at `<data_dir>/wiki/`. Creates the
@@ -97,6 +199,8 @@ impl Wiki {
             admission_chain: None,
             store_reader: None,
             mutation_lock: Arc::new(RwLock::new(())),
+            page_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            manifested_scopes: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -119,9 +223,12 @@ impl Wiki {
     /// external webhooks must fall back to header introspection or use
     /// `_unscoped` placeholders.
     ///
-    /// The reader is only invoked when the chain is configured AND would
-    /// actually fire; tests and CLI paths that don't wire a chain pay
-    /// nothing for setting (or omitting) this.
+    /// The reader is also what makes a scope self-describing: the names a
+    /// `_meta.md` manifest carries are resolved through it, so without one
+    /// neither [`Self::backfill_scope_manifests`] nor the manifest written
+    /// with a scope's first page can run, and both become no-ops. For the
+    /// admission chain specifically the reader is still only consulted when
+    /// a chain is configured and would actually fire.
     #[must_use]
     pub fn with_store_reader(mut self, reader: ReaderPool) -> Self {
         self.store_reader = Some(reader);
@@ -136,12 +243,21 @@ impl Wiki {
         self
     }
 
+    /// Borrow the configured sanitizer, so components holding a `Wiki`
+    /// (e.g. the consolidator scrubbing project-provided prompt
+    /// preferences) reuse the operator's patterns instead of
+    /// constructing a second, built-in-only instance.
+    #[must_use]
+    pub fn sanitizer(&self) -> &Sanitizer {
+        &self.sanitizer
+    }
+
     /// Attach an embedder. When set, `write_page` computes + stores an
     /// embedding for the new version synchronously. `apply_batch` keeps
     /// the SQL/file fan-out atomic and leaves vector completeness to
     /// admin or scheduled embedding backfill. Without an embedder,
     /// vector search is skipped and `ReaderPool::hybrid_search` uses
-    /// FTS5 + graph expansion.
+    /// FTS5 + entity + graph expansion.
     #[must_use]
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
@@ -181,6 +297,22 @@ impl Wiki {
         self.git.commit_all(message)
     }
 
+    /// Append `bytes` to `<project root>/<file_name>` (the hook ledger)
+    /// and report the write.
+    ///
+    /// # Errors
+    /// Propagates the filesystem error.
+    pub fn append_under_project(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<PathBuf> {
+        let path = self.project_root(workspace_id, project_id).join(file_name);
+        self.git.append(&path, bytes)?;
+        Ok(path)
+    }
     /// Return the most recent wiki git checkpoints, newest first.
     ///
     /// # Errors
@@ -210,6 +342,14 @@ impl Wiki {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The data directory this wiki lives under (`<data_dir>/wiki` is
+    /// the root, so this is its parent). Used by the web layer to read
+    /// the pre-migration backup receipt.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
     }
 
     /// Resolve the on-disk root for a project: `<wiki_root>/<ws>/<proj>`.
@@ -269,7 +409,7 @@ impl Wiki {
             if let Some(parent) = dst.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::rename(&src, &dst)?;
+            self.git.rename(&src, &dst)?;
             true
         } else {
             // Nothing on disk to move (a project with zero written pages).
@@ -292,7 +432,7 @@ impl Wiki {
                     if let Some(parent) = src.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    if let Err(rollback_err) = std::fs::rename(&dst, &src) {
+                    if let Err(rollback_err) = self.git.rename(&dst, &src) {
                         return Err(crate::WikiError::Io(std::io::Error::other(format!(
                             "INCONSISTENT STATE: files moved but DB re-stamp failed ({e}) and dir rename-back also failed ({rollback_err}); manually move {} -> {} or finish the re-stamp",
                             dst.display(),
@@ -305,7 +445,147 @@ impl Wiki {
         }
     }
 
-    async fn ensure_project_workspace(
+    /// Move one session to another project: relocate its `sessions/<id>.md`
+    /// file on disk and re-stamp its store rows in one transaction
+    /// ([`WriterHandle::move_session`]).
+    ///
+    /// Same critical section and ordering as [`Self::move_project_workspace`]:
+    /// the exclusive mutation guard is held across the admission chain, the
+    /// file step and the store step; disk goes first and SQL last, so the DB
+    /// is never ahead of disk. Under [`PagesMode::Move`] the file is renamed
+    /// into the destination project directory (refused when a file already
+    /// sits there). Under [`PagesMode::Regenerate`] the file is first parked
+    /// under the watcher-ignored `.ai-memory-tmp.` prefix and deleted once the
+    /// rows are retired: left in place, the next reconciliation pass would
+    /// re-index it as a fresh latest page in the source scope. A store failure
+    /// puts the file back where it was in both modes. When `from == to` (a
+    /// re-home of a session already rooted in the destination) there is no
+    /// file to relocate: the file step is skipped and only the store sweep
+    /// runs.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::DestinationPageExists`] when the destination
+    /// already holds a page file at that path, [`WikiError::Store`] for store
+    /// refusals (`NotFound`, `PagePathTaken`), or an I/O error when the file
+    /// step or its rollback fails.
+    pub async fn move_session_page(
+        &self,
+        session_id: SessionId,
+        from: (WorkspaceId, ProjectId),
+        to: (WorkspaceId, ProjectId),
+        pages: PagesMode,
+        author_id: Option<UserId>,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<MoveSessionOutcome> {
+        let _guard = self.mutation_lock.write().await;
+        let resolved_ctx = if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::MoveSession;
+            self.resolve_admission_names(from.0, from.1, &mut ctx).await;
+            chain.notify(None, &ctx).await?;
+            Some(ctx)
+        } else {
+            None
+        };
+
+        let file_name = format!("{session_id}.md");
+        let src = self
+            .project_root(from.0, from.1)
+            .join("sessions")
+            .join(&file_name);
+        let parked = if from != to && src.is_file() {
+            let target = match pages {
+                PagesMode::Move => {
+                    let dst = self
+                        .project_root(to.0, to.1)
+                        .join("sessions")
+                        .join(&file_name);
+                    if dst.exists() {
+                        return Err(WikiError::DestinationPageExists(dst.display().to_string()));
+                    }
+                    dst
+                }
+                // Same directory, watcher-ignored name: invisible to
+                // reindex/reconcile, trivially renamed back on failure.
+                PagesMode::Regenerate => {
+                    src.with_file_name(format!(".ai-memory-tmp.move-session.{file_name}"))
+                }
+            };
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            self.git.rename(&src, &target)?;
+            Some(target)
+        } else {
+            None
+        };
+
+        match self
+            .writer
+            .move_session(session_id, to.0, to.1, pages, author_id, true)
+            .await
+        {
+            Ok(summary) => {
+                let file = match (&parked, pages) {
+                    (None, _) => SessionPageFile::Absent,
+                    (Some(_), PagesMode::Move) => SessionPageFile::Moved,
+                    (Some(tmp), PagesMode::Regenerate) => {
+                        // The rows are retired; a leftover temp file is
+                        // ignored by the watcher, so this is best-effort.
+                        if let Err(e) = self.git.remove_file(tmp) {
+                            tracing::warn!(
+                                error = %e,
+                                path = %tmp.display(),
+                                "move-session: could not remove parked session page file"
+                            );
+                        }
+                        SessionPageFile::Removed
+                    }
+                };
+                if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
+                    chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
+                }
+                Ok(MoveSessionOutcome { summary, file })
+            }
+            Err(e) => {
+                if let Some(target) = parked
+                    && let Err(rollback_err) = self.git.rename(&target, &src)
+                {
+                    return Err(WikiError::Io(std::io::Error::other(format!(
+                        "INCONSISTENT STATE: session page file moved but DB re-stamp failed ({e}) and moving it back also failed ({rollback_err}); manually move {} -> {}",
+                        target.display(),
+                        src.display()
+                    ))));
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Ensure the store rows for a scope exist **and** that the scope is
+    /// self-describing on disk. Every wiki write path funnels through here,
+    /// which is what guarantees a project directory never outlives its
+    /// `_meta.md`: the directory comes into existence with the first page
+    /// written into it, and this runs first.
+    pub(crate) async fn ensure_project_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<()> {
+        self.ensure_project_scope_rows(workspace_id, project_id)
+            .await?;
+        self.ensure_scope_manifests(workspace_id, project_id).await;
+        Ok(())
+    }
+
+    /// Ensure the store rows for a scope exist, without touching the wiki
+    /// tree. The watcher's two orphan guards want this — the reconcile pass
+    /// and the directory-event path. Both run before `reindex_page` takes
+    /// the mutation guard, so creating a file there could drop a manifest
+    /// into a directory a concurrent project move is renaming away, and both
+    /// only ever see directories that already exist, whose manifests were
+    /// written with their first page or by the startup backfill.
+    pub(crate) async fn ensure_project_scope_rows(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
@@ -314,6 +594,64 @@ impl Wiki {
             .ensure_project_workspace(workspace_id, project_id)
             .await?;
         Ok(())
+    }
+
+    /// Write the workspace and project `_meta.md` manifests the first time
+    /// this process writes into a scope, so a project that first materializes
+    /// *while the server is up* is rebuildable immediately instead of only
+    /// after the next startup backfill (#643). In that window `reindex` could
+    /// not rebuild the scope at all: it walks the directories that exist on
+    /// disk, and the directory exists from the first page write onward.
+    ///
+    /// Best-effort on purpose. A manifest that cannot be written must not
+    /// fail the page write that triggered it — the page is the operator's
+    /// data, the manifest is derived, and
+    /// [`Self::backfill_scope_manifests`] rewrites it on the next start.
+    async fn ensure_scope_manifests(&self, workspace_id: WorkspaceId, project_id: ProjectId) {
+        let Some(reader) = &self.store_reader else {
+            return;
+        };
+        let key = (workspace_id, project_id);
+        if self
+            .manifested_scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key)
+        {
+            return;
+        }
+        let scope = match reader.scope_row_by_ids(workspace_id, project_id).await {
+            Ok(Some(scope)) => scope,
+            // No row to describe: the scope was purged or moved between the
+            // ensure above and this lookup. The next write re-checks.
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "scope-manifest lookup failed (non-fatal)");
+                return;
+            }
+        };
+        let ws_dir = self.root.join(workspace_id.to_string());
+        let mut project_fm = serde_json::json!({ "project": scope.project_name });
+        if let Some(repo_path) = scope.repo_path {
+            project_fm["repo_path"] = serde_json::Value::String(repo_path);
+        }
+        let written = self
+            .write_scope_manifest(
+                &ws_dir,
+                serde_json::json!({ "workspace": scope.workspace_name }),
+            )
+            .and_then(|_| {
+                self.write_scope_manifest(&ws_dir.join(project_id.to_string()), project_fm)
+            });
+        match written {
+            Ok(_) => {
+                self.manifested_scopes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key);
+            }
+            Err(e) => tracing::warn!(error = %e, "scope-manifest write failed (non-fatal)"),
+        }
     }
 
     /// Absolute on-disk path for a page within a specific project.
@@ -375,8 +713,8 @@ impl Wiki {
         })?;
         let md = parse(&raw)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
 
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
@@ -385,7 +723,7 @@ impl Wiki {
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        atomic::write_atomic(&abs, raw.as_bytes())?;
+        self.git.write_atomic(&abs, raw.as_bytes())?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -394,11 +732,14 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
                 author_id: None,
+                expires_at: meta.expires_at,
+                entities: meta.entities,
+                evidence: Vec::new(),
             })
             .await?;
         Ok(id)
@@ -436,6 +777,17 @@ impl Wiki {
         }
     }
 
+    /// Best-effort fill of `ctx.workspace` from a workspace id via the store
+    /// reader. Workspace-wide ops have no project id to resolve.
+    async fn resolve_workspace_name(&self, workspace_id: WorkspaceId, ctx: &mut AdmissionContext) {
+        if let Some(reader) = &self.store_reader
+            && ctx.workspace.is_empty()
+            && let Ok(Some(name)) = reader.workspace_name_by_id(workspace_id).await
+        {
+            ctx.workspace = name;
+        }
+    }
+
     /// Delete a single page file. When an admission chain is attached, it is
     /// notified (`op=delete`) BEFORE the file is removed, so a mirror can
     /// `git rm` the same path. A `Reject`-policy webhook aborts the delete.
@@ -448,11 +800,114 @@ impl Wiki {
         project_id: ProjectId,
         path: &PagePath,
         admission_ctx: Option<AdmissionContext>,
+        author_id: Option<ai_memory_core::UserId>,
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
+        self.remove_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            PageStoreRemoval::Delete {
+                author_id,
+                expected_latest_id: None,
+            },
+        )
+        .await
+        .map(|_| ())
+    }
 
+    /// Delete a page only when `expected_latest_id` is still its latest
+    /// indexed version. Used by retention so a stale expiry candidate cannot
+    /// delete a page that was refreshed after the sweep selected it.
+    ///
+    /// The exclusive mutation guard keeps normal wiki writes out between the
+    /// pre-admission comparison and file quarantine; the writer repeats the
+    /// comparison in the delete transaction as the final authority check.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn delete_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("conditional page delete requires a store reader")
+        })?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        self.remove_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            PageStoreRemoval::Delete {
+                author_id: None,
+                expected_latest_id: Some(expected_latest_id),
+            },
+        )
+        .await
+    }
+
+    /// Remove the authoritative file and tombstone the expected latest page.
+    /// A stale candidate leaves both disk and store
+    /// untouched.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn evict_page_if_latest(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        expected_latest_id: PageId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<bool> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self.store_reader.as_ref().ok_or_else(|| {
+            ai_memory_wiki_error("conditional page eviction requires a store reader")
+        })?;
+        let current = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        if current != Some(expected_latest_id) {
+            return Ok(false);
+        }
+        self.remove_page_locked(
+            workspace_id,
+            project_id,
+            path,
+            admission_ctx,
+            PageStoreRemoval::Decay { expected_latest_id },
+        )
+        .await
+    }
+
+    async fn remove_page_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        admission_ctx: Option<AdmissionContext>,
+        removal: PageStoreRemoval,
+    ) -> WikiResult<bool> {
         let mut resolved_ctx = None;
         if let Some(chain) = &self.admission_chain {
             let mut ctx = admission_ctx.unwrap_or_default();
@@ -463,38 +918,111 @@ impl Wiki {
             resolved_ctx = Some(ctx);
         }
         let abs = self.abs_path(workspace_id, project_id, path);
-        let quarantined = match quarantine_file(&abs) {
+        let quarantined = match quarantine_file(&self.git, &abs) {
             Ok(path) => path,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(crate::WikiError::Io(e)),
         };
 
-        let delete_result = self
-            .writer
-            .delete_page(workspace_id, project_id, path.clone())
-            .await;
-        if let Err(e) = delete_result {
-            if let Some(quarantine) = &quarantined
-                && let Err(restore_err) = std::fs::rename(quarantine, &abs)
-            {
-                tracing::error!(
-                    path = %path.as_str(),
-                    quarantine = %quarantine.display(),
-                    error = %restore_err,
-                    "delete_page: DB delete failed and restoring quarantined file also failed"
-                );
+        let delete_result = match removal {
+            PageStoreRemoval::Delete {
+                expected_latest_id: Some(expected),
+                ..
+            } => {
+                self.writer
+                    .delete_page_if_latest(workspace_id, project_id, path.clone(), expected)
+                    .await
             }
-            return Err(e.into());
+            PageStoreRemoval::Delete {
+                author_id,
+                expected_latest_id: None,
+            } => self
+                .writer
+                .delete_page(workspace_id, project_id, path.clone(), author_id)
+                .await
+                .map(|()| true),
+            PageStoreRemoval::Decay { expected_latest_id } => {
+                self.writer
+                    .soft_delete_for_decay_if_latest(
+                        workspace_id,
+                        project_id,
+                        path.clone(),
+                        expected_latest_id,
+                    )
+                    .await
+            }
+        };
+        let deleted = match delete_result {
+            Ok(deleted) => deleted,
+            Err(e) => {
+                restore_quarantined_file(&self.git, &quarantined, &abs, path);
+                return Err(e.into());
+            }
+        };
+        if !deleted {
+            restore_quarantined_file(&self.git, &quarantined, &abs, path);
+            return Ok(false);
         }
 
         if let Some(quarantine) = quarantined {
-            std::fs::remove_file(&quarantine)?;
+            self.git.remove_file(&quarantine)?;
         }
 
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, &resolved_ctx) {
             chain.dispatch_async(Some(path.as_str()), &serde_json::Value::Null, "", ctx);
         }
-        Ok(())
+        Ok(true)
+    }
+
+    /// Permanently delete one aged decay tombstone and its ancestry chain.
+    ///
+    /// An existing Markdown file is always preserved. If the watcher has not
+    /// indexed it yet (including a legacy pre-fix eviction or an external
+    /// recreation), this method reindexes it under the exclusive mutation
+    /// guard before deleting only the old chain rooted at `tombstone_id`.
+    /// The writer repeats the observed latest-id check so a concurrent store
+    /// mutation fails closed.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when the store reader is unavailable, or on a
+    /// filesystem, store, or rejecting-webhook error.
+    pub async fn hard_delete_decay_tombstone(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        tombstone_id: PageId,
+        cutoff_us: i64,
+    ) -> WikiResult<usize> {
+        let _guard = self.mutation_lock.write().await;
+        self.ensure_project_workspace(workspace_id, project_id)
+            .await?;
+        let reader = self
+            .store_reader
+            .as_ref()
+            .ok_or_else(|| ai_memory_wiki_error("decay cleanup requires a store reader"))?;
+        let mut current_latest = reader
+            .latest_page_id_by_ids(workspace_id, project_id, path.as_str().to_string())
+            .await?;
+        let abs = self.abs_path(workspace_id, project_id, path);
+        if current_latest.is_none() && abs.try_exists()? {
+            current_latest = Some(
+                self.reindex_page_locked(workspace_id, project_id, path.clone())
+                    .await?,
+            );
+        }
+
+        self.writer
+            .hard_delete_decayed_page_chain(
+                workspace_id,
+                project_id,
+                path.clone(),
+                tombstone_id,
+                current_latest,
+                cutoff_us,
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Purge a whole project's wiki directory. When an admission chain is
@@ -515,7 +1043,7 @@ impl Wiki {
             .admit_purge_project(workspace_id, project_id, admission_ctx)
             .await?;
         self.remove_project_dir(workspace_id, project_id).await?;
-        self.dispatch_purge_project(ctx.as_ref());
+        self.dispatch_purge(ctx.as_ref());
         Ok(())
     }
 
@@ -543,6 +1071,154 @@ impl Wiki {
         }
     }
 
+    /// Run the admission chain for a single-session purge, before any row is
+    /// deleted, so a scope-guard webhook can refuse it while the data is
+    /// still intact.
+    ///
+    /// # Errors
+    /// Propagates a webhook rejection as [`WikiError`].
+    pub async fn admit_purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeSession;
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(None, &ctx).await?;
+            Ok(Some(ctx))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Run the blocking admission notification for a workspace purge without
+    /// removing files. Admin callers use this before the DB purge so a
+    /// `failure_policy = reject` webhook can still abort all destructive work.
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook fails.
+    pub async fn admit_purge_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        admission_ctx: Option<AdmissionContext>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = admission_ctx.unwrap_or_default();
+            ctx.op = AdmissionOp::PurgeWorkspace;
+            self.resolve_workspace_name(workspace_id, &mut ctx).await;
+            ctx.project.clear();
+            chain.notify(None, &ctx).await?;
+            Ok(Some(ctx))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Ask the admission chain about an operation that has no page and no body
+    /// — a handoff lifecycle event.
+    ///
+    /// Handoffs live outside the wiki tree (they have their own table), so they
+    /// never passed through `write_page` and were invisible to admission
+    /// webhooks. That left the operations that move prompt-derived text between
+    /// operators unauthorizable: a webhook that decides who may touch which
+    /// scope could not see them at all.
+    ///
+    /// Only the webhooks that can refuse the operation are awaited — that is
+    /// what the caller has to know before doing destructive work, and a
+    /// `reject` policy is the operator asking to be waited for. The observers
+    /// are handed back with the resolved context: pass it to
+    /// [`Self::notify_operation_observers`] once the operation is durable, or
+    /// drop it if the operation was abandoned, so no webhook is told about work
+    /// that never happened. Every path that raises one of these ops owes its
+    /// webhooks the same three steps in the same order — decide, act, notify —
+    /// or the same event reaches a mirror from one caller and not from another.
+    ///
+    /// Returns `None` when no chain is attached (nothing left to notify).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses.
+    pub async fn authorize_operation(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> WikiResult<Option<AdmissionContext>> {
+        let Some(chain) = &self.admission_chain else {
+            return Ok(None);
+        };
+        let ctx = self
+            .operation_admission_ctx(workspace_id, project_id, op, actor, skip_webhooks)
+            .await;
+        chain.authorize(None, &ctx).await?;
+        Ok(Some(ctx))
+    }
+
+    /// Fire-and-forget the observer webhooks for an operation previously gated
+    /// by [`Self::authorize_operation`] and since committed.
+    pub fn notify_operation_observers(&self, ctx: &AdmissionContext) {
+        if let Some(chain) = &self.admission_chain {
+            chain.dispatch_notify_observers(None, ctx);
+        }
+    }
+
+    async fn operation_admission_ctx(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        op: AdmissionOp,
+        actor: ActorContext,
+        skip_webhooks: Vec<String>,
+    ) -> AdmissionContext {
+        let mut ctx = AdmissionContext {
+            op,
+            actor,
+            skip_webhooks,
+            ..Default::default()
+        };
+        self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+            .await;
+        ctx
+    }
+
+    /// Run just the blocking admission chain for a would-be write, without
+    /// touching the store, disk, or any upstream cost (e.g. an LLM call). A
+    /// `failure_policy = reject` webhook can still abort here, so callers use
+    /// this to fail fast on a scope/actor that admission would refuse anyway.
+    ///
+    /// The webhook receives an empty placeholder body: the blocking chain
+    /// decides on `ctx` (op / actor / workspace / project + path), not on
+    /// content, so no real body is needed and any mutation it returns is
+    /// discarded. Returns `Ok(())` when no chain is attached (nothing to gate).
+    ///
+    /// # Errors
+    /// Returns [`WikiError`] when a reject-policy webhook refuses the write.
+    pub async fn preflight_admission(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+        op: AdmissionOp,
+        actor: ActorContext,
+    ) -> WikiResult<()> {
+        if let Some(chain) = &self.admission_chain {
+            let mut ctx = AdmissionContext {
+                op,
+                actor,
+                ..Default::default()
+            };
+            self.resolve_admission_names(workspace_id, project_id, &mut ctx)
+                .await;
+            chain.notify(Some(path.as_str()), &ctx).await?;
+        }
+        Ok(())
+    }
+
     /// Remove the project's on-disk directory without running admission.
     ///
     /// # Errors
@@ -554,16 +1230,104 @@ impl Wiki {
     ) -> WikiResult<()> {
         let _guard = self.mutation_lock.write().await;
         let root = self.project_root(workspace_id, project_id);
-        match std::fs::remove_dir_all(&root) {
+        match self.git.remove_dir_all(&root) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(crate::WikiError::Io(e)),
         }
     }
 
+    /// Remove a workspace's on-disk directory (`<wiki_root>/<ws>`), including
+    /// every project under it, without running admission. Best-effort: a
+    /// missing dir is not an error.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Io`] on filesystem errors other than NotFound.
+    pub async fn remove_workspace_dir(&self, workspace_id: WorkspaceId) -> WikiResult<()> {
+        let _guard = self.mutation_lock.write().await;
+        let root = self.root.join(workspace_id.to_string());
+        match self.git.remove_dir_all(&root) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::WikiError::Io(e)),
+        }
+    }
+
+    /// Session ids this scope has tombstoned, as a set for the reindex gate.
+    ///
+    /// The session-level twin of [`WriterHandle::scope_is_purged`], and read
+    /// the same way: once per directory per reindex pass, by the callers that
+    /// walk a tree, rather than once per page (#701).
+    ///
+    /// # Errors
+    /// Propagates the store error.
+    pub async fn purged_sessions(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+    ) -> WikiResult<HashSet<SessionId>> {
+        Ok(self
+            .writer
+            .purged_session_ids(workspace_id, project_id)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    /// Purge a session and its page files under one exclusive mutation guard.
+    /// Admission must run before this call. File failures do not roll back the
+    /// committed database purge and are returned for partial-failure reporting.
+    /// Holding the guard before submitting SQL prevents a watcher reindex,
+    /// page write or project move from landing between SQL and file cleanup.
+    ///
+    /// # Errors
+    /// Returns [`WikiError::Store`] without removing files if the database
+    /// purge fails.
+    pub async fn purge_session(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        author_id: Option<UserId>,
+        compaction: ai_memory_store::Compaction,
+    ) -> WikiResult<PurgeSessionOutcome> {
+        let _guard = self.mutation_lock.write().await;
+        let summary = self
+            .writer
+            .purge_session(workspace_id, project_id, session_id, author_id, compaction)
+            .await?;
+        let mut files_deleted = Vec::with_capacity(summary.removed_paths.len());
+        let mut files_failed = Vec::new();
+        for path in &summary.removed_paths {
+            let abs = self.abs_path(workspace_id, project_id, path);
+            match self.git.remove_file(&abs) {
+                Ok(()) => {
+                    sync_parent_best_effort(&abs);
+                    files_deleted.push(path.clone());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        operation = "purge-session",
+                        path = path.as_str(),
+                        error = %error,
+                        "session purge failed to remove wiki page file",
+                    );
+                    files_failed.push(path.clone());
+                }
+            }
+        }
+        Ok(PurgeSessionOutcome {
+            summary,
+            files_deleted,
+            files_failed,
+        })
+    }
+
     /// Dispatch non-blocking purge webhooks after the caller's purge has
-    /// completed its durable DB/filesystem work.
-    pub fn dispatch_purge_project(&self, admission_ctx: Option<&AdmissionContext>) {
+    /// completed its durable DB/filesystem work. The purge kind (project,
+    /// session, workspace) travels in `ctx.op`, set by the matching `admit_*`.
+    pub fn dispatch_purge(&self, admission_ctx: Option<&AdmissionContext>) {
         if let (Some(chain), Some(ctx)) = (&self.admission_chain, admission_ctx) {
             chain.dispatch_async(None, &serde_json::Value::Null, "", ctx);
         }
@@ -610,7 +1374,7 @@ impl Wiki {
         let _guard = self.mutation_lock.read().await;
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
-        atomic::write_atomic(&path, content.as_bytes())?;
+        self.git.write_atomic(&path, content.as_bytes())?;
         Ok(path)
     }
 
@@ -636,6 +1400,7 @@ impl Wiki {
             .ok_or_else(|| ai_memory_wiki_error("auto-improve proposal not found in scope"))?;
 
         let path = detail.summary.target_path.clone();
+        path.ensure_portable()?;
         let mut frontmatter = serde_json::json!({
             "kind": detail.summary.kind,
             "title": detail.summary.title,
@@ -671,8 +1436,22 @@ impl Wiki {
         }
         markdown.body = self.sanitizer.scrub(&markdown.body);
         scrub_frontmatter_strings(&mut markdown.frontmatter, &self.sanitizer);
+        // Approved pages must land conformant like every other write —
+        // this emit skipped the disk conformance seam, leaving files
+        // without type/generated that blocked export-okf and, worse,
+        // phantom-superseded on the first reindex after a binary upgrade
+        // (the row was conformed with the approving binary's version, the
+        // file with the reindexing one's). Post-audit finding.
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut markdown,
+        );
         let title = self.sanitizer.scrub(&detail.summary.title);
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
         let emitted = emit(&markdown)?;
         let page = NewPage {
             workspace_id,
@@ -685,6 +1464,9 @@ impl Wiki {
             pinned: is_slot_path(&path),
             links,
             author_id,
+            expires_at,
+            entities,
+            evidence: Vec::new(),
         };
 
         let result = {
@@ -692,7 +1474,8 @@ impl Wiki {
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.abs_path(workspace_id, project_id, &path);
-            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
+            let installed =
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
             match self
                 .writer
                 .approve_auto_improve_proposal(ApproveAutoImproveProposal {
@@ -711,13 +1494,14 @@ impl Wiki {
                 }
                 Ok(ApproveAutoImproveProposalResult::Conflict) => {
                     rollback_or_inconsistent(
+                        &self.git,
                         std::slice::from_ref(&installed),
                         &"proposal conflict",
                     )?;
                     ApproveAutoImproveProposalResult::Conflict
                 }
                 Err(e) => {
-                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
                 }
             }
@@ -759,12 +1543,29 @@ impl Wiki {
         self.ensure_project_workspace(workspace_id, project_id)
             .await?;
 
+        self.reindex_page_locked(workspace_id, project_id, path)
+            .await
+    }
+
+    async fn reindex_page_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: PagePath,
+    ) -> WikiResult<PageId> {
+        let abs = self.abs_path(workspace_id, project_id, &path);
+        if std::fs::symlink_metadata(&abs)?.file_type().is_symlink() {
+            return Err(WikiError::Io(std::io::Error::other(format!(
+                "refusing to reindex symlinked page {}",
+                path.as_str()
+            ))));
+        }
         let md = self.read_page(workspace_id, project_id, &path)?;
         let title = derive_title(&md.frontmatter, &md.body, &path);
-        let links = extract_links(&md.body, &path);
+        let links = crate::markdown::extract_all_links(&md.frontmatter, &md.body, &path);
         // Markdown is the source of truth: preserve explicit tier/pinned
         // metadata on reindex instead of forcing every page back to semantic.
-        let (tier, pinned) = derive_index_metadata(&path, &md.frontmatter)?;
+        let meta = derive_index_metadata(&path, &md.frontmatter)?;
         let id = self
             .writer
             .upsert_page(NewPage {
@@ -773,12 +1574,14 @@ impl Wiki {
                 path,
                 title,
                 body: md.body,
-                tier,
+                tier: meta.tier,
                 frontmatter_json: md.frontmatter,
-                pinned,
+                pinned: meta.pinned,
                 links,
-
                 author_id: None,
+                expires_at: meta.expires_at,
+                entities: meta.entities,
+                evidence: Vec::new(),
             })
             .await?;
         Ok(id)
@@ -787,14 +1590,29 @@ impl Wiki {
     /// Read a `_meta.md` scope-manifest's frontmatter from `dir`.
     fn read_scope_meta(dir: &Path) -> WikiResult<serde_json::Value> {
         let path = dir.join("_meta.md");
-        let meta = std::fs::symlink_metadata(&path)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|error| {
+            let message = if error.kind() == std::io::ErrorKind::NotFound {
+                format!("scope manifest {} is missing", path.display())
+            } else {
+                format!(
+                    "could not inspect scope manifest {}: {error}",
+                    path.display()
+                )
+            };
+            WikiError::Io(std::io::Error::new(error.kind(), message))
+        })?;
         if meta.file_type().is_symlink() {
             return Err(WikiError::Io(std::io::Error::other(format!(
                 "refusing to read symlinked scope manifest {}",
                 path.display()
             ))));
         }
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(&path).map_err(|error| {
+            WikiError::Io(std::io::Error::new(
+                error.kind(),
+                format!("could not read scope manifest {}: {error}", path.display()),
+            ))
+        })?;
         Ok(parse(&raw)?.frontmatter)
     }
 
@@ -816,7 +1634,10 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for filesystem/parse/store errors, including a
     /// scope directory that lacks its `_meta.md` (the wiki is not
-    /// self-describing — newer engines write the manifest on scope creation).
+    /// self-describing). Scopes written by this engine always have one: it
+    /// is materialized with the scope's first page, and
+    /// [`Self::backfill_scope_manifests`] repairs trees written by older
+    /// ones on every start.
     pub async fn reindex_all(&self) -> WikiResult<ReindexSummary> {
         let root = self.root().to_path_buf();
         let project_dirs =
@@ -828,6 +1649,21 @@ impl Wiki {
         let mut seen_ws = std::collections::HashSet::new();
 
         for (ws, proj, proj_root) in project_dirs {
+            // A purged scope must not be resurrected from an on-disk directory
+            // its purge failed to remove (#607). The tombstone is terminal:
+            // skip the whole directory rather than recreating the scope row and
+            // reindexing its pages. The files stay inert (the watcher skips
+            // them too, #613) until a later purge or manual cleanup removes
+            // them; reindex stays non-destructive.
+            if self.writer.scope_is_purged(ws, proj).await? {
+                tracing::debug!(
+                    workspace = %ws,
+                    project = %proj,
+                    "skipping reindex of a purged (tombstoned) scope",
+                );
+                summary.skipped_purged += 1;
+                continue;
+            }
             if seen_ws.insert(ws) {
                 let ws_dir = proj_root
                     .parent()
@@ -870,9 +1706,32 @@ impl Wiki {
             let pages = tokio::task::spawn_blocking(move || crate::watcher::walk_markdown(&pr))
                 .await
                 .map_err(|e| WikiError::Io(std::io::Error::other(e.to_string())))??;
+            let purged = self.purged_sessions(ws, proj).await?;
             for path in pages {
-                self.reindex_page(ws, proj, path).await?;
-                summary.pages += 1;
+                if is_purged_session_page(&path, &purged) {
+                    tracing::debug!(
+                        path = %path,
+                        "skipping reindex of a purged (tombstoned) session page",
+                    );
+                    summary.skipped_purged_sessions += 1;
+                    continue;
+                }
+                match self.reindex_page(ws, proj, path).await {
+                    Ok(_) => summary.pages += 1,
+                    Err(WikiError::Store(ai_memory_store::StoreError::PagePathCollides {
+                        requested,
+                        existing,
+                    })) => {
+                        tracing::warn!(
+                            path = %requested,
+                            existing = %existing,
+                            "skipping page: it differs from an already-indexed page only by case \
+                             or Unicode normalization, so both cannot coexist on macOS/Windows",
+                        );
+                        summary.skipped_collisions += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(summary)
@@ -881,7 +1740,22 @@ impl Wiki {
     /// Write a `_meta.md` scope manifest under `dir` from `frontmatter`,
     /// idempotently — unchanged content is left untouched so a startup
     /// backfill never churns the wiki git history. Returns `true` if written.
-    fn write_scope_manifest(dir: &Path, frontmatter: serde_json::Value) -> WikiResult<bool> {
+    fn write_scope_manifest(
+        &self,
+        dir: &Path,
+        mut frontmatter: serde_json::Value,
+    ) -> WikiResult<bool> {
+        // OKF conformance at the manifest choke point: every non-reserved
+        // .md needs a `type`, and the startup backfill's byte-compare must
+        // agree with what the OKF migration writes — a typeless emit here
+        // silently reverted migrated manifests on the same boot
+        // (post-audit finding). `type` is appended last, matching the
+        // migration's entry-insertion order, so the two emitters converge
+        // on identical bytes.
+        if let Some(map) = frontmatter.as_object_mut() {
+            map.entry("type".to_string())
+                .or_insert(serde_json::Value::String("Scope Manifest".into()));
+        }
         let content = emit(&Markdown {
             frontmatter,
             body: String::new(),
@@ -902,7 +1776,7 @@ impl Wiki {
             Ok(_) | Err(_) => {}
         }
         std::fs::create_dir_all(dir)?;
-        crate::atomic::write_atomic(&path, content.as_bytes())?;
+        self.git.write_atomic(&path, content.as_bytes())?;
         Ok(true)
     }
 
@@ -924,7 +1798,7 @@ impl Wiki {
         let mut written = 0;
         for ws in workspaces {
             let ws_dir = self.root().join(ws.workspace_id.to_string());
-            if Self::write_scope_manifest(
+            if self.write_scope_manifest(
                 &ws_dir,
                 serde_json::json!({ "workspace": ws.workspace_name }),
             )? {
@@ -937,7 +1811,7 @@ impl Wiki {
             if let Some(rp) = s.repo_path {
                 fm["repo_path"] = serde_json::Value::String(rp);
             }
-            if Self::write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
+            if self.write_scope_manifest(&ws_dir.join(s.project_id.to_string()), fm)? {
                 written += 1;
             }
         }
@@ -956,6 +1830,11 @@ impl Wiki {
     pub async fn apply_batch(&self, requests: Vec<WritePageRequest>) -> WikiResult<Vec<PageId>> {
         if requests.is_empty() {
             return Ok(Vec::new());
+        }
+        // Reject any path that cannot be materialised and checkpointed on every
+        // supported platform, before anything is written.
+        for req in &requests {
+            req.path.ensure_portable()?;
         }
         // Pre-compute markdown for each request. Filesystem work happens only
         // after the mutation guard + project/workspace validation below.
@@ -1000,6 +1879,11 @@ impl Wiki {
                     .unwrap_or(false);
             markdown.frontmatter =
                 canonicalize_index_frontmatter(markdown.frontmatter, req.tier, req.pinned);
+            conform_frontmatter_for_disk(
+                &self.abs_path(req.workspace_id, req.project_id, &req.path),
+                req.path.as_str(),
+                &mut markdown,
+            );
 
             let title = req
                 .title
@@ -1018,6 +1902,14 @@ impl Wiki {
 
         let (ids, dispatches) = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize every path in this batch against concurrent single-page
+            // or batch writers to the same path (#607). Sorted acquisition
+            // keeps a batch deadlock-free against any other writer.
+            let batch_keys: Vec<PageKey> = staged
+                .iter()
+                .map(|(req, _, _, _)| (req.workspace_id, req.project_id, req.path.clone()))
+                .collect();
+            let _page_guards = self.lock_pages(&batch_keys).await;
             let mut staged_files: Vec<(
                 WritePageRequest,
                 tempfile::NamedTempFile,
@@ -1043,19 +1935,28 @@ impl Wiki {
             // Build NewPage batch with the precomputed titles.
             let pages: Vec<ai_memory_core::NewPage> = staged_files
                 .iter()
-                .map(|(req, _, _, _)| ai_memory_core::NewPage {
-                    workspace_id: req.workspace_id,
-                    project_id: req.project_id,
-                    path: req.path.clone(),
-                    title: req.title.clone().unwrap_or_default(),
-                    body: req.body.clone(),
-                    tier: req.tier,
-                    frontmatter_json: req.frontmatter.clone(),
-                    pinned: req.pinned,
-                    links: extract_links(&req.body, &req.path),
-                    author_id: req.author_id,
+                .map(|(req, _, _, _)| {
+                    Ok(ai_memory_core::NewPage {
+                        workspace_id: req.workspace_id,
+                        project_id: req.project_id,
+                        path: req.path.clone(),
+                        title: req.title.clone().unwrap_or_default(),
+                        body: req.body.clone(),
+                        tier: req.tier,
+                        frontmatter_json: req.frontmatter.clone(),
+                        pinned: req.pinned,
+                        links: crate::markdown::extract_all_links(
+                            &req.frontmatter,
+                            &req.body,
+                            &req.path,
+                        ),
+                        author_id: req.author_id,
+                        expires_at: parse_expires_at(&req.path, &req.frontmatter)?,
+                        entities: parse_entities(&req.path, &req.frontmatter)?,
+                        evidence: req.evidence.clone(),
+                    })
                 })
-                .collect();
+                .collect::<WikiResult<Vec<_>>>()?;
 
             // Install files first so the DB is never ahead of markdown. If the
             // SQL batch fails below, rollback restores the prior disk state;
@@ -1064,10 +1965,10 @@ impl Wiki {
             let mut installed = Vec::with_capacity(staged_files.len());
             let mut dispatches = Vec::with_capacity(staged_files.len());
             for (req, tmp, abs, ctx) in staged_files {
-                let install = match persist_tmp_with_rollback_snapshot(tmp, &abs) {
+                let install = match persist_tmp_with_rollback_snapshot(&self.git, tmp, &abs) {
                     Ok(install) => install,
                     Err(e) => {
-                        rollback_or_inconsistent(&installed, &e)?;
+                        rollback_or_inconsistent(&self.git, &installed, &e)?;
                         return Err(e);
                     }
                 };
@@ -1078,7 +1979,7 @@ impl Wiki {
             let ids = match self.writer.upsert_pages_batch(pages).await {
                 Ok(ids) => ids,
                 Err(e) => {
-                    rollback_or_inconsistent(&installed, &e)?;
+                    rollback_or_inconsistent(&self.git, &installed, &e)?;
                     return Err(e.into());
                 }
             };
@@ -1097,6 +1998,53 @@ impl Wiki {
         Ok(ids)
     }
 
+    /// Acquire the per-path write lock for one page, serializing concurrent
+    /// writers to the same `(ws, proj, path)` while different paths run
+    /// concurrently. See [`Wiki::page_locks`].
+    async fn lock_page(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        path: &PagePath,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut map = self.page_locks.lock().expect("page_locks mutex poisoned");
+            // Opportunistic GC under the same short critical section that hands
+            // out locks: an entry whose only remaining strong ref is the map's
+            // own (count == 1) has no live guard and no waiter, so drop it.
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+            Arc::clone(
+                map.entry((workspace_id, project_id, path.clone()))
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        lock.lock_owned().await
+    }
+
+    /// Acquire per-path write locks for a batch of pages in a deterministic
+    /// global order (sorted by id/path bytes, deduped) so a batch write and any
+    /// concurrent single-page or batch writer can never deadlock. See
+    /// [`Wiki::page_locks`].
+    async fn lock_pages(&self, keys: &[PageKey]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut ordered: Vec<PageKey> = keys.to_vec();
+        // The id newtypes are not `Ord`, so order by their byte / string
+        // representation — any total order works, it only has to be consistent
+        // across all acquirers.
+        ordered.sort_by(|a, b| {
+            (a.0.as_bytes(), a.1.as_bytes(), a.2.as_str()).cmp(&(
+                b.0.as_bytes(),
+                b.1.as_bytes(),
+                b.2.as_str(),
+            ))
+        });
+        ordered.dedup();
+        let mut guards = Vec::with_capacity(ordered.len());
+        for (ws, proj, path) in ordered {
+            guards.push(self.lock_page(ws, proj, &path).await);
+        }
+        guards
+    }
+
     /// Write `body` (with optional `frontmatter`) atomically to
     /// `<wiki_root>/<workspace_id>/<project_id>/<path>` and upsert the
     /// matching page row in the store.
@@ -1107,6 +2055,18 @@ impl Wiki {
     /// # Errors
     /// Returns [`WikiError`] for any filesystem, parsing, or store error.
     pub async fn write_page(&self, req: WritePageRequest) -> WikiResult<PageId> {
+        // Reject a path that cannot be materialised and checkpointed on every
+        // supported platform, before anything is written.
+        //
+        // This is the single funnel every page creation passes through, and
+        // it is the moment the two failing operations happen: the file hits
+        // the filesystem and libgit2 checkpoints it. Catching it earlier (in
+        // `PagePath::new`) would break reads of already-stored pages, and
+        // catching it later leaves the worst outcome observed in #462 — a
+        // page written successfully but uncheckpointable and undeletable
+        // through the normal API.
+        req.path.ensure_portable()?;
+
         let WritePageRequest {
             workspace_id,
             project_id,
@@ -1119,6 +2079,7 @@ impl Wiki {
             admission_ctx,
             author_id,
             actor,
+            evidence,
         } = req;
 
         // Defence-in-depth: scrub the body before we touch disk or the
@@ -1167,6 +2128,11 @@ impl Wiki {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
         markdown.frontmatter = canonicalize_index_frontmatter(markdown.frontmatter, tier, pinned);
+        conform_frontmatter_for_disk(
+            &self.abs_path(workspace_id, project_id, &path),
+            path.as_str(),
+            &mut markdown,
+        );
 
         // Re-derive title + links from the (possibly mutated) markdown.
         // We do this after the chain so explicit title overrides survive
@@ -1176,7 +2142,13 @@ impl Wiki {
             .clone()
             .map(|t| self.sanitizer.scrub(&t))
             .unwrap_or_else(|| derive_title(&markdown.frontmatter, &markdown.body, &path));
-        let links = extract_links(&markdown.body, &path);
+        let links =
+            crate::markdown::extract_all_links(&markdown.frontmatter, &markdown.body, &path);
+        let expires_at = parse_expires_at(&path, &markdown.frontmatter)?;
+        let entities = parse_entities(&path, &markdown.frontmatter)?;
+        // Read before the destructuring move below: the embed step needs the
+        // L0 `abstract:` line out of the final frontmatter.
+        let abstract_text = frontmatter_abstract(&markdown.frontmatter).map(str::to_owned);
 
         let Markdown {
             frontmatter: final_frontmatter,
@@ -1191,13 +2163,19 @@ impl Wiki {
 
         let page_id = {
             let _guard = self.mutation_lock.read().await;
+            // Serialize with any concurrent write to this same path, so the
+            // file-rename and DB-upsert below cannot interleave with another
+            // writer's and leave disk disagreeing with the DB `latest` row
+            // (#607). Different paths still proceed concurrently.
+            let _page_guard = self.lock_page(workspace_id, project_id, &path).await;
             self.ensure_project_workspace(workspace_id, project_id)
                 .await?;
             let abs = self.abs_path(workspace_id, project_id, &path);
             if let Some(parent) = abs.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let installed = replace_file_with_rollback_snapshot(&abs, emitted.as_bytes())?;
+            let installed =
+                replace_file_with_rollback_snapshot(&self.git, &abs, emitted.as_bytes())?;
 
             match self
                 .writer
@@ -1212,12 +2190,15 @@ impl Wiki {
                     pinned,
                     links,
                     author_id,
+                    expires_at,
+                    entities,
+                    evidence,
                 })
                 .await
             {
                 Ok(id) => id,
                 Err(e) => {
-                    rollback_or_inconsistent(std::slice::from_ref(&installed), &e)?;
+                    rollback_or_inconsistent(&self.git, std::slice::from_ref(&installed), &e)?;
                     return Err(e.into());
                 }
             }
@@ -1242,7 +2223,51 @@ impl Wiki {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %page_id, "embedding failed; page indexed without it");
+                    // The warning alone dies with the container. Record it so
+                    // the page is attributable later (#528); best-effort,
+                    // because failing to note a failure must not fail the
+                    // write that already succeeded.
+                    let _ = self
+                        .writer
+                        .record_embed_failure(
+                            page_id,
+                            ai_memory_store::EmbedOutcome::Failed,
+                            Some(e.to_string()),
+                        )
+                        .await;
                 }
+            }
+            // L0 abstract: the frontmatter `abstract:` line is embedded on
+            // its own so the opt-in abstract stream can rank on the sharp
+            // one-line summary. A page rewritten without the key has its
+            // stale abstract row removed, mirroring the body row's
+            // replace-on-write semantics.
+            match abstract_text.as_deref() {
+                Some(abstract_text) => match embedder.embed_document(abstract_text).await {
+                    Ok(vec) => {
+                        self.writer
+                            .store_abstract_embeddings(vec![ai_memory_store::EmbeddingWrite {
+                                page_id,
+                                vector_bytes: f32_vec_to_bytes(&vec),
+                                provider: embedder.provider().to_string(),
+                                model: embedder.model().to_string(),
+                                dim: embedder.dim(),
+                            }])
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %page_id, "abstract embedding failed; page indexed without it");
+                        let _ = self
+                            .writer
+                            .record_embed_failure(
+                                page_id,
+                                ai_memory_store::EmbedOutcome::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                    }
+                },
+                None => self.writer.delete_abstract_embedding(page_id).await?,
             }
         }
 
@@ -1302,6 +2327,12 @@ pub struct WritePageRequest {
     /// (consolidator, lint rewriters) that build `WritePageRequest`
     /// without an HTTP request layer.
     pub author_id: Option<ai_memory_core::UserId>,
+    /// Evidence sources backing this write (P2,
+    /// docs/design-hindsight-borrowings.md §3), forwarded verbatim to
+    /// [`ai_memory_core::NewPage::evidence`]. Populated by the
+    /// consolidator from the session(s) it drew on; empty for every
+    /// other caller (MCP tool, admin endpoints, lint rewriters).
+    pub evidence: Vec<ai_memory_core::PageEvidence>,
     /// Identity carried in the on-disk frontmatter's `last_modified_by`
     /// block AND the admission webhook payload's `ctx.actor`. The auth
     /// middleware fills this from the four-rung resolution (injected as
@@ -1318,7 +2349,7 @@ fn ai_memory_wiki_error(msg: &str) -> crate::WikiError {
 fn derive_index_metadata(
     path: &PagePath,
     frontmatter: &serde_json::Value,
-) -> WikiResult<(Tier, bool)> {
+) -> WikiResult<IndexMetadata> {
     let tier = match frontmatter.get("tier") {
         None => Tier::Semantic,
         Some(serde_json::Value::String(s)) => s.parse::<Tier>().map_err(|e| {
@@ -1339,7 +2370,143 @@ fn derive_index_metadata(
             .get("pinned")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-    Ok((tier, pinned))
+    let expires_at = parse_expires_at(path, frontmatter)?;
+    let entities = parse_entities(path, frontmatter)?;
+    Ok(IndexMetadata {
+        tier,
+        pinned,
+        expires_at,
+        entities,
+    })
+}
+
+/// Index-relevant metadata derived from a page's frontmatter. Markdown
+/// is the source of truth; every field here is rebuildable by a reindex.
+struct IndexMetadata {
+    tier: Tier,
+    pinned: bool,
+    expires_at: Option<jiff::Timestamp>,
+    entities: Vec<String>,
+}
+
+/// Derive a page's indexed entities — the salient nouns it is *about* —
+/// from its frontmatter, for the entity retrieval stream and the `as_of`
+/// entity-timeline queries (docs/temporal.md).
+///
+/// Two sources, merged and normalised:
+///
+/// 1. The explicit `entities:` list an LLM consolidator emits when it
+///    runs. Highest precision, but absent on the bulk of a real store —
+///    bootstrapped pages predate it and stable pages are never
+///    re-consolidated, so relying on it alone leaves the entity index
+///    (and therefore `as_of`) empty on any mature deployment.
+/// 2. The frontmatter `tags:` list, which nearly every page carries and
+///    which is, by construction, "what this page is about" — the same
+///    thing entities are meant to capture. Deriving from tags populates
+///    the index deterministically, with no LLM and no re-consolidation,
+///    for the whole corpus. Broad tags do not distort ranking: the
+///    entity stream weights each match by inverse page-frequency, so a
+///    tag shared by many pages contributes proportionally little.
+///
+/// Explicit entities come first so they win the per-page cap
+/// ([`normalize_entities`] dedupes and bounds the result). A non-array
+/// `entities` value is still a structural error; `tags` is treated
+/// leniently (a malformed or missing list simply contributes nothing),
+/// because a bad tag must never fail a page write.
+pub(crate) fn parse_entities(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Vec<String>> {
+    // Strict structural check on the write path only: a non-array
+    // `entities` value is a mistake worth surfacing. `tags` stays lenient
+    // (see below); the derivation itself is shared with the store's
+    // one-shot backfill so the two never drift.
+    match frontmatter.get("entities") {
+        None | Some(serde_json::Value::Null | serde_json::Value::Array(_)) => {}
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-array entities in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    }
+    Ok(ai_memory_core::frontmatter_entity_names(frontmatter))
+}
+
+/// Parse the optional frontmatter `expires_at:` key. Accepts RFC3339
+/// (`2026-09-01T12:00:00Z`) or a bare date (`2026-09-01` = end of that
+/// day, UTC). Anything else is rejected in the same style as an
+/// invalid `tier`, so a typo can't silently mean "never expires".
+pub(crate) fn parse_expires_at(
+    path: &PagePath,
+    frontmatter: &serde_json::Value,
+) -> WikiResult<Option<jiff::Timestamp>> {
+    let raw = match frontmatter.get("expires_at") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::String(s)) => s.trim(),
+        Some(_) => {
+            return Err(ai_memory_wiki_error(&format!(
+                "invalid non-string expires_at in frontmatter for {}",
+                path.as_str()
+            )));
+        }
+    };
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(Some(ts));
+    }
+    if let Ok(date) = raw.parse::<jiff::civil::Date>() {
+        let ts = date
+            .at(23, 59, 59, 999_999_000)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .map_err(|e| {
+                ai_memory_wiki_error(&format!(
+                    "invalid expires_at date in frontmatter for {}: {e}",
+                    path.as_str()
+                ))
+            })?
+            .timestamp();
+        return Ok(Some(ts));
+    }
+    Err(ai_memory_wiki_error(&format!(
+        "invalid expires_at in frontmatter for {} (want RFC3339 or YYYY-MM-DD): {raw}",
+        path.as_str()
+    )))
+}
+
+/// OKF conformance for the on-disk file (docs/okf.md): fill the
+/// deterministic keys, then stamp `generated.at` — inheriting the
+/// current file's value when nothing but the timestamp would change, so
+/// an idempotent rewrite emits byte-identical markdown (no git churn,
+/// and the store's modulo-`generated.at` comparison keeps the row).
+/// The frontmatter `abstract:` line, when it is a non-empty string.
+fn frontmatter_abstract(frontmatter: &serde_json::Value) -> Option<&str> {
+    frontmatter
+        .get("abstract")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn conform_frontmatter_for_disk(abs: &Path, page_path: &str, markdown: &mut Markdown) {
+    ai_memory_core::okf::conform_frontmatter(page_path, &mut markdown.frontmatter);
+    let inherited = std::fs::read_to_string(abs)
+        .ok()
+        .and_then(|s| crate::markdown::parse(&s).ok())
+        .filter(|cur| {
+            ai_memory_core::okf::strip_generated_at(&cur.frontmatter)
+                == ai_memory_core::okf::strip_generated_at(&markdown.frontmatter)
+                && cur.body == markdown.body
+        })
+        .and_then(|cur| ai_memory_core::okf::generated_at(&cur.frontmatter).map(str::to_string));
+    let at = inherited.unwrap_or_else(|| {
+        jiff::Timestamp::now()
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    });
+    ai_memory_core::okf::stamp_generated_at(&mut markdown.frontmatter, &at);
 }
 
 fn canonicalize_index_frontmatter(
@@ -1366,31 +2533,45 @@ fn canonicalize_index_frontmatter(
 
 fn render_auto_improve_sidecar(detail: &AutoImproveProposalDetail) -> WikiResult<String> {
     let evidence = serde_json::to_string_pretty(&detail.evidence_json)?;
+    let patch = detail
+        .patch_json
+        .as_ref()
+        .map(serde_json::to_string_pretty)
+        .transpose()?
+        .unwrap_or_else(|| "null".into());
+    let expected_base = detail
+        .expected_base_body_sha256
+        .map(|hash| hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+        .unwrap_or_else(|| "none".into());
     Ok(format!(
         "# Pending auto-improvement proposal\n\n\
          - proposal_id: `{}`\n\
          - run_id: `{}`\n\
-         - status: `{}`\n\
          - operation: `{}`\n\
          - target_path: `{}`\n\
          - kind: `{}`\n\
          - title: `{}`\n\
          - confidence: `{}`\n\
+         - edit_mode: `{}`\n\
+         - expected_base_body_sha256: `{}`\n\
          - staged_at: `{}`\n\n\
          ## Rationale\n\n{}\n\n\
          ## Evidence\n\n```json\n{}\n```\n\n\
+         ## Patch metadata\n\n```json\n{}\n```\n\n\
          ## Proposed body\n\n{}\n",
         detail.summary.id,
         detail.summary.run_id,
-        detail.summary.status.as_str(),
         detail.summary.operation.as_str(),
         detail.summary.target_path.as_str(),
         detail.summary.kind,
         detail.summary.title,
         detail.summary.confidence,
+        detail.edit_mode,
+        expected_base,
         detail.summary.staged_at,
         detail.rationale,
         evidence,
+        patch,
         detail.body_markdown,
     ))
 }
@@ -1418,11 +2599,12 @@ fn sync_parent_best_effort(path: &Path) {
 }
 
 fn persist_tmp_with_rollback_snapshot(
+    git: &GitAdapter,
     tmp: tempfile::NamedTempFile,
     path: &Path,
 ) -> WikiResult<InstalledFile> {
     let previous = snapshot_existing_file(path)?;
-    let persisted = tmp.persist(path)?;
+    let persisted = git.persist(tmp, path)?;
     persisted.sync_data()?;
     sync_parent_best_effort(path);
     Ok(InstalledFile {
@@ -1431,22 +2613,24 @@ fn persist_tmp_with_rollback_snapshot(
     })
 }
 
-fn replace_file_with_rollback_snapshot(path: &Path, bytes: &[u8]) -> WikiResult<InstalledFile> {
+fn replace_file_with_rollback_snapshot(
+    git: &GitAdapter,
+    path: &Path,
+    bytes: &[u8],
+) -> WikiResult<InstalledFile> {
     let previous = snapshot_existing_file(path)?;
-    atomic::write_atomic(path, bytes)?;
+    git.write_atomic(path, bytes)?;
     Ok(InstalledFile {
         path: path.to_path_buf(),
         previous,
     })
 }
 
-fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
+fn rollback_installed_files(git: &GitAdapter, installed: &[InstalledFile]) -> WikiResult<()> {
     for file in installed.iter().rev() {
         match &file.previous {
-            Some(bytes) => {
-                atomic::write_atomic(&file.path, bytes)?;
-            }
-            None => match std::fs::remove_file(&file.path) {
+            Some(bytes) => git.write_atomic(&file.path, bytes)?,
+            None => match git.remove_file(&file.path) {
                 Ok(()) => sync_parent_best_effort(&file.path),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(WikiError::Io(e)),
@@ -1457,10 +2641,11 @@ fn rollback_installed_files(installed: &[InstalledFile]) -> WikiResult<()> {
 }
 
 fn rollback_or_inconsistent<E: std::fmt::Display>(
+    git: &GitAdapter,
     installed: &[InstalledFile],
     cause: &E,
 ) -> WikiResult<()> {
-    if let Err(rollback_err) = rollback_installed_files(installed) {
+    if let Err(rollback_err) = rollback_installed_files(git, installed) {
         return Err(WikiError::Io(std::io::Error::other(format!(
             "INCONSISTENT STATE: wiki files changed but store write failed ({cause}) and rollback failed ({rollback_err})"
         ))));
@@ -1468,7 +2653,7 @@ fn rollback_or_inconsistent<E: std::fmt::Display>(
     Ok(())
 }
 
-fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
+fn quarantine_file(git: &GitAdapter, path: &Path) -> std::io::Result<Option<PathBuf>> {
     let Some(parent) = path.parent() else {
         return Err(std::io::Error::other(
             "page path has no parent (cannot quarantine delete)",
@@ -1478,13 +2663,31 @@ fn quarantine_file(path: &Path) -> std::io::Result<Option<PathBuf>> {
         .prefix(".ai-memory-delete.")
         .tempfile_in(parent)?;
     let (_file, quarantine) = tmp.keep().map_err(|e| e.error)?;
-    std::fs::remove_file(&quarantine)?;
-    match std::fs::rename(path, &quarantine) {
+    git.remove_file(&quarantine)?;
+    match git.rename(path, &quarantine) {
         Ok(()) => Ok(Some(quarantine)),
         Err(e) => {
-            let _ = std::fs::remove_file(&quarantine);
+            let _ = git.remove_file(&quarantine);
             Err(e)
         }
+    }
+}
+
+fn restore_quarantined_file(
+    git: &GitAdapter,
+    quarantined: &Option<PathBuf>,
+    path: &Path,
+    page_path: &PagePath,
+) {
+    if let Some(quarantine) = quarantined
+        && let Err(error) = git.rename(quarantine, path)
+    {
+        tracing::error!(
+            path = %page_path.as_str(),
+            quarantine = %quarantine.display(),
+            %error,
+            "page removal: conditional store mutation failed and restoring quarantined file also failed"
+        );
     }
 }
 
@@ -1558,6 +2761,7 @@ fn is_slot_path(path: &PagePath) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::admission::{FailurePolicy, WebhookConfig};
@@ -1566,6 +2770,59 @@ mod tests {
         StageAutoImproveRun, Store,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn expires_at_accepts_rfc3339_and_date_only_utc() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        let rfc3339 = serde_json::json!({"expires_at": "2026-08-01T12:00:00-03:00"});
+        assert_eq!(
+            parse_expires_at(&path, &rfc3339).unwrap().unwrap(),
+            "2026-08-01T15:00:00Z".parse::<jiff::Timestamp>().unwrap()
+        );
+
+        let date_only = serde_json::json!({"expires_at": "2026-08-01"});
+        assert_eq!(
+            parse_expires_at(&path, &date_only).unwrap().unwrap(),
+            "2026-08-01T23:59:59.999999Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expires_at_fails_closed_for_invalid_values() {
+        let path = PagePath::new("notes/ttl.md").unwrap();
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_expires_at(&path, &serde_json::json!({"expires_at": "  "}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": "soon"})).is_err());
+        assert!(parse_expires_at(&path, &serde_json::json!({"expires_at": 7})).is_err());
+    }
+
+    #[cfg(windows)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipping symlink assertion: Windows symlink privilege unavailable");
+                false
+            }
+            Err(e) => panic!("failed to create symlink {}: {e}", link.display()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_test_symlink_file(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
 
     #[tokio::test]
     async fn project_root_is_wiki_root_joined_with_ws_and_proj() {
@@ -1581,6 +2838,271 @@ mod tests {
                 .join(ws.to_string())
                 .join(proj.to_string()),
         );
+    }
+
+    /// The file a consumer reads off disk is the OKF concept file
+    /// (docs/okf.md): required `type`, a `generated {by, at}` stanza,
+    /// provenance — emitted by the wiki, not just stored in the index.
+    #[tokio::test]
+    async fn written_files_are_okf_conformant_on_disk() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "gotchas/linker.md",
+            "mind the linker",
+            serde_json::json!({"title": "Linker gotcha"}),
+        ))
+        .await
+        .unwrap();
+
+        let raw =
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("gotchas/linker.md")).unwrap();
+        let parsed = crate::markdown::parse(&raw).unwrap();
+        assert_eq!(parsed.frontmatter["type"], "Gotcha");
+        assert!(
+            parsed.frontmatter["generated"]["by"]
+                .as_str()
+                .unwrap()
+                .starts_with("process:ai-memory/")
+        );
+        assert!(
+            parsed.frontmatter["generated"]["at"]
+                .as_str()
+                .unwrap()
+                .ends_with('Z')
+        );
+        assert!(ai_memory_core::okf::is_conformant(&parsed.frontmatter));
+    }
+
+    /// Refused on every platform, not only the case-insensitive ones: the
+    /// wiki is synced between them, so what it accepts cannot depend on the
+    /// filesystem underneath.
+    #[tokio::test]
+    async fn a_case_only_path_variant_cannot_destroy_an_existing_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "concepts/alpha.md",
+            "the original alpha body",
+            serde_json::json!({"title": "Alpha"}),
+        ))
+        .await
+        .unwrap();
+
+        let collision = wiki
+            .write_page(req(
+                ws,
+                proj,
+                "concepts/Alpha.md",
+                "a different page entirely",
+                serde_json::json!({"title": "Alpha Upper"}),
+            ))
+            .await;
+
+        let err = collision.expect_err("case-only variant must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("concepts/alpha.md") && msg.contains("concepts/Alpha.md"),
+            "the error must name both pages so the caller can act on it: {msg}"
+        );
+        let raw =
+            std::fs::read_to_string(wiki.project_root(ws, proj).join("concepts/alpha.md")).unwrap();
+        assert!(
+            raw.contains("the original alpha body"),
+            "the existing page's file must survive the refused write: {raw}"
+        );
+    }
+
+    /// The same collision through Unicode normalization rather than case.
+    #[tokio::test]
+    async fn an_nfd_path_variant_cannot_destroy_its_nfc_page() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let nfc = "concepts/caf\u{00e9}.md";
+        let nfd = "concepts/cafe\u{0301}.md";
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            nfc,
+            "the composed page body",
+            serde_json::json!({"title": "Cafe NFC"}),
+        ))
+        .await
+        .unwrap();
+
+        let collision = wiki
+            .write_page(req(
+                ws,
+                proj,
+                nfd,
+                "a different page entirely",
+                serde_json::json!({"title": "Cafe NFD"}),
+            ))
+            .await;
+
+        assert!(
+            collision.is_err(),
+            "a decomposed variant of an existing composed path must be refused"
+        );
+        let raw = std::fs::read_to_string(wiki.project_root(ws, proj).join(nfc)).unwrap();
+        assert!(
+            raw.contains("the composed page body"),
+            "the existing page's file must survive the refused write: {raw}"
+        );
+    }
+
+    /// The guard must not turn page paths into case-insensitive keys.
+    #[tokio::test]
+    async fn distinct_paths_are_unaffected_by_the_collision_guard() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        for path in [
+            "concepts/alpha.md",
+            "concepts/alphabet.md",
+            "concepts/nested/alpha.md",
+            "decisions/alpha.md",
+        ] {
+            wiki.write_page(req(ws, proj, path, "body", serde_json::json!({})))
+                .await
+                .unwrap_or_else(|e| panic!("{path} must be accepted: {e}"));
+        }
+
+        // A rewrite is a supersede, not a collision.
+        wiki.write_page(req(
+            ws,
+            proj,
+            "concepts/alpha.md",
+            "revised body",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// An unchanged rewrite must emit byte-identical markdown: the
+    /// `generated.at` inheritance keeps the timestamp, so neither git
+    /// nor the store sees a phantom new version.
+    #[tokio::test]
+    async fn an_idempotent_rewrite_keeps_the_file_bytes_and_the_row() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        let request = || {
+            req(
+                ws,
+                proj,
+                "notes/idem.md",
+                "stable body",
+                serde_json::json!({"title": "Idem"}),
+            )
+        };
+        let id1 = wiki.write_page(request()).await.unwrap();
+        let abs = wiki.project_root(ws, proj).join("notes/idem.md");
+        let bytes1 = std::fs::read(&abs).unwrap();
+
+        // Far enough apart that a re-stamped `generated.at` would differ.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let id2 = wiki.write_page(request()).await.unwrap();
+        let bytes2 = std::fs::read(&abs).unwrap();
+
+        assert_eq!(id1, id2, "identical rewrite superseded the page");
+        assert_eq!(bytes1, bytes2, "identical rewrite changed the file bytes");
+    }
+
+    /// A real content change updates `generated.at` — inheritance only
+    /// covers the unchanged case.
+    #[tokio::test]
+    async fn a_content_change_updates_generated_at() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "p", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/evolving.md",
+            "v1",
+            serde_json::json!({"title": "Evolving"}),
+        ))
+        .await
+        .unwrap();
+        let abs = wiki.project_root(ws, proj).join("notes/evolving.md");
+        let at1 = ai_memory_core::okf::generated_at(
+            &crate::markdown::parse(&std::fs::read_to_string(&abs).unwrap())
+                .unwrap()
+                .frontmatter,
+        )
+        .unwrap()
+        .to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        wiki.write_page(req(
+            ws,
+            proj,
+            "notes/evolving.md",
+            "v2 - changed",
+            serde_json::json!({"title": "Evolving"}),
+        ))
+        .await
+        .unwrap();
+        let at2 = ai_memory_core::okf::generated_at(
+            &crate::markdown::parse(&std::fs::read_to_string(&abs).unwrap())
+                .unwrap()
+                .frontmatter,
+        )
+        .unwrap()
+        .to_string();
+        assert_ne!(at1, at2, "content change kept the old generated.at");
     }
 
     #[tokio::test]
@@ -1645,6 +3167,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         }
     }
 
@@ -1663,6 +3186,9 @@ mod tests {
             evidence_json: serde_json::json!([{ "source": "test" }]),
             body_markdown: body.into(),
             artifact_sha256: None,
+            edit_mode: None,
+            patch_json: None,
+            expected_base_body_sha256: None,
         }
     }
 
@@ -1743,6 +3269,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_page_embeds_frontmatter_abstract_and_cleans_stale_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let embedder: Arc<dyn ai_memory_llm::Embedder> =
+            Arc::new(ai_memory_llm::SyntheticEmbedder::new(64));
+        let wiki = wiki.with_embedder(embedder);
+        let write_abs = |frontmatter: serde_json::Value| {
+            wiki.write_page(WritePageRequest {
+                workspace_id: ws,
+                project_id: proj,
+                path: PagePath::new("notes/abs.md").unwrap(),
+                frontmatter,
+                body: "alpha bravo".to_string(),
+                tier: Tier::Semantic,
+                pinned: false,
+                title: None,
+                admission_ctx: None,
+                author_id: None,
+                actor: ActorContext::anonymous(),
+                evidence: Vec::new(),
+            })
+        };
+
+        write_abs(serde_json::json!({"title": "abs", "abstract": "one-line summary"}))
+            .await
+            .unwrap();
+        let ids = store
+            .reader
+            .abstract_embedded_page_ids(
+                ws,
+                proj,
+                "synthetic".to_string(),
+                "bag-of-words-v1".to_string(),
+                64,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 1, "abstract embedded at write time");
+
+        // Rewriting without the key leaves the latest version without an
+        // abstract row; the superseded version's row stays behind, matching
+        // the body embedding's versioning semantics.
+        write_abs(serde_json::json!({"title": "abs"}))
+            .await
+            .unwrap();
+        let ids = store
+            .reader
+            .abstract_embedded_page_ids(
+                ws,
+                proj,
+                "synthetic".to_string(),
+                "bag-of-words-v1".to_string(),
+                64,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ids.is_empty(),
+            "latest version must not carry an abstract row"
+        );
+    }
+
+    #[tokio::test]
     async fn auto_improve_sidecar_writes_non_indexed_review_file() {
         let tmp = TempDir::new().unwrap();
         let (store, wiki, ws, proj) = scoped(&tmp).await;
@@ -1759,7 +3348,7 @@ mod tests {
         assert!(
             store
                 .reader
-                .search_pages_for_project(ws, proj, "proposed body".into(), 10)
+                .search_pages_for_project(ws, proj, "proposed body".into(), 10, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -1778,13 +3367,13 @@ mod tests {
                 "notes/leaky-proposal.md",
                 "body has ANTHROPIC_API_KEY=sk-ant-leak-1234567890abcdef",
                 "rationale has postgres://admin:hunter2@db.internal/prod",
-                serde_json::json!([{ "secret": "GH_TOKEN=ghp_1234567890abcdef1234567890abcdef1234" }]),
+                serde_json::json!([{ "secret": "GH_TOKEN=ghp_FAKEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }]),
             ),
         )
         .await;
         let sidecar = wiki.write_auto_improve_sidecar(ws, proj, id).await.unwrap();
         let content = std::fs::read_to_string(sidecar).unwrap();
-        assert!(content.contains("[REDACTED]"));
+        assert!(content.contains("[REDACTED:"));
         assert!(!content.contains("sk-ant-leak"));
         assert!(!content.contains("hunter2"));
         assert!(!content.contains("ghp_"));
@@ -2117,7 +3706,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(stored.body.contains("[REDACTED]"));
+        assert!(stored.body.contains("[REDACTED:"));
         assert!(!stored.body.contains("sk-ant-leak"));
         assert!(
             std::fs::read_to_string(wiki.abs_path(
@@ -2126,7 +3715,7 @@ mod tests {
                 &PagePath::new("notes/mutated.md").unwrap()
             ))
             .unwrap()
-            .contains("[REDACTED]")
+            .contains("[REDACTED:")
         );
     }
 
@@ -2257,6 +3846,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decay_eviction_refuses_a_stale_latest_id_without_touching_disk() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/stale-decay.md").unwrap();
+        let stale = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "old candidate",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+        let current = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "new current body",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            !wiki
+                .evict_page_if_latest(ws, proj, &path, stale, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            std::fs::read_to_string(wiki.abs_path(ws, proj, &path))
+                .unwrap()
+                .contains("new current body")
+        );
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(current),
+        );
+    }
+
+    #[tokio::test]
+    async fn rejecting_delete_admission_leaves_decay_candidate_live() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/reject",
+            post(|| async { (StatusCode::FORBIDDEN, "retention denied") }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/admission-decay.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "must remain live",
+                serde_json::json!({"tier": "episodic"}),
+            ))
+            .await
+            .unwrap();
+        let wiki = wiki.with_admission_chain(
+            AdmissionChain::new(vec![WebhookConfig {
+                name: "retention-guard".into(),
+                url: format!("http://{addr}/reject"),
+                timeout_ms: 1_000,
+                failure_policy: FailurePolicy::Reject,
+                events: vec![AdmissionOp::Delete],
+                blocking: true,
+            }])
+            .unwrap(),
+        );
+
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .is_err()
+        );
+        assert!(wiki.abs_path(ws, proj, &path).exists());
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            Some(page_id),
+        );
+    }
+
+    #[tokio::test]
+    async fn decay_cleanup_refuses_to_reindex_a_symlinked_recreation() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj) = scoped(&tmp).await;
+        let path = PagePath::new("sessions/symlink-decay.md").unwrap();
+        let page_id = wiki
+            .write_page(req(
+                ws,
+                proj,
+                path.as_str(),
+                "evicted body",
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            wiki.evict_page_if_latest(ws, proj, &path, page_id, None)
+                .await
+                .unwrap()
+        );
+
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "outside secret must not be indexed").unwrap();
+        let linked = wiki.abs_path(ws, proj, &path);
+        if !create_test_symlink_file(&outside, &linked) {
+            return;
+        }
+
+        let error = wiki
+            .hard_delete_decay_tombstone(ws, proj, &path, page_id, i64::MAX)
+            .await
+            .expect_err("symlinked recreation must fail closed");
+        assert!(error.to_string().contains("symlinked page"), "{error}");
+        assert_eq!(
+            store
+                .reader
+                .latest_page_id_by_ids(ws, proj, path.as_str().to_string())
+                .await
+                .unwrap(),
+            None,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "outside secret must not be indexed"
+        );
+        assert_eq!(
+            store
+                .reader
+                .decay_tombstones_before(ws, proj, i64::MAX)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "cleanup failure must leave the tombstone for a safe retry"
+        );
+    }
+
+    #[tokio::test]
     async fn write_page_rolls_back_file_when_store_upsert_fails() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -2353,7 +4102,7 @@ mod tests {
         // The on-disk page must not contain any of the planted
         // secrets; each should have been replaced with [REDACTED].
         assert!(
-            on_disk.contains("[REDACTED]"),
+            on_disk.contains("[REDACTED:"),
             "expected redaction in: {on_disk}"
         );
         assert!(
@@ -2440,6 +4189,7 @@ mod tests {
                 admission_ctx: None,
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             })
             .collect();
         let ids = wiki.apply_batch(batch).await.unwrap();
@@ -2606,6 +4356,7 @@ mod tests {
                 }),
                 author_id: None,
                 actor: ai_memory_core::ActorContext::anonymous(),
+                evidence: Vec::new(),
             }])
             .await
             .unwrap();
@@ -2617,7 +4368,7 @@ mod tests {
             &PagePath::new("batch/admitted.md").unwrap(),
         ))
         .unwrap();
-        assert!(on_disk.contains("[REDACTED]"), "{on_disk}");
+        assert!(on_disk.contains("[REDACTED:api_key]"), "{on_disk}");
         assert!(!on_disk.contains("sk-1234567890abcdef"), "{on_disk}");
 
         let hits = store
@@ -2626,6 +4377,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    /// The preflight runs the blocking chain with no body and rejects when a
+    /// `reject`-policy webhook refuses — so a caller can fail fast before
+    /// spending an LLM call — while writing nothing to disk.
+    #[tokio::test]
+    async fn preflight_admission_rejects_without_writing() {
+        use crate::admission::{AdmissionChain, AdmissionOp, FailurePolicy, WebhookConfig};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tokio::net::TcpListener;
+
+        // A scope-guard-style webhook that refuses the write outright.
+        let app = Router::new().route(
+            "/gate",
+            post(|Json(_payload): Json<serde_json::Value>| async move {
+                (StatusCode::FORBIDDEN, "denied for this scope")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let chain = AdmissionChain::new(vec![WebhookConfig {
+            name: "gate".into(),
+            url: format!("http://{addr}/gate"),
+            timeout_ms: 1_000,
+            failure_policy: FailurePolicy::Reject,
+            events: vec![AdmissionOp::Consolidate],
+            blocking: true,
+        }])
+        .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_admission_chain(chain)
+            .with_store_reader(store.reader.clone());
+
+        let path = PagePath::new("sessions/abc.md").unwrap();
+        let err = wiki
+            .preflight_admission(
+                ws,
+                proj,
+                &path,
+                AdmissionOp::Consolidate,
+                ai_memory_core::ActorContext::anonymous(),
+            )
+            .await
+            .expect_err("reject-policy webhook must fail the preflight");
+        assert!(
+            format!("{err}").contains("denied for this scope"),
+            "the webhook rejection reason should surface: {err}",
+        );
+        // The preflight never persists anything.
+        assert!(!wiki.abs_path(ws, proj, &path).exists());
+    }
+
+    /// With no admission chain attached there is nothing to gate, so the
+    /// preflight is a no-op that always succeeds.
+    #[tokio::test]
+    async fn preflight_admission_is_noop_without_chain() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        wiki.preflight_admission(
+            ws,
+            proj,
+            &PagePath::new("sessions/abc.md").unwrap(),
+            AdmissionOp::Consolidate,
+            ai_memory_core::ActorContext::anonymous(),
+        )
+        .await
+        .expect("no chain → preflight is a no-op");
     }
 
     /// Two projects writing the same relative path must produce two distinct
@@ -2663,6 +4511,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2679,6 +4528,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2802,6 +4652,7 @@ mod tests {
             }),
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2923,8 +4774,6 @@ mod tests {
             .unwrap();
 
         // Pre-load an actual users row so author_id can FK-resolve.
-        let pepper = ai_memory_store::TokenPepper::new("test-pepper-attribution");
-        let token_hash = ai_memory_store::hash_token("test-token", &pepper);
         let mut new_user = NewUser {
             username: "alice".into(),
             name: Some("Alice Smith".into()),
@@ -2933,7 +4782,7 @@ mod tests {
         new_user.validate().unwrap();
         let user_id: UserId = store
             .writer
-            .create_user(new_user, token_hash)
+            .create_human_user(new_user, ai_memory_core::UserRole::User, None, false)
             .await
             .unwrap();
 
@@ -2954,6 +4803,7 @@ mod tests {
                 email: Some("alice@example.com".into()),
                 ..ai_memory_core::ActorContext::default()
             },
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -2974,6 +4824,158 @@ mod tests {
             .unwrap()
             .expect("page exists");
         let _ = meta;
+    }
+
+    /// #607 item 2: a purge commits the DB deletion but removes on-disk files
+    /// only afterward (best-effort). If that removal is interrupted, the
+    /// markdown directory — `_meta.md` included — survives with no `projects`
+    /// row. `reindex_all` must NOT resurrect it: the tombstone written in the
+    /// purge transaction makes the deletion terminal.
+    #[tokio::test]
+    async fn reindex_does_not_resurrect_a_purged_scope_whose_files_survived() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/keep.md").unwrap();
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/keep.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Keep"}),
+            body: "survivor".into(),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+        // Manifests reindex reads to recreate scopes from disk.
+        wiki.backfill_scope_manifests().await.unwrap();
+
+        // Purge the DB only (store side); the on-disk files intentionally
+        // survive — exactly the crash-before-file-removal window.
+        store
+            .writer
+            .purge_project(
+                ws,
+                proj,
+                "default/scratch",
+                None,
+                false,
+                ai_memory_store::Compaction::Skip,
+            )
+            .await
+            .unwrap();
+        let meta_on_disk = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join(proj.to_string())
+            .join("_meta.md");
+        assert!(
+            meta_on_disk.exists(),
+            "the purge left the manifest on disk (the crash window this guards)"
+        );
+
+        let summary = wiki.reindex_all().await.unwrap();
+
+        assert_eq!(
+            summary.skipped_purged, 1,
+            "the purged scope must be skipped"
+        );
+        assert_eq!(
+            summary.projects, 0,
+            "the purged project must not be recreated"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "a purged page must not reappear in the index"
+        );
+    }
+
+    /// #607 item 3: two concurrent writes to the SAME page path must not
+    /// interleave their file-rename and DB-upsert. Per-path serialization
+    /// guarantees the winning writer's body lands in both the on-disk file and
+    /// the DB `is_latest` row — they never disagree about who won.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_path_writes_keep_file_and_db_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        let path = PagePath::new("notes/hot.md").unwrap();
+        let mk = |tag: char| WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("notes/hot.md").unwrap(),
+            frontmatter: serde_json::json!({"title": "Hot"}),
+            body: format!("body-{tag}"),
+            tier: Tier::Semantic,
+            pinned: false,
+            title: None,
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        };
+
+        // Many rounds so any interleave window is likely to be exercised.
+        for _ in 0..25 {
+            let (wa, wb) = (wiki.clone(), wiki.clone());
+            let (ra, rb) = (mk('a'), mk('b'));
+            let ha = tokio::spawn(async move { wa.write_page(ra).await });
+            let hb = tokio::spawn(async move { wb.write_page(rb).await });
+            ha.await.unwrap().unwrap();
+            hb.await.unwrap().unwrap();
+
+            let on_disk = wiki.read_page(ws, proj, &path).unwrap().body;
+            let in_db = store
+                .reader
+                .page_body_by_ids(ws, proj, path.as_str())
+                .await
+                .unwrap()
+                .expect("a latest row exists")
+                .body;
+            // Compare who won, not exact bytes (emit/parse normalizes newlines):
+            // the file and the DB latest row must reflect the same writer.
+            assert_eq!(
+                on_disk.contains("body-a"),
+                in_db.contains("body-a"),
+                "file ({on_disk:?}) and DB latest ({in_db:?}) disagree on the winning writer"
+            );
+        }
     }
 
     /// Backward-compat: anonymous writes do not add attribution frontmatter.
@@ -3005,6 +5007,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -3033,10 +5036,12 @@ mod tests {
     }
 
     /// End-to-end "DB is rebuildable from files": `backfill_scope_manifests`
-    /// makes the wiki self-describing, then `reindex_all` on a FRESH store
-    /// (no DB carried over) recreates the named scopes + all pages from the
-    /// wiki tree alone — including a page that lives at the reserved name
-    /// `log.md` (kept because it has frontmatter).
+    /// repairs a tree whose manifests are missing (one written by a release
+    /// before scopes described themselves from their first page), then
+    /// `reindex_all` on a FRESH store (no DB carried over) recreates the
+    /// named scopes + all pages from the wiki tree alone — including a page
+    /// that lives at the reserved name `log.md` (kept because it has
+    /// frontmatter).
     #[tokio::test]
     async fn backfill_then_reindex_rebuilds_from_wiki_alone() {
         // Source store: a named scope with two pages (one at `log.md`).
@@ -3057,7 +5062,7 @@ mod tests {
                 proj,
                 "notes/a.md",
                 "alpha uniquetoken",
-                serde_json::json!({}),
+                serde_json::json!({"entities": ["NATS JetStream"]}),
             ),
             req(
                 ws,
@@ -3070,10 +5075,17 @@ mod tests {
         .await
         .unwrap();
 
-        // Make the wiki self-describing.
+        // Simulate a tree written by an engine that had no manifests at all
+        // (pre-#643 releases), so the backfill is exercised as the repair
+        // path it now is — the writes above already made this scope
+        // self-describing on their own.
+        let ws_dir = src.path().join("wiki").join(ws.to_string());
+        std::fs::remove_file(ws_dir.join("_meta.md")).unwrap();
+        std::fs::remove_file(ws_dir.join(proj.to_string()).join("_meta.md")).unwrap();
+
+        // Make the wiki self-describing again.
         let written = w1.backfill_scope_manifests().await.unwrap();
         assert!(written >= 2, "ws + proj manifests written, got {written}");
-        let ws_dir = src.path().join("wiki").join(ws.to_string());
         assert!(ws_dir.join("_meta.md").is_file());
         assert!(ws_dir.join(proj.to_string()).join("_meta.md").is_file());
         drop(s1);
@@ -3102,6 +5114,27 @@ mod tests {
             1,
             "reindexed page is searchable in the fresh store"
         );
+        let entity_hits = s2
+            .reader
+            .hybrid_search(
+                ws,
+                proj,
+                "jetstream".into(),
+                None,
+                String::new(),
+                String::new(),
+                0,
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            entity_hits.len(),
+            1,
+            "reindex must rebuild the entity stream from canonical frontmatter"
+        );
+        assert_eq!(entity_hits[0].path.as_str(), "notes/a.md");
         drop(s2);
     }
 
@@ -3131,6 +5164,208 @@ mod tests {
         assert!(meta.contains("workspace: empty-ws"));
     }
 
+    /// #643: a scope that first materializes *while the server is up* is
+    /// self-describing from its first page, without waiting for the next
+    /// startup backfill. The manifests must be byte-identical to the ones
+    /// the backfill would have written, or every restart would rewrite them
+    /// and churn the wiki's git history.
+    #[tokio::test]
+    async fn first_write_into_a_new_scope_writes_its_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        // The scope appears after startup — no backfill has run for it.
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", Some("/repo/webapp".into()))
+            .await
+            .unwrap();
+        wiki.write_page(req(ws, proj, "notes/a.md", "alpha", serde_json::json!({})))
+            .await
+            .unwrap();
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let ws_meta = std::fs::read_to_string(ws_dir.join("_meta.md")).unwrap();
+        assert!(ws_meta.contains("workspace: acme"), "{ws_meta}");
+        let proj_meta =
+            std::fs::read_to_string(ws_dir.join(proj.to_string()).join("_meta.md")).unwrap();
+        assert!(proj_meta.contains("project: webapp"), "{proj_meta}");
+        assert!(
+            proj_meta.contains("repo_path: /repo/webapp"),
+            "repo_path is carried, as the backfill carries it: {proj_meta}"
+        );
+        assert!(proj_meta.contains("type: Scope Manifest"), "{proj_meta}");
+
+        assert_eq!(
+            wiki.backfill_scope_manifests().await.unwrap(),
+            0,
+            "a later backfill finds nothing to write; the two emitters agree byte for byte"
+        );
+    }
+
+    /// #643 end-to-end: stop the server inside the window the issue
+    /// describes — a project created after startup, so no backfill has ever
+    /// seen it — and `reindex` still rebuilds it from the wiki tree alone.
+    /// Before the manifest was written with the first page, this aborted with
+    /// a bare `No such file or directory (os error 2)`.
+    #[tokio::test]
+    async fn scope_created_after_startup_reindexes_without_a_restart() {
+        let src = TempDir::new().unwrap();
+        let s1 = Store::open(src.path()).unwrap();
+        let w1 = Wiki::new(src.path(), s1.writer.clone())
+            .unwrap()
+            .with_store_reader(s1.reader.clone());
+        // Startup backfill: the server has seen nothing yet, so it writes
+        // nothing. The scope below is created afterwards, mid-run.
+        assert_eq!(w1.backfill_scope_manifests().await.unwrap(), 0);
+
+        let ws = s1.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = s1
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+        w1.write_page(req(
+            ws,
+            proj,
+            "notes/a.md",
+            "alpha uniquetoken",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        drop(s1);
+
+        // Fresh store, wiki tree only — the recovery the operator runs.
+        let dst = TempDir::new().unwrap();
+        let s2 = Store::open(dst.path()).unwrap();
+        copy_tree(&src.path().join("wiki"), &dst.path().join("wiki"));
+        let w2 = Wiki::new(dst.path(), s2.writer.clone()).unwrap();
+        let summary = w2.reindex_all().await.unwrap();
+
+        assert_eq!(summary.projects, 1);
+        assert_eq!(summary.pages, 1);
+        assert_eq!(
+            s2.reader.workspace_name_by_id(ws).await.unwrap().as_deref(),
+            Some("acme"),
+            "workspace name recovered from the manifest written mid-run"
+        );
+        assert_eq!(
+            s2.reader
+                .project_name_by_id(ws, proj)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("webapp"),
+        );
+    }
+
+    /// The watcher's reconcile pre-check runs outside the mutation guard, so
+    /// it deliberately ensures store rows ONLY. Writing a manifest there
+    /// could drop a file into a directory a concurrent project move is
+    /// renaming away, and buys nothing: a directory it can see already got
+    /// its manifest with its first page, or from the backfill.
+    #[tokio::test]
+    async fn reconcile_scope_check_does_not_write_manifests() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store.writer.get_or_create_workspace("acme").await.unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "webapp", None)
+            .await
+            .unwrap();
+
+        wiki.ensure_project_scope_rows(ws, proj).await.unwrap();
+
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        assert!(!ws_dir.join("_meta.md").exists());
+        assert!(!ws_dir.join(proj.to_string()).join("_meta.md").exists());
+    }
+
+    /// Post-audit regression: manifests are OKF-typed at the writer
+    /// choke point, and a typeless manifest (the tug-of-war era, or a
+    /// hand edit) is HEALED by the next backfill instead of reverting
+    /// the migration's typing.
+    #[tokio::test]
+    async fn backfill_types_manifests_and_heals_typeless_ones() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let ws = store.writer.get_or_create_workspace("w").await.unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+
+        wiki.backfill_scope_manifests().await.unwrap();
+        let meta_path = tmp
+            .path()
+            .join("wiki")
+            .join(ws.to_string())
+            .join("_meta.md");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(meta.contains("type: Scope Manifest"), "{meta}");
+
+        // Second backfill: byte-stable, no churn.
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 0);
+
+        // A typeless manifest (pre-fix state) is healed, not preserved.
+        std::fs::write(&meta_path, "---\nworkspace: w\n---\n").unwrap();
+        assert_eq!(wiki.backfill_scope_manifests().await.unwrap(), 1);
+        let healed = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(healed.contains("type: Scope Manifest"), "{healed}");
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_workspace_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let missing = ws_dir.join("_meta.md");
+        std::fs::create_dir_all(ws_dir.join(proj.to_string())).unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_names_a_missing_project_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        let ws_dir = tmp.path().join("wiki").join(ws.to_string());
+        let proj_dir = ws_dir.join(proj.to_string());
+        let missing = proj_dir.join("_meta.md");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            ws_dir.join("_meta.md"),
+            "---\nworkspace: acme\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+
+        let err = wiki.reindex_all().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!("scope manifest {} is missing", missing.display())
+        );
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn reindex_rejects_symlinked_scope_manifest() {
@@ -3147,15 +5382,527 @@ mod tests {
         let outside = tmp.path().join("outside-meta.md");
         std::fs::write(&outside, "---\nproject: webapp\n---\n").unwrap();
         let link = proj_dir.join("_meta.md");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&outside, &link).unwrap();
+        if !create_test_symlink_file(&outside, &link) {
+            return;
+        }
 
         let err = wiki.reindex_all().await.unwrap_err();
         assert!(
             err.to_string().contains("symlinked scope manifest"),
             "reindex must reject symlinked manifests, got {err:#}"
         );
+    }
+
+    /// Frontmatter `entities:` round-trips through the write path and is
+    /// normalised on the way into the index. A non-array value is a
+    /// structural error; bad *items* are dropped, because entities are a
+    /// ranking signal and one long hand-typed entry must not cost the page.
+    #[test]
+    fn parse_entities_normalises_and_rejects_non_arrays() {
+        let path = PagePath::new("concepts/x.md").unwrap();
+
+        assert!(
+            parse_entities(&path, &serde_json::json!({}))
+                .unwrap()
+                .is_empty(),
+            "absent key means no entities",
+        );
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["SQLite", "  sqlite ", "Writer\nActor", 42]}),
+            )
+            .unwrap(),
+            vec!["sqlite".to_string(), "writer actor".to_string()],
+            "lowercased, whitespace-collapsed, de-duplicated, non-strings dropped",
+        );
+        assert!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["ok", "x".repeat(200)]}),
+            )
+            .unwrap()
+                == vec!["ok".to_string()],
+            "over-long items are dropped, not fatal",
+        );
+        let err = parse_entities(&path, &serde_json::json!({"entities": "sqlite"}))
+            .expect_err("a string instead of a list is a structural error");
+        assert!(err.to_string().contains("non-array entities"), "{err}");
+    }
+
+    /// Entities are derived from `tags` too, so the index (and `as_of`)
+    /// populate on real stores whose pages predate LLM entity extraction.
+    #[test]
+    fn parse_entities_derives_from_tags() {
+        let path = PagePath::new("concepts/x.md").unwrap();
+
+        // Tags alone populate entities — the common case on a mature store.
+        assert_eq!(
+            parse_entities(&path, &serde_json::json!({"tags": ["Storage", "SQLite"]})).unwrap(),
+            vec!["storage".to_string(), "sqlite".to_string()],
+            "tags become entities, normalised",
+        );
+
+        // Explicit entities come first (they win the cap), tags fill in,
+        // and a tag duplicating an entity is de-duplicated.
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["FTS5"], "tags": ["fts5", "search"]}),
+            )
+            .unwrap(),
+            vec!["fts5".to_string(), "search".to_string()],
+            "explicit first, tags merged, duplicates dropped",
+        );
+
+        // A malformed tags list is lenient — it must never fail a write —
+        // while a malformed entities list still errors.
+        assert_eq!(
+            parse_entities(
+                &path,
+                &serde_json::json!({"entities": ["ok"], "tags": "not-a-list"}),
+            )
+            .unwrap(),
+            vec!["ok".to_string()],
+            "non-array tags contribute nothing rather than erroring",
+        );
+    }
+
+    /// Two projects in one workspace, one ended session in the first with a
+    /// consolidated `sessions/<id>.md` page written through the wiki.
+    async fn session_with_page(
+        tmp: &TempDir,
+    ) -> (
+        Store,
+        Wiki,
+        WorkspaceId,
+        ProjectId,
+        ProjectId,
+        SessionId,
+        PagePath,
+    ) {
+        let (store, wiki, ws, src) = scoped(tmp).await;
+        let dst = store
+            .writer
+            .get_or_create_project(ws, "target", None)
+            .await
+            .unwrap();
+        let sid = SessionId::new();
+        store
+            .writer
+            .begin_session(ai_memory_core::NewSession {
+                id: sid,
+                workspace_id: ws,
+                project_id: src,
+                agent_kind: ai_memory_core::AgentKind::ClaudeCode,
+                cwd: Some("/repo/src".into()),
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store.writer.end_session(sid, None).await.unwrap();
+        let path = PagePath::new(format!("sessions/{sid}.md")).unwrap();
+        wiki.write_page(req(
+            ws,
+            src,
+            path.as_str(),
+            "consolidated session body",
+            serde_json::json!({ "title": "Session" }),
+        ))
+        .await
+        .unwrap();
+        (store, wiki, ws, src, dst, sid, path)
+    }
+
+    #[tokio::test]
+    async fn purge_session_waits_for_in_flight_reindex_before_deleting_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, _, sid, path) = session_with_page(&tmp).await;
+        let page_id = wiki.reindex_page(ws, proj, path.clone()).await.unwrap();
+        store.writer.end_session(sid, Some(page_id)).await.unwrap();
+
+        // Model a watcher that has acquired the shared guard but has not
+        // indexed its file yet. Poll the purge once, then fence the writer
+        // queue: any SQL it submitted must finish before this command replies.
+        let reader_guard = wiki.mutation_lock.read().await;
+        let purge = wiki.purge_session(ws, proj, sid, None, ai_memory_store::Compaction::Skip);
+        tokio::pin!(purge);
+        tokio::select! {
+            biased;
+            result = &mut purge => panic!("purge bypassed an active reader: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        store
+            .writer
+            .get_or_create_workspace("queue-fence")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some(),
+            "purge must wait for the wiki guard before deleting SQL rows"
+        );
+        // Finish the already-admitted reindex without recursively locking.
+        wiki.reindex_page_locked(ws, proj, path.clone())
+            .await
+            .unwrap();
+        drop(reader_guard);
+        let outcome = purge.await.unwrap();
+        assert_eq!(outcome.files_deleted, vec![path.clone()]);
+        assert!(outcome.files_failed.is_empty());
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!wiki.abs_path(ws, proj, &path).exists());
+        assert!(wiki.reindex_page(ws, proj, path).await.is_err());
+        assert!(
+            store
+                .reader
+                .search_pages("consolidated".into(), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The writer's half of the same claim. `purge_session` holds the
+    /// exclusive guard across SQL and cleanup — proved by
+    /// `purge_session_waits_for_in_flight_reindex_before_deleting_rows` — and
+    /// `write_page` takes the shared one, so a write cannot install its file
+    /// while a purge owns the guard and would otherwise delete it during
+    /// cleanup. Removing the shared guard from `write_page` makes this fail.
+    #[tokio::test]
+    async fn page_write_cannot_land_while_the_purge_guard_is_held() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, _, _sid, _path) = session_with_page(&tmp).await;
+        let target = PagePath::new("decisions/keep.md").unwrap();
+        let abs = wiki.abs_path(ws, proj, &target);
+
+        let purge_guard = wiki.mutation_lock.write().await;
+        let write = wiki.write_page(req(
+            ws,
+            proj,
+            target.as_str(),
+            "kept body",
+            serde_json::json!({ "title": "Keep" }),
+        ));
+        tokio::pin!(write);
+        // A single poll would only prove the write did not finish in one
+        // step, which is true even without the guard: `write_page` parks on
+        // the writer queue before it touches disk. Give it real time instead.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut write)
+                .await
+                .is_err(),
+            "the page write must not complete while a purge owns the guard"
+        );
+        assert!(
+            !abs.exists(),
+            "no page file may be installed while a purge owns the guard"
+        );
+
+        drop(purge_guard);
+        write.await.unwrap();
+        assert!(abs.exists(), "the write completes once the purge releases");
+        assert!(
+            !store
+                .reader
+                .search_pages("kept".into(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "disk and index agree after the guard is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_session_store_failure_preserves_page_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, proj, other, sid, path) = session_with_page(&tmp).await;
+        let abs = wiki.abs_path(ws, proj, &path);
+        let before = std::fs::read(&abs).unwrap();
+        let result = wiki
+            .purge_session(ws, other, sid, None, ai_memory_store::Compaction::Skip)
+            .await;
+        assert!(matches!(
+            result,
+            Err(WikiError::Store(ai_memory_store::StoreError::NotFound(_)))
+        ));
+        assert_eq!(std::fs::read(&abs).unwrap(), before);
+        assert!(
+            store
+                .reader
+                .find_session_scope(sid)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn leftover_tempfiles(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(".ai-memory-tmp."))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn move_session_page_moves_file_and_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Moved);
+        assert!(outcome.summary.session_moved);
+        assert_eq!(outcome.summary.page_versions_moved, 1);
+
+        assert!(
+            !wiki.abs_path(ws, src, &path).exists(),
+            "source file must be gone"
+        );
+        let moved = std::fs::read_to_string(wiki.abs_path(ws, dst, &path)).unwrap();
+        assert!(moved.contains("consolidated session body"));
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, dst, path.as_str())
+                .await
+                .unwrap()
+                .is_some(),
+            "latest page row must now sit in the destination"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, src, path.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // The moved file is byte-identical to what the store indexed, so the
+        // watcher's follow-up reindex in the destination is a no-op.
+        wiki.reindex_page(ws, dst, path.clone()).await.unwrap();
+        assert_eq!(
+            store
+                .reader
+                .page_body_by_ids(ws, dst, path.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "consolidated session body"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_regenerate_removes_source_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Regenerate, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Removed);
+        assert_eq!(outcome.summary.pages_regenerated, 1);
+
+        let src_abs = wiki.abs_path(ws, src, &path);
+        assert!(!src_abs.exists(), "retired page file must not linger");
+        assert!(!wiki.abs_path(ws, dst, &path).exists());
+        assert!(
+            leftover_tempfiles(src_abs.parent().unwrap()).is_empty(),
+            "parked copy must be deleted after the store commit"
+        );
+        assert!(
+            store
+                .reader
+                .page_body_by_ids(ws, src, path.as_str())
+                .await
+                .unwrap()
+                .is_none(),
+            "no latest version left in the source"
+        );
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_puts_file_back_when_store_refuses() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        // A latest page row at the same path in the destination, without a
+        // file, so the disk step succeeds and only the SQL step refuses.
+        store
+            .writer
+            .upsert_page(NewPage {
+                workspace_id: ws,
+                project_id: dst,
+                path: path.clone(),
+                title: "taken".into(),
+                body: "already here".into(),
+                tier: Tier::Semantic,
+                frontmatter_json: serde_json::json!({}),
+                pinned: false,
+                links: vec![],
+                author_id: None,
+                expires_at: None,
+                entities: vec![],
+                evidence: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let err = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WikiError::Store(ai_memory_store::StoreError::PagePathTaken { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            wiki.abs_path(ws, src, &path).exists(),
+            "source file must be back after the store refused"
+        );
+        assert!(!wiki.abs_path(ws, dst, &path).exists());
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, src))
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_refuses_existing_destination_file() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        wiki.write_page(req(
+            ws,
+            dst,
+            path.as_str(),
+            "destination already has this page",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+
+        let err = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WikiError::DestinationPageExists(_)),
+            "unexpected error: {err}"
+        );
+        assert!(wiki.abs_path(ws, src, &path).exists());
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, src)),
+            "nothing may move when the destination file exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_page_without_file_reports_absent() {
+        let tmp = TempDir::new().unwrap();
+        let (store, wiki, ws, src, dst, sid, path) = session_with_page(&tmp).await;
+        std::fs::remove_file(wiki.abs_path(ws, src, &path)).unwrap();
+
+        let outcome = wiki
+            .move_session_page(sid, (ws, src), (ws, dst), PagesMode::Move, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.file, SessionPageFile::Absent);
+        // The rows still move even though the file was already gone.
+        assert_eq!(outcome.summary.page_versions_moved, 1);
+        assert_eq!(
+            store.reader.session_project_ids(sid).await.unwrap(),
+            Some((ws, dst))
+        );
+    }
+
+    #[tokio::test]
+    async fn write_page_and_apply_batch_refuse_git_reserved_and_non_portable_paths() {
+        let tmp = TempDir::new().unwrap();
+        let (_store, wiki, ws, proj) = scoped(&tmp).await;
+
+        for bad in [
+            "CON.md",
+            "notes/aux.md",
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+        ] {
+            let bad_path = PagePath::new(bad).unwrap();
+            let write_err = wiki
+                .write_page(req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    write_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "write_page should refuse {bad:?}, got: {write_err}"
+            );
+
+            let batch_err = wiki
+                .apply_batch(vec![req(
+                    ws,
+                    proj,
+                    bad_path.as_str(),
+                    "content",
+                    serde_json::json!({}),
+                )])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    batch_err,
+                    WikiError::Memory(ai_memory_core::MemoryError::InvalidPagePath(_))
+                ),
+                "apply_batch should refuse {bad:?}, got: {batch_err}"
+            );
+
+            assert!(
+                !wiki.abs_path(ws, proj, &bad_path).exists(),
+                "file for {bad:?} must not be written to disk"
+            );
+        }
     }
 }

@@ -103,7 +103,7 @@ struct ImportNormalizeResponseBody {
 /// missing, when a source cannot be read, or when a page write fails.
 pub async fn run(config: &Config, args: ImportArgs) -> Result<()> {
     let project = super::resolve_project_name(config, args.project.as_deref())?;
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
 
     // The source determines both the deterministic importer AND the path
     // prefix the normalize pass scopes to (the importer's output root).

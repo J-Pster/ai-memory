@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "MCP server transport and tool router for ai-memory."
+# One integration-test binary instead of one per file. Each binary
+# statically links the whole dep graph and gets scanned by macOS on
+# first run.
 
 [dependencies]
 ai-memory-core.workspace = true
@@ -30,6 +33,12 @@ tracing.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
+http.workspace = true
+# HTTP auth middleware: constant-time Bearer compare. Basic is not a
+# credential; sessions live in human_auth.
+subtle.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 # Time gap calculation for `memory_explore` (parse stored ISO-8601
 # timestamps + delta against now). The rest of the crate doesn't
 # need a clock dep.
@@ -43,7 +52,9 @@ ai-memory-wiki.workspace = true
 async-trait.workspace = true
 flate2.workspace = true
 tar.workspace = true
+tempfile.workspace = true
 tower.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

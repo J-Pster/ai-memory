@@ -11,7 +11,11 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use reqwest::header::{HeaderName, HeaderValue};
+
+use crate::types::{
+    ChatRequest, ChatResponse, ExtraHeaders, LlmOperationId, ReasoningEffort, Usage,
+};
 
 /// Default OpenAI API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com";
@@ -89,6 +93,22 @@ pub struct OpenAiProvider {
     base_url: String,
     model: String,
     dialect: RequestDialect,
+    timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
+    /// Operator-configured headers from `AI_MEMORY_LLM_HEADERS`. Applied
+    /// last, so an explicit entry wins over any default below.
+    extra_headers: ExtraHeaders,
+    /// Caller-identifying defaults a provider opts into. Layered *under*
+    /// `extra_headers`.
+    client_headers: Option<ClientHeaders>,
+}
+
+/// Defaults for a provider whose gateway wants the caller identified: an
+/// agent string, and the header name to report the logical operation under.
+#[derive(Debug, Clone, Copy)]
+struct ClientHeaders {
+    user_agent: &'static str,
+    operation_id: &'static str,
 }
 
 impl OpenAiProvider {
@@ -99,19 +119,17 @@ impl OpenAiProvider {
     /// # Errors
     /// Returns a `reqwest::Error` if the HTTP client cannot be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        // 300s tolerates Ollama / llama-swap cold-loading a 30B+ model
-        // from disk on first request. Once OLLAMA_KEEP_ALIVE keeps it
-        // warm, subsequent requests return in seconds — but the first
-        // one after the model unloaded needs the headroom.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             api_key,
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
             dialect: RequestDialect::Official,
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
+            client_headers: None,
         })
     }
 
@@ -123,11 +141,68 @@ impl OpenAiProvider {
         self
     }
 
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]). Applied per request,
+    /// so the HTTP client itself stays connection-pool friendly.
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Currently configured per-request timeout. Test-visible so
+    /// wrapper tests (`OpenAiCompatProvider`, `OpenCodeProvider`)
+    /// can assert the delegation without exposing the field.
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// Switch request dialect. See [`RequestDialect`].
     #[must_use]
     pub fn with_dialect(mut self, dialect: RequestDialect) -> Self {
         self.dialect = dialect;
         self
+    }
+
+    /// Set reasoning effort. `None` omits the field so the model default
+    /// applies. Official Chat Completions send `reasoning_effort`; OpenRouter
+    /// and xAI hosts use their native shapes.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
+        self
+    }
+
+    /// Opt this provider into caller-identifying defaults: `user_agent` as
+    /// the agent string, and `operation_id` as the header *name* to report
+    /// each logical operation under. Both are defaults — an
+    /// `AI_MEMORY_LLM_HEADERS` entry for either name takes precedence.
+    pub(crate) fn with_client_headers(
+        mut self,
+        user_agent: &'static str,
+        operation_id: &'static str,
+    ) -> Self {
+        self.client_headers = Some(ClientHeaders {
+            user_agent,
+            operation_id,
+        });
+        self
+    }
+
+    /// Endpoint the client will call. Test-visible so wrappers that default
+    /// the base URL and let it be overridden can assert which one is set.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 }
 
@@ -141,15 +216,21 @@ struct OpenAiRequest<'a> {
     max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
-    /// GPT-5 reasoning budget. Set to `"low"` for gpt-5 models under the
-    /// `Official` dialect to cut the time the model spends on internal
-    /// reasoning (a large latency win for summarization-style calls like
-    /// normalize / consolidate / lint). Omitted for every other model and
-    /// for the `Compat` dialect, where local engines don't accept it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<OpenAiResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAiReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiReasoning {
+    effort: ReasoningEffort,
+    /// OpenRouter: keep thinking tokens out of `message.content` so
+    /// structured-output parse is not polluted.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    exclude: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,14 +287,47 @@ impl LlmProvider for OpenAiProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        let response = self.post(&self.build_request(&request, None)).await?;
+        self.complete_with_operation_id(request, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_with_operation_id(
+        &self,
+        request: ChatRequest,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<ChatResponse> {
+        let response = self
+            .post(&self.build_request(&request, None), operation_id)
+            .await?;
         Ok(self.to_chat_response(response))
     }
 
     async fn complete_structured_raw(
         &self,
         request: ChatRequest,
+        schema: serde_json::Value,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured_raw_with_operation_id(request, schema, LlmOperationId::new())
+            .await
+    }
+
+    async fn complete_structured_raw_with_operation_id(
+        &self,
+        request: ChatRequest,
+        schema: serde_json::Value,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<serde_json::Value> {
+        self.complete_structured(request, schema, operation_id)
+            .await
+    }
+}
+
+impl OpenAiProvider {
+    async fn complete_structured(
+        &self,
+        request: ChatRequest,
         mut schema: serde_json::Value,
+        operation_id: LlmOperationId,
     ) -> LlmResult<serde_json::Value> {
         // Strict-mode normalisation is an `Official` concern — compat
         // backends typically ignore `response_format` entirely and fall
@@ -229,7 +343,10 @@ impl LlmProvider for OpenAiProvider {
             },
         };
         let response = self
-            .post(&self.build_request(&request, Some(response_format)))
+            .post(
+                &self.build_request(&request, Some(response_format)),
+                operation_id,
+            )
             .await?;
         let text = response
             .choices
@@ -238,9 +355,7 @@ impl LlmProvider for OpenAiProvider {
             .unwrap_or("");
         serde_json::from_str::<serde_json::Value>(text).map_err(LlmError::from)
     }
-}
 
-impl OpenAiProvider {
     fn build_request<'a>(
         &'a self,
         request: &'a ChatRequest,
@@ -255,10 +370,7 @@ impl OpenAiProvider {
         }
         for m in &request.messages {
             messages.push(OpenAiMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
+                role: m.role.as_str(),
                 content: &m.content,
             });
         }
@@ -290,28 +402,29 @@ impl OpenAiProvider {
                 (mt, mct, temp)
             }
         };
-        // GPT-5 models accept `reasoning_effort` (minimal|low|medium|high);
-        // `"low"` cuts the internal-reasoning latency a lot for the
-        // summarization-style structured calls this provider serves
-        // (normalize / consolidate / lint). Only the `Official` dialect
-        // targets `api.openai.com`; `Compat` backends (Ollama / vLLM / …)
-        // don't implement the field, so leave it off there.
-        let reasoning_effort = if self.dialect == RequestDialect::Official
-            && model_supports_reasoning_effort(&self.model)
-        {
-            Some("low")
-        } else {
-            None
-        };
+        let (reasoning_effort, reasoning) = self.chat_reasoning_fields();
         OpenAiRequest {
             model: &self.model,
             messages,
             max_tokens,
             max_completion_tokens,
             temperature,
-            reasoning_effort,
             response_format,
+            reasoning_effort,
+            reasoning,
         }
+    }
+
+    /// Native reasoning payload for this host / dialect.
+    ///
+    /// Official OpenAI and generic openai-compat send top-level
+    /// `reasoning_effort`. OpenRouter's Chat Completions docs use
+    /// `reasoning: { effort, exclude }`. xAI Grok Chat Completions uses
+    /// `reasoning_effort` with a clamped value set (cannot disable).
+    fn chat_reasoning_fields(&self) -> (Option<ReasoningEffort>, Option<OpenAiReasoning>) {
+        self.reasoning_effort
+            .map(|effort| ReasoningHost::detect(self.dialect, &self.base_url).fields(effort))
+            .unwrap_or((None, None))
     }
 
     fn to_chat_response(&self, response: OpenAiResponse) -> ChatResponse {
@@ -331,17 +444,46 @@ impl OpenAiProvider {
         }
     }
 
-    async fn post<B: Serialize>(&self, body: &B) -> LlmResult<OpenAiResponse> {
+    async fn post<B: Serialize>(
+        &self,
+        body: &B,
+        operation_id: LlmOperationId,
+    ) -> LlmResult<OpenAiResponse> {
         let url = normalize_openai_base(&self.base_url, "chat/completions");
         debug!(url, "POST openai");
-        let resp = self
+        let builder = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .bearer_auth(self.api_key.expose_secret())
-            .header("content-type", "application/json")
-            .json(body)
-            .send()
-            .await?;
+            .header("content-type", "application/json");
+        // Both header layers go on in one `apply`, which replaces per name.
+        // Adding them separately with `RequestBuilder::header` would *append*
+        // — two `user-agent` values whenever the operator configures one, and
+        // a duplicate is worse than either value alone. `set_default` leaves
+        // an operator entry untouched, so the layering is explicit here
+        // rather than dependent on call order.
+        let request = match self.client_headers {
+            None => self.extra_headers.apply(builder),
+            Some(client) => {
+                let mut headers = self.extra_headers.clone();
+                headers.set_default(
+                    reqwest::header::USER_AGENT,
+                    HeaderValue::from_static(client.user_agent),
+                );
+                // Both are our own constants, so an invalid name is a bug to
+                // surface in the first test run, not a runtime branch.
+                let name = HeaderName::from_static(client.operation_id);
+                // A UUID is always a valid header value; on the impossible
+                // failure, omitting a correlation header beats failing the
+                // consolidation pass that carries it.
+                if let Ok(value) = HeaderValue::from_str(&operation_id.to_string()) {
+                    headers.set_default(name, value);
+                }
+                headers.apply(builder)
+            }
+        };
+        let resp = request.json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -442,17 +584,6 @@ fn model_requires_max_completion_tokens(model: &str) -> bool {
     m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
 
-/// Models that accept the `reasoning_effort` parameter.
-///
-/// Only the gpt-5 family takes `reasoning_effort` (minimal|low|medium|high)
-/// on the Chat Completions endpoint. The o-series exposes a different
-/// reasoning knob, so this is intentionally narrower than
-/// [`model_requires_max_completion_tokens`], keep it gpt-5 only so we
-/// never send an unsupported field to o1/o3/o4.
-fn model_supports_reasoning_effort(model: &str) -> bool {
-    model.to_ascii_lowercase().starts_with("gpt-5")
-}
-
 /// Models that reject any non-default `temperature` value.
 ///
 /// gpt-5 and the o-series reasoning models accept only the model
@@ -466,6 +597,47 @@ fn model_requires_default_temperature(model: &str) -> bool {
     // Same family as `max_completion_tokens` — keep aligned: any future
     // family that adopts the new rename also tends to lock temperature.
     model_requires_max_completion_tokens(model)
+}
+
+pub(crate) fn is_openrouter_base(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("openrouter.ai")
+}
+
+fn is_xai_base(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("api.x.ai") || lower.contains("://x.ai/") || lower.contains(".x.ai/")
+}
+
+/// Which reasoning object this Chat Completions host expects.
+#[derive(Debug, Clone, Copy)]
+enum ReasoningHost {
+    OpenAi,
+    OpenRouter,
+    Grok,
+}
+
+impl ReasoningHost {
+    fn detect(dialect: RequestDialect, base_url: &str) -> Self {
+        match dialect {
+            RequestDialect::Compat if is_openrouter_base(base_url) => Self::OpenRouter,
+            RequestDialect::Compat if is_xai_base(base_url) => Self::Grok,
+            RequestDialect::Official | RequestDialect::Compat => Self::OpenAi,
+        }
+    }
+
+    fn fields(self, effort: ReasoningEffort) -> (Option<ReasoningEffort>, Option<OpenAiReasoning>) {
+        match self {
+            Self::OpenRouter => (
+                None,
+                Some(OpenAiReasoning {
+                    effort: effort.openai_wire_effort(),
+                    exclude: true,
+                }),
+            ),
+            Self::Grok => (Some(effort.grok_chat_effort()), None),
+            Self::OpenAi => (Some(effort.openai_wire_effort()), None),
+        }
+    }
 }
 
 /// Per-model output-token ceiling for the `Official` dialect.
@@ -502,7 +674,8 @@ mod tests {
         OpenAiProvider, RequestDialect, enforce_strict_object_schemas,
         model_requires_max_completion_tokens, normalize_openai_base,
     };
-    use crate::types::{ChatMessage, ChatRequest, Role};
+    use crate::types::{ChatMessage, ChatRequest, ReasoningEffort, Role};
+    use rstest::rstest;
     use schemars::JsonSchema;
     use secrecy::SecretString;
     use serde::{Deserialize, Serialize};
@@ -510,6 +683,17 @@ mod tests {
 
     fn provider_for(model: &str) -> OpenAiProvider {
         OpenAiProvider::new(SecretString::new("test-key".into()), model).unwrap()
+    }
+
+    #[test]
+    fn request_timeout_defaults_and_is_overridable() {
+        let provider = provider_for("gpt-4o-mini");
+        assert_eq!(
+            provider.timeout,
+            std::time::Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+        let provider = provider.with_timeout_secs(900);
+        assert_eq!(provider.timeout, std::time::Duration::from_secs(900));
     }
 
     fn chat_request() -> ChatRequest {
@@ -582,6 +766,79 @@ mod tests {
         assert!(names.contains(&"body"));
         assert!(names.contains(&"tags"));
         assert_eq!(names.len(), 3);
+    }
+
+    /// Recursively assert every object node an enforced schema produces has
+    /// `additionalProperties: false` and a `required` array that is exactly
+    /// its `properties` keys — no key in `required` that `properties` lacks.
+    fn assert_strict_invariant(node: &serde_json::Value) {
+        if let Some(map) = node.as_object() {
+            if map.contains_key("$ref") {
+                return;
+            }
+            if let Some(props) = map.get("properties").and_then(|p| p.as_object()) {
+                assert_eq!(
+                    map.get("additionalProperties"),
+                    Some(&json!(false)),
+                    "every object must set additionalProperties:false; got {map:?}"
+                );
+                let required: std::collections::BTreeSet<&str> = map
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                let keys: std::collections::BTreeSet<&str> =
+                    props.keys().map(String::as_str).collect();
+                assert_eq!(
+                    required, keys,
+                    "required must equal properties keys (the #628 drift symptom is required \
+                     carrying a key properties lacks)"
+                );
+            }
+            for v in map.values() {
+                assert_strict_invariant(v);
+            }
+        } else if let Some(items) = node.as_array() {
+            for v in items {
+                assert_strict_invariant(v);
+            }
+        }
+    }
+
+    /// #628 guard: a `BTreeMap`-typed field (schemars emits
+    /// `additionalProperties: {schema}`, an open map) is normalized to
+    /// `additionalProperties: false`, NOT recursed into. OpenAI strict mode
+    /// forbids open/arbitrary-key maps — emitting `additionalProperties:{schema}`
+    /// would 400 on every strict provider. This test pins that behavior so the
+    /// map value-schema is never "revived": the correct way to make a map field
+    /// model-producible under strict mode is a fixed-shape array of objects, not
+    /// an open map.
+    #[test]
+    fn enforce_strict_closes_open_maps_and_keeps_required_consistent() {
+        // Shape mirrors ConsolidatedPage: scalar fields plus a `relations`
+        // BTreeMap<String, Vec<String>> rendered as an open map.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "body_markdown": { "type": "string" },
+                "relations": {
+                    "type": "object",
+                    "additionalProperties": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        });
+        enforce_strict_object_schemas(&mut schema);
+        // The map field is closed, not preserved as an open map.
+        assert_eq!(
+            schema["properties"]["relations"]["additionalProperties"],
+            json!(false),
+            "an open map must be closed for strict mode, not left as additionalProperties:{{schema}}"
+        );
+        // And the whole schema satisfies the strict invariant end to end.
+        assert_strict_invariant(&schema);
     }
 
     #[test]
@@ -920,50 +1177,6 @@ mod tests {
     }
 
     #[test]
-    fn build_request_sets_reasoning_effort_low_for_gpt5() {
-        // gpt-5 under the Official dialect gets `reasoning_effort: "low"`
-        // to cut summarization latency.
-        let p = provider_for("gpt-5-mini");
-        let req_input = chat_request();
-        let req = p.build_request(&req_input, None);
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["reasoning_effort"], json!("low"));
-    }
-
-    #[test]
-    fn build_request_omits_reasoning_effort_for_gpt4() {
-        // Non-gpt-5 models must NOT receive `reasoning_effort`.
-        let p = provider_for("gpt-4o-mini");
-        let req_input = chat_request();
-        let req = p.build_request(&req_input, None);
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn build_request_omits_reasoning_effort_for_o_series() {
-        // The o-series uses a different reasoning knob; keep it off.
-        let p = provider_for("o3-mini");
-        let req_input = chat_request();
-        let req = p.build_request(&req_input, None);
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn build_request_compat_dialect_omits_reasoning_effort_for_gpt5() {
-        // Even for a gpt-5 model id, the Compat dialect (local engines)
-        // must not emit `reasoning_effort`, they don't implement it.
-        let p = OpenAiProvider::new(SecretString::new("dummy".into()), "gpt-5-mini")
-            .unwrap()
-            .with_dialect(RequestDialect::Compat);
-        let req_input = chat_request();
-        let req = p.build_request(&req_input, None);
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("reasoning_effort").is_none());
-    }
-
-    #[test]
     fn build_request_does_not_cap_gpt5() {
         // Reasoning models have a much larger output cap (128K+); leave
         // the caller's value alone.
@@ -980,6 +1193,78 @@ mod tests {
         let req = p.build_request(&req_input, None);
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["max_completion_tokens"], json!(64_000));
+    }
+
+    fn chat_reasoning_json(
+        dialect: RequestDialect,
+        base_url: Option<&str>,
+        model: &str,
+        effort: Option<ReasoningEffort>,
+    ) -> serde_json::Value {
+        let mut provider = OpenAiProvider::new(SecretString::new("test-key".into()), model)
+            .unwrap()
+            .with_dialect(dialect)
+            .with_reasoning_effort(effort);
+        if let Some(url) = base_url {
+            provider = provider.with_base_url(url);
+        }
+        serde_json::to_value(provider.build_request(&chat_request(), None)).unwrap()
+    }
+
+    #[rstest]
+    #[case::official_low(
+        RequestDialect::Official,
+        None,
+        "gpt-5.4-mini",
+        Some(ReasoningEffort::Low),
+        Some("low"),
+        None
+    )]
+    #[case::official_unset(RequestDialect::Official, None, "gpt-5.4-mini", None, None, None)]
+    #[case::openrouter_excludes_content(
+        RequestDialect::Compat,
+        Some("https://openrouter.ai/api/v1"),
+        "anthropic/claude-sonnet-4.6",
+        Some(ReasoningEffort::High),
+        None,
+        Some("high")
+    )]
+    #[case::xai_none_clamps_low(
+        RequestDialect::Compat,
+        Some("https://api.x.ai/v1"),
+        "grok-4.6",
+        Some(ReasoningEffort::None),
+        Some("low"),
+        None
+    )]
+    #[case::official_ultra_clamps_max(
+        RequestDialect::Official,
+        None,
+        "gpt-5.4-mini",
+        Some(ReasoningEffort::Ultra),
+        Some("max"),
+        None
+    )]
+    fn chat_request_uses_native_reasoning_shape(
+        #[case] dialect: RequestDialect,
+        #[case] base_url: Option<&str>,
+        #[case] model: &str,
+        #[case] effort: Option<ReasoningEffort>,
+        #[case] reasoning_effort: Option<&str>,
+        #[case] reasoning_object: Option<&str>,
+    ) {
+        let json = chat_reasoning_json(dialect, base_url, model, effort);
+        match reasoning_effort {
+            Some(expected) => assert_eq!(json["reasoning_effort"], json!(expected)),
+            None => assert!(json.get("reasoning_effort").is_none()),
+        }
+        match reasoning_object {
+            Some(expected) => {
+                assert_eq!(json["reasoning"]["effort"], json!(expected));
+                assert_eq!(json["reasoning"]["exclude"], json!(true));
+            }
+            None => assert!(json.get("reasoning").is_none()),
+        }
     }
 
     #[test]

@@ -31,7 +31,7 @@ use crate::http_client::{ServerEndpoint, post_json};
 /// Bails when the resolved repo path cannot be inspected, when source
 /// collection fails, or when the server returns a non-2xx response.
 pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
-    let ep = ServerEndpoint::from_config(config);
+    let ep = ServerEndpoint::from_config_resolving_auth(config).await;
     info!(server = %ep.url, auth = ep.auth_token.is_some(), "bootstrap CLI configured");
 
     // ---- repo path — auto-detect via libgit2, fall back to CWD ----
@@ -73,8 +73,9 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
     }
 
     // ---- project — auto-derive from repo basename if absent -------
-    let project = super::resolve_project_name(config, args.project.as_deref())?;
-    info!(workspace = %args.workspace, project = %project, repo_path = %repo_path.display(), git = has_git, "bootstrap target");
+    let (workspace, project) =
+        super::resolve_scope(config, args.workspace.as_deref(), args.project.as_deref())?;
+    info!(workspace = %workspace, project = %project, repo_path = %repo_path.display(), git = has_git, "bootstrap target");
 
     // ---- collect sources locally ----------------------------------
     let sources = collect_sources(
@@ -122,7 +123,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
             args.max_input_tokens,
             args.chunk_input_tokens,
         );
-        print_human_report(&outcome, &args.workspace, &project);
+        print_human_report(&outcome, &workspace, &project);
         let report = serde_json::to_string_pretty(&outcome)?;
         println!("\n--- machine-readable ---\n{report}");
         return Ok(());
@@ -130,7 +131,7 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
 
     // ---- POST to server -------------------------------------------
     let body = serde_json::json!({
-        "workspace": args.workspace,
+        "workspace": workspace,
         "project": project,
         "sources": sources,
         "sources_collected": collected,
@@ -138,10 +139,11 @@ pub async fn run(config: &Config, args: BootstrapArgs) -> Result<()> {
         "chunk_input_tokens": args.chunk_input_tokens,
         "dry_run": args.dry_run,
         "force": args.force,
+        "resume": args.resume,
     });
     let outcome: BootstrapOutcome = post_json(&ep, "/admin/bootstrap", &body).await?;
 
-    print_human_report(&outcome, &args.workspace, &project);
+    print_human_report(&outcome, &workspace, &project);
     let report = serde_json::to_string_pretty(&outcome)?;
     println!("\n--- machine-readable ---\n{report}");
     Ok(())

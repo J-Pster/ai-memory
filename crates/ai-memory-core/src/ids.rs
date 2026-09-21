@@ -82,10 +82,16 @@ id_newtype!(pub ProjectId, "Project identifier (middle of the 3-tuple).");
 id_newtype!(pub SessionId, "Identifier for a single agent run.");
 id_newtype!(pub ObservationId, "Identifier for a single observation captured during a session.");
 id_newtype!(pub PageId, "Identifier for a single wiki page version.");
+id_newtype!(pub EntityId, "Identifier for one project-scoped entity.");
 id_newtype!(pub HandoffId, "Identifier for a cross-agent handoff record.");
+id_newtype!(pub MessageId, "Identifier for one cross-project agent message (inbox/queue).");
+id_newtype!(pub WorkstreamId, "Identifier for a managed cross-harness workstream.");
+id_newtype!(pub ManagedRunId, "Identifier for one `ai-memory run` invocation.");
 id_newtype!(pub UserId, "Identifier for a registered user (multi-user attribution; see [`crate::actor`]).");
+id_newtype!(pub ApiCredentialId, "Identifier for one native `aim_` API credential.");
 id_newtype!(pub AutoImproveRunId, "Identifier for one auto-improvement review run.");
 id_newtype!(pub AutoImproveProposalId, "Identifier for one staged auto-improvement proposal.");
+id_newtype!(pub PageFeedbackId, "Identifier for one page-feedback signal (`memory_feedback`).");
 
 /// Relative path of a page within the wiki tree.
 ///
@@ -151,6 +157,33 @@ impl PagePath {
         Ok(Self(raw))
     }
 
+    /// Reject a path that cannot be materialised and checkpointed on every
+    /// supported platform.
+    ///
+    /// Deliberately **not** part of [`PagePath::new`]. Persisted rows are
+    /// reconstructed through that constructor on every read
+    /// (`reader.rs` does so in the recency, search, vector and graph
+    /// queries), so tightening it would make any already-stored
+    /// non-portable page unreadable — and because those are list queries,
+    /// one such page would break a whole listing rather than just itself.
+    /// The rule therefore applies where a *new* path enters the system.
+    ///
+    /// The rule is the same on every platform on purpose. A wiki authored
+    /// on Linux is expected to be usable on Windows by the same release;
+    /// making the check platform-conditional would let a Linux session
+    /// create pages a Windows session cannot read, which is the defect
+    /// being fixed rather than a fix for it (#462).
+    ///
+    /// # Errors
+    /// Returns [`MemoryError::InvalidPagePath`] naming the offending
+    /// component and the reason.
+    pub fn ensure_portable(&self) -> Result<(), MemoryError> {
+        for component in self.as_str().split('/') {
+            ensure_portable_component(component, self.as_str())?;
+        }
+        Ok(())
+    }
+
     /// Borrow the inner string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -167,6 +200,23 @@ impl fmt::Debug for PagePath {
 impl fmt::Display for PagePath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// The key a case-folding or Unicode-normalizing filesystem effectively
+/// stores a page path under: two paths with the same key are one file on
+/// macOS (APFS) and Windows (NTFS), whatever they look like here.
+///
+/// Lowercase first, then compose: `İ` lowercases to `i` + U+0307, which only
+/// composes back to a single scalar after the fold.
+#[must_use]
+pub fn portable_page_key(path: &str) -> String {
+    let lowered = path.to_lowercase();
+    let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+    if nfc.is_normalized(&lowered) {
+        lowered
+    } else {
+        nfc.normalize(&lowered).into_owned()
     }
 }
 
@@ -191,15 +241,65 @@ pub enum AgentKind {
     OpenClaw,
     /// Google Antigravity CLI (`agy`).
     AntigravityCli,
-    /// Oh My Pi (`omp`) / Pi-compatible coding agent.
+    /// Oh My Pi (`omp`) coding agent.
     Omp,
+    /// Pi coding agent.
+    #[serde(rename = "pi")]
+    Pi,
+    /// Charmbracelet Crush coding agent.
+    Crush,
     /// xAI Grok Build CLI (`grok`).
     Grok,
+    /// Zero coding agent (Gitlawb/zero).
+    Zero,
+    /// Devin CLI (Cognition).
+    Devin,
+    /// Kimi Code CLI (Moonshot AI).
+    KimiCode,
+    /// AWS Kiro CLI (verified v2 lifecycle protocol).
+    KiroCli,
+    /// Command Code CLI.
+    CommandCode,
+    /// Hermes Agent (Nous Research).
+    Hermes,
+    /// Pool (Poolside Agent CLI).
+    Pool,
+    /// ZCode (z.ai) coding agent.
+    Zcode,
     /// Anything else (manual capture, future agents).
     Other,
 }
 
 impl AgentKind {
+    /// Every variant, for tests that must cover the full agent surface —
+    /// e.g. the store-level check that the persisted `sessions.agent_kind`
+    /// CHECK constraint accepts every kind (the Zero integration shipped
+    /// with the enum variant but without the V26 migration and only a
+    /// live test caught it). Extend together with the enum.
+    pub const ALL: [Self; 21] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Cursor,
+        Self::GeminiCli,
+        Self::ClaudeDesktop,
+        Self::OpenClaw,
+        Self::AntigravityCli,
+        Self::Omp,
+        Self::Pi,
+        Self::Crush,
+        Self::Grok,
+        Self::Zero,
+        Self::Devin,
+        Self::KimiCode,
+        Self::KiroCli,
+        Self::CommandCode,
+        Self::Hermes,
+        Self::Pool,
+        Self::Zcode,
+        Self::Other,
+    ];
+
     /// Kebab-case wire string matching the serde representation.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -213,7 +313,17 @@ impl AgentKind {
             Self::OpenClaw => "openclaw",
             Self::AntigravityCli => "antigravity-cli",
             Self::Omp => "omp",
+            Self::Pi => "pi",
+            Self::Crush => "crush",
             Self::Grok => "grok",
+            Self::Zero => "zero",
+            Self::Devin => "devin",
+            Self::KimiCode => "kimi-code",
+            Self::KiroCli => "kiro-cli",
+            Self::CommandCode => "command-code",
+            Self::Hermes => "hermes",
+            Self::Pool => "pool",
+            Self::Zcode => "zcode",
             Self::Other => "other",
         }
     }
@@ -226,14 +336,24 @@ impl AgentKind {
         match s {
             "claude-code" | "claude_code" | "claude" => Self::ClaudeCode,
             "codex" => Self::Codex,
-            "open-code" | "opencode" => Self::OpenCode,
+            "open-code" | "opencode" | "opencode2" | "opencode-v2" | "open-code2" => Self::OpenCode,
             "cursor" => Self::Cursor,
             "gemini-cli" | "gemini" => Self::GeminiCli,
             "claude-desktop" | "claude_desktop" => Self::ClaudeDesktop,
             "openclaw" | "open-claw" => Self::OpenClaw,
             "antigravity-cli" | "antigravity" | "agy" => Self::AntigravityCli,
-            "omp" | "pi" | "oh-my-pi" => Self::Omp,
+            "pi" => Self::Pi,
+            "crush" => Self::Crush,
+            "omp" | "oh-my-pi" => Self::Omp,
             "grok" => Self::Grok,
+            "zero" => Self::Zero,
+            "devin" => Self::Devin,
+            "kimi-code" | "kimi" => Self::KimiCode,
+            "kiro-cli" | "kiro" => Self::KiroCli,
+            "command-code" | "commandcode" | "cmdc" | "cmd" => Self::CommandCode,
+            "hermes" | "hermes-agent" => Self::Hermes,
+            "pool" | "poolside" => Self::Pool,
+            "zcode" | "zai" => Self::Zcode,
             _ => Self::Other,
         }
     }
@@ -243,7 +363,9 @@ impl AgentKind {
     /// `true` (Claude Code reads `hookSpecificOutput.additionalContext`).
     ///
     /// Grok ignores hook stdout on `SessionStart` (per Grok's hooks docs:
-    /// "For events like SessionStart or PostToolUse, stdout is ignored"), so
+    /// "For events like SessionStart or PostToolUse, stdout is ignored"), and
+    /// Zero's agent loop discards the sessionStart dispatch result entirely
+    /// (`internal/agent/loop.go` ignores `Dispatch`'s return there), so
     /// the native hook must NOT fetch the handoff for it: the fetch is
     /// **destructive** (the server marks the handoff accepted) and the result
     /// would be discarded — silently losing the handoff. For such agents the
@@ -251,9 +373,50 @@ impl AgentKind {
     /// tool. Unknown future agents return `false` until we know their
     /// SessionStart stdout semantics; accepting a handoff is single-use and
     /// should fail safe.
+    ///
+    /// Kimi Code fires `SessionStart` but discards the hook's stdout/result
+    /// entirely (`packages/agent-core/src/session/index.ts` ignores the
+    /// dispatch return, verified in the v0.28.1 source), so the handoff is
+    /// delivered on `UserPromptSubmit` instead — see
+    /// [`Self::user_prompt_injects_handoff`].
+    ///
+    /// Pool (Poolside Agent CLI) tolerates plain hook stdout, but model-visible
+    /// context injection from `SessionStart` stdout is not demonstrated
+    /// (verified against Poolside CLI v1.0.16), so Pool fails safe like other
+    /// unproven agents: the handoff stays available on demand via the MCP
+    /// `memory_handoff_accept` tool.
+    ///
+    /// ZCode (z.ai) DOES inject: a `hookSpecificOutput.additionalContext`
+    /// canary printed by the session-start hook appeared verbatim inside a
+    /// `<system-reminder>` text block of the first user message sent to the
+    /// model (verified live against the embedded engine v0.16.5, capture logs
+    /// 2026-08-28), so its native hook fetches the handoff like Claude Code's.
     #[must_use]
     pub fn session_start_injects_handoff(self) -> bool {
-        !matches!(self, Self::Grok | Self::Other)
+        !matches!(
+            self,
+            Self::Crush
+                | Self::Grok
+                | Self::Zero
+                | Self::KimiCode
+                | Self::Hermes
+                | Self::Pool
+                | Self::Other
+        )
+    }
+
+    /// Whether this agent injects the native `user-prompt` (UserPromptSubmit)
+    /// hook's stdout into the upcoming turn as context. Only Kimi Code does:
+    /// its `SessionStart` stdout is discarded (see
+    /// [`Self::session_start_injects_handoff`]), while `UserPromptSubmit`
+    /// stdout is prepended to the turn as a user message with
+    /// `origin: {kind: 'hook_result'}` (`agent/turn/index.ts`,
+    /// `session/hooks/user-prompt.ts`, verified in the v0.28.1 source).
+    /// Empty stdout injects nothing, so the hook prints the raw handoff body
+    /// or nothing at all — never a JSON envelope.
+    #[must_use]
+    pub fn user_prompt_injects_handoff(self) -> bool {
+        matches!(self, Self::KimiCode)
     }
 }
 
@@ -297,9 +460,171 @@ mod tests {
         // Grok cannot inject the session-start handoff (ignores hook stdout);
         // every other agent can.
         assert!(!AgentKind::Grok.session_start_injects_handoff());
+        assert!(!AgentKind::Zero.session_start_injects_handoff());
         assert!(AgentKind::ClaudeCode.session_start_injects_handoff());
         assert!(AgentKind::Codex.session_start_injects_handoff());
         assert!(!AgentKind::Other.session_start_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_devin_round_trips() {
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        // serde uses rename_all = "kebab-case" → "devin".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Devin).unwrap(),
+            "\"devin\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"devin\"").unwrap(),
+            AgentKind::Devin
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("devin-2"), AgentKind::Other);
+        // Devin can inject the session-start handoff (consumes additionalContext).
+        assert!(AgentKind::Devin.session_start_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kimi_code_round_trips() {
+        assert_eq!(AgentKind::KimiCode.as_str(), "kimi-code");
+        assert_eq!(AgentKind::from_wire("kimi-code"), AgentKind::KimiCode);
+        assert_eq!(AgentKind::from_wire("kimi"), AgentKind::KimiCode);
+        // serde uses rename_all = "kebab-case" → "kimi-code".
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KimiCode).unwrap(),
+            "\"kimi-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kimi-code\"").unwrap(),
+            AgentKind::KimiCode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("kimi-2"), AgentKind::Other);
+        // Kimi Code discards SessionStart stdout (verified in the v0.28.1
+        // source), so the handoff is delivered on UserPromptSubmit instead.
+        assert!(!AgentKind::KimiCode.session_start_injects_handoff());
+        assert!(AgentKind::KimiCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_hermes_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Hermes.as_str(), "hermes");
+        assert_eq!(AgentKind::from_wire("hermes"), AgentKind::Hermes);
+        assert_eq!(AgentKind::from_wire("hermes-agent"), AgentKind::Hermes);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"hermes\"").unwrap(),
+            AgentKind::Hermes
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Hermes).unwrap(),
+            "\"hermes\""
+        );
+        assert!(!AgentKind::Hermes.session_start_injects_handoff());
+        assert!(!AgentKind::Hermes.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_pool_round_trips_without_claiming_handoff_delivery() {
+        assert_eq!(AgentKind::Pool.as_str(), "pool");
+        assert_eq!(AgentKind::from_wire("pool"), AgentKind::Pool);
+        assert_eq!(AgentKind::from_wire("poolside"), AgentKind::Pool);
+        assert_eq!(serde_json::to_string(&AgentKind::Pool).unwrap(), "\"pool\"");
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"pool\"").unwrap(),
+            AgentKind::Pool
+        );
+        assert_eq!(AgentKind::from_wire("pool-2"), AgentKind::Other);
+        // Pool's SessionStart stdout injection is not demonstrated, so the
+        // destructive handoff fetch must not happen from its native hook.
+        assert!(!AgentKind::Pool.session_start_injects_handoff());
+        assert!(!AgentKind::Pool.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_zcode_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::Zcode.as_str(), "zcode");
+        assert_eq!(AgentKind::from_wire("zcode"), AgentKind::Zcode);
+        assert_eq!(AgentKind::from_wire("zai"), AgentKind::Zcode);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Zcode).unwrap(),
+            "\"zcode\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"zcode\"").unwrap(),
+            AgentKind::Zcode
+        );
+        // Unknown tags still degrade to Other.
+        assert_eq!(AgentKind::from_wire("zcode-2"), AgentKind::Other);
+        // ZCode injects SessionStart stdout as additionalContext (live canary
+        // capture against engine v0.16.5), so the destructive handoff fetch
+        // is safe from its native hook.
+        assert!(AgentKind::Zcode.session_start_injects_handoff());
+        assert!(!AgentKind::Zcode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_command_code_round_trips_and_injects_session_start_handoff() {
+        assert_eq!(AgentKind::CommandCode.as_str(), "command-code");
+        for alias in ["command-code", "commandcode", "cmdc", "cmd"] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::CommandCode);
+        }
+        assert_eq!(
+            serde_json::to_string(&AgentKind::CommandCode).unwrap(),
+            "\"command-code\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"command-code\"").unwrap(),
+            AgentKind::CommandCode
+        );
+        assert!(AgentKind::CommandCode.session_start_injects_handoff());
+        assert!(!AgentKind::CommandCode.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_kiro_cli_round_trips_and_injects_at_session_start() {
+        assert_eq!(AgentKind::KiroCli.as_str(), "kiro-cli");
+        assert_eq!(AgentKind::from_wire("kiro-cli"), AgentKind::KiroCli);
+        assert_eq!(AgentKind::from_wire("kiro"), AgentKind::KiroCli);
+        assert_eq!(
+            serde_json::to_string(&AgentKind::KiroCli).unwrap(),
+            "\"kiro-cli\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentKind>("\"kiro-cli\"").unwrap(),
+            AgentKind::KiroCli
+        );
+        assert!(AgentKind::KiroCli.session_start_injects_handoff());
+        assert!(!AgentKind::KiroCli.user_prompt_injects_handoff());
+    }
+
+    #[test]
+    fn agent_kind_opencode_wire_names_share_one_kind() {
+        // OpenCode 2.0 ships side by side as `opencode2` against the same
+        // config dir and session store, so its wire names resolve to the
+        // existing kind — no new variant, no store migration.
+        assert_eq!(AgentKind::OpenCode.as_str(), "open-code");
+        for alias in [
+            "open-code",
+            "opencode",
+            "opencode2",
+            "opencode-v2",
+            "open-code2",
+        ] {
+            assert_eq!(AgentKind::from_wire(alias), AgentKind::OpenCode);
+        }
+    }
+
+    #[test]
+    fn user_prompt_handoff_injection_is_kimi_only() {
+        for agent in AgentKind::ALL {
+            assert_eq!(
+                agent.user_prompt_injects_handoff(),
+                agent == AgentKind::KimiCode,
+                "{}",
+                agent.as_str()
+            );
+        }
     }
 
     #[test]
@@ -346,6 +671,22 @@ mod tests {
 
         let omp = serde_json::to_string(&AgentKind::Omp).unwrap();
         assert_eq!(omp, "\"omp\"");
+        assert_eq!(AgentKind::from_wire("omp"), AgentKind::Omp);
+        assert_eq!(AgentKind::from_wire("oh-my-pi"), AgentKind::Omp);
+
+        let pi = serde_json::to_string(&AgentKind::Pi).unwrap();
+        assert_eq!(pi, "\"pi\"");
+        assert_eq!(AgentKind::Pi.as_str(), "pi");
+        assert_eq!(AgentKind::from_wire("pi"), AgentKind::Pi);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>(&pi).unwrap(),
+            AgentKind::Pi
+        );
+
+        let crush = serde_json::to_string(&AgentKind::Crush).unwrap();
+        assert_eq!(crush, "\"crush\"");
+        assert_eq!(AgentKind::from_wire("crush"), AgentKind::Crush);
+        assert!(!AgentKind::Crush.session_start_injects_handoff());
 
         let openclaw = serde_json::to_string(&AgentKind::OpenClaw).unwrap();
         assert_eq!(openclaw, "\"openclaw\"");
@@ -356,5 +697,243 @@ mod tests {
 
         let antigravity = serde_json::to_string(&AgentKind::AntigravityCli).unwrap();
         assert_eq!(antigravity, "\"antigravity-cli\"");
+
+        let devin = serde_json::to_string(&AgentKind::Devin).unwrap();
+        assert_eq!(devin, "\"devin\"");
+        assert_eq!(AgentKind::Devin.as_str(), "devin");
+        assert_eq!(AgentKind::from_wire("devin"), AgentKind::Devin);
+        assert_eq!(
+            serde_json::from_str::<AgentKind>(&devin).unwrap(),
+            AgentKind::Devin
+        );
+    }
+}
+
+/// Names Windows reserves regardless of extension: `CON.md` is still the
+/// console device.
+const DOS_DEVICE_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Characters Windows refuses in a filename. `/` is the separator and is
+/// handled by the caller; `\\` and a drive prefix are already rejected by
+/// [`PagePath::new`].
+const WINDOWS_RESERVED_CHARS: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+
+/// Returns true if a path component is reserved by Git (`.git` case-insensitively,
+/// or an 8.3 short-name alias like `git~1`..`git~4`).
+#[must_use]
+pub fn is_git_reserved_component(component: &str) -> bool {
+    // Compare on bytes: a `str` slice at a fixed byte index panics on a
+    // multibyte component (a 5-byte UTF-8 name like "abcé" has no char
+    // boundary at 4), and this runs on untrusted write input.
+    let b = component.as_bytes();
+    component.eq_ignore_ascii_case(".git")
+        || (b.len() == 5 && b[..4].eq_ignore_ascii_case(b"git~") && (b'1'..=b'4').contains(&b[4]))
+}
+
+fn ensure_portable_component(component: &str, full: &str) -> Result<(), MemoryError> {
+    let invalid = |reason: &str| {
+        Err(MemoryError::InvalidPagePath(format!(
+            "page path {full:?}: component {component:?} {reason}"
+        )))
+    };
+
+    if let Some(bad) = component
+        .chars()
+        .find(|c| WINDOWS_RESERVED_CHARS.contains(c))
+    {
+        return invalid(&format!(
+            "contains {bad:?}, which Windows refuses in a filename"
+        ));
+    }
+    if let Some(bad) = component.chars().find(|c| (*c as u32) < 0x20) {
+        return invalid(&format!(
+            "contains control character U+{:04X}, which is not a legal filename byte",
+            bad as u32
+        ));
+    }
+    // A trailing dot or space is silently stripped by the Win32 layer, so the
+    // file lands under a different name than the one recorded in the index.
+    if component.ends_with('.') || component.ends_with(' ') {
+        return invalid("ends with a dot or space, which Windows strips on create");
+    }
+    // Device names match on the stem, so `CON`, `CON.md` and `con.markdown`
+    // are all the console.
+    let stem = component.split('.').next().unwrap_or(component);
+    if DOS_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
+        return invalid(&format!(
+            "uses the reserved DOS device name {stem:?}; Windows resolves it to a device, not a file"
+        ));
+    }
+    // Git reserves `.git` for repository metadata. Any tree entry named `.git`
+    // or an 8.3 alias is refused by libgit2 with `GIT_EINVALIDPATH` and cannot
+    // be checkpointed.
+    if is_git_reserved_component(component) {
+        return invalid("is reserved by Git for repository metadata and refused in tree entries");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod portable_page_path_tests {
+    use super::{PagePath, portable_page_key};
+
+    /// Every shape #462 reproduced on native Windows. Each either fails late
+    /// with a 500, or writes but cannot be checkpointed by libgit2 and cannot
+    /// be deleted through the normal API — silent partial state, which is
+    /// worse than a clean rejection.
+    #[test]
+    fn windows_hostile_paths_are_rejected() {
+        for raw in [
+            "CON.md",
+            "notes/aux.md",
+            "notes/NUL.md",
+            "notes/com1.md",
+            "notes/LPT9.txt",
+            "notes/trailing./x.md",
+            "notes/trailing /x.md",
+            "notes/end.md.",
+            "notes/end.md ",
+            "notes/a<b.md",
+            "notes/a>b.md",
+            "notes/a\"b.md",
+            "notes/a|b.md",
+            "notes/a?b.md",
+            "notes/a*b.md",
+            "notes/a:b.md",
+            "notes/a\u{1}b.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} is not portable and must be refused at write time"
+            );
+        }
+    }
+
+    #[test]
+    fn git_reserved_paths_are_rejected() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".git/HEAD",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/.GIT/sub.md",
+            "notes/.Git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "notes/GIT~2/bar.md",
+            "notes/git~4/config",
+            "a/b/c/.git/deep.md",
+        ] {
+            let path = PagePath::new(raw).expect("still constructible: reads must keep working");
+            assert!(
+                path.ensure_portable().is_err(),
+                "{raw:?} contains a git-reserved component and must be refused at write time"
+            );
+        }
+    }
+
+    /// The rule must not reject ordinary pages. `con` is only reserved as a
+    /// whole component, so `concepts/` and `icon.md` are fine.
+    #[test]
+    fn ordinary_paths_stay_writable() {
+        for raw in [
+            "notes/portable.md",
+            "concepts/no-impl-without-test.md",
+            "sessions/2026-08-22.md",
+            "notes/icon.md",
+            "notes/console.md",
+            "prn-notes/aux-iliary.md",
+            "a/b/c/deep.md",
+            "notes/dot.in.middle.md",
+            "notes/UPPER.MD",
+            "notes/.git.md",
+            "notes/.gitignore",
+            "notes/.gitattributes",
+            "notes/github.md",
+            "git-notes/index.md",
+        ] {
+            let path = PagePath::new(raw).expect("valid path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// A multibyte component whose byte length is 5 must not be mistaken for
+    /// a `git~N` alias, and must not panic: `is_git_reserved_component` once
+    /// sliced the string at byte index 4, which is not a char boundary in a
+    /// name like "abcé" (5 bytes) or "a😀" (5 bytes). Since this runs on the
+    /// write funnel for untrusted input, the panic was a crashable defect.
+    #[test]
+    fn multibyte_components_are_not_git_reserved_and_do_not_panic() {
+        for component in ["abcé", "ab€", "a😀", "éé", "🦀🦀"] {
+            assert!(
+                !super::is_git_reserved_component(component),
+                "{component:?} is an ordinary name, not a git-reserved alias"
+            );
+        }
+        // The full write funnel (construct + ensure_portable) must accept a
+        // page path with a 5-byte multibyte component without panicking.
+        for raw in ["notes/abcé.md", "notes/a😀.md", "notes/ab€.md"] {
+            let path = PagePath::new(raw).expect("valid non-ASCII path");
+            assert!(
+                path.ensure_portable().is_ok(),
+                "{raw:?} is portable and must stay writable"
+            );
+        }
+    }
+
+    /// Reads must keep working for pages already stored under a
+    /// non-portable name: `PagePath::new` stays tolerant so a listing does
+    /// not break on one bad row.
+    #[test]
+    fn existing_non_portable_pages_remain_constructible() {
+        for raw in [
+            "CON.md",
+            "notes/a|b.md",
+            "notes/trailing./x.md",
+            ".git/config",
+            "notes/.git/sub.md",
+            "notes/git~1/foo.md",
+        ] {
+            assert!(
+                PagePath::new(raw).is_ok(),
+                "{raw:?} must still construct so persisted rows stay readable"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_collapses_case_and_normalization() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/Alpha.md"),
+            ("Concepts/alpha.md", "concepts/ALPHA.md"),
+            ("concepts/caf\u{00e9}.md", "concepts/cafe\u{0301}.md"),
+            ("concepts/CAF\u{00c9}.md", "concepts/cafe\u{0301}.md"),
+        ] {
+            assert_eq!(
+                portable_page_key(a),
+                portable_page_key(b),
+                "{a:?} and {b:?} are one file on macOS/Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_key_keeps_distinct_paths_distinct() {
+        for (a, b) in [
+            ("concepts/alpha.md", "concepts/alphabet.md"),
+            ("concepts/alpha.md", "decisions/alpha.md"),
+            ("concepts/nested/a.md", "concepts/a.md"),
+            ("concepts/cafe.md", "concepts/caf\u{00e9}.md"),
+        ] {
+            assert_ne!(portable_page_key(a), portable_page_key(b));
+        }
     }
 }

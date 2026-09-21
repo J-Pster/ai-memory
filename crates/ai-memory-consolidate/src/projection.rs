@@ -7,6 +7,8 @@ use ai_memory_core::{Observation, ObservationKind};
 const DEFAULT_EVEN_SAMPLE_BUCKETS: usize = 16;
 const MAX_RENDERED_TITLE_CHARS: usize = 500;
 const MAX_RENDERED_SOURCE_CHARS: usize = 128;
+const EVEN_SAMPLE_SCORE: i32 = 20;
+const MAX_RECENCY_SCORE: i32 = 80;
 
 /// Budget and rendering controls for observation projection.
 #[derive(Debug, Clone)]
@@ -115,16 +117,40 @@ pub fn project_observations(
         };
     }
 
-    let mut selected = select_observation_indices(observations, cfg.max_selected_observations);
-    let mut rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
+    // Scores and rendered blocks depend only on an observation and its position
+    // in the full list, never on which other observations were selected, so
+    // both are computed once here. The prune loop below used to recompute
+    // every remaining score (each one scans the body) and re-render the whole
+    // text on every removal: quadratic, and 14s for 256 observations of 4k
+    // chars, in production consolidation as much as in the test.
+    let scores: Vec<i32> = observations
+        .iter()
+        .enumerate()
+        .map(|(idx, obs)| observation_score(obs, idx, observations.len()))
+        .collect();
+    let mut selected =
+        select_observation_indices(observations, cfg.max_selected_observations, &scores);
 
-    while rendered.text.chars().count() > cfg.max_total_chars && selected.len() > 1 {
-        let Some(remove_idx) = lowest_prunable_index(observations, &selected) else {
+    let block_chars: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .map(|(idx, obs)| {
+            render_observation_block(observations.len(), idx, obs, cfg.per_body_excerpt_chars)
+                .text
+                .chars()
+                .count()
+        })
+        .collect();
+    let mut total_chars: usize = selected.iter().map(|idx| block_chars[*idx]).sum();
+
+    while total_chars > cfg.max_total_chars && selected.len() > 1 {
+        let Some(remove_idx) = lowest_prunable_index(observations, &selected, &scores) else {
             break;
         };
         selected.retain(|idx| *idx != remove_idx);
-        rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
+        total_chars = total_chars.saturating_sub(block_chars[remove_idx]);
     }
+    let rendered = render_projection(observations, &selected, cfg.per_body_excerpt_chars);
 
     let omitted_count = observations.len().saturating_sub(selected.len());
     let mut text = rendered.text;
@@ -206,43 +232,61 @@ fn render_projection(
         let Some(obs) = observations.get(*idx) else {
             continue;
         };
-        let (body, truncated, omitted) = excerpt_body(&obs.body, per_body_excerpt_chars);
-        if truncated {
+        let block = render_observation_block(observations.len(), *idx, obs, per_body_excerpt_chars);
+        if block.truncated {
             truncated_bodies += 1;
         }
-        let title = cap_text_with_marker(&obs.title, MAX_RENDERED_TITLE_CHARS, "observation title");
-        text.push_str(&format!(
-            "\n--- observation {}/{} ---\nid: {}\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\n",
-            idx + 1,
-            observations.len(),
-            obs.id,
-            obs.kind.as_str(),
-            title,
-            obs.importance,
-            obs.created_at,
-        ));
-        if let Some(extension) = obs.extension.as_deref().filter(|s| !s.trim().is_empty()) {
-            let extension = cap_text_with_marker(extension, MAX_RENDERED_SOURCE_CHARS, "extension");
-            text.push_str(&format!("extension: {extension}\n"));
-        }
-        if let Some(source_event) = obs.source_event.as_deref().filter(|s| !s.trim().is_empty()) {
-            let source_event =
-                cap_text_with_marker(source_event, MAX_RENDERED_SOURCE_CHARS, "source event");
-            text.push_str(&format!("source_event: {source_event}\n"));
-        }
-        text.push_str(&format!("body:\n{body}"));
-        if truncated {
-            text.push_str(&format!(
-                "\n[observation body truncated; {omitted} chars omitted; full original remains in SQLite as observation id {}]",
-                obs.id
-            ));
-        }
-        text.push('\n');
+        text.push_str(&block.text);
     }
     RenderedProjection {
         text,
         truncated_bodies,
     }
+}
+
+/// One observation's rendered block: header, optional provenance lines, body
+/// excerpt, and the truncation marker when the body was cut.
+struct RenderedBlock {
+    text: String,
+    truncated: bool,
+}
+
+fn render_observation_block(
+    total: usize,
+    idx: usize,
+    obs: &Observation,
+    per_body_excerpt_chars: usize,
+) -> RenderedBlock {
+    let (body, truncated, omitted) = excerpt_body(&obs.body, per_body_excerpt_chars);
+    let title = cap_text_with_marker(&obs.title, MAX_RENDERED_TITLE_CHARS, "observation title");
+    let mut text = format!(
+        "\n--- observation {}/{} ---\nid: {}\nkind: {}\ntitle: {}\nimportance: {}\ncreated_at: {}\n",
+        idx + 1,
+        total,
+        obs.id,
+        obs.kind.as_str(),
+        title,
+        obs.importance,
+        obs.created_at,
+    );
+    if let Some(extension) = obs.extension.as_deref().filter(|s| !s.trim().is_empty()) {
+        let extension = cap_text_with_marker(extension, MAX_RENDERED_SOURCE_CHARS, "extension");
+        text.push_str(&format!("extension: {extension}\n"));
+    }
+    if let Some(source_event) = obs.source_event.as_deref().filter(|s| !s.trim().is_empty()) {
+        let source_event =
+            cap_text_with_marker(source_event, MAX_RENDERED_SOURCE_CHARS, "source event");
+        text.push_str(&format!("source_event: {source_event}\n"));
+    }
+    text.push_str(&format!("body:\n{body}"));
+    if truncated {
+        text.push_str(&format!(
+            "\n[observation body truncated; {omitted} chars omitted; full original remains in SQLite as observation id {}]",
+            obs.id
+        ));
+    }
+    text.push('\n');
+    RenderedBlock { text, truncated }
 }
 
 fn excerpt_body(body: &str, max_chars: usize) -> (String, bool, usize) {
@@ -272,7 +316,11 @@ fn fit_text_to_budget(text: &str, max_chars: usize, marker: &str) -> String {
     out
 }
 
-fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec<usize> {
+fn select_observation_indices(
+    observations: &[Observation],
+    limit: usize,
+    scores: &[i32],
+) -> Vec<usize> {
     if observations.len() <= limit {
         return (0..observations.len()).collect();
     }
@@ -288,10 +336,10 @@ fn select_observation_indices(observations: &[Observation], limit: usize) -> Vec
         .iter()
         .enumerate()
         .filter(|(idx, _)| !selected.contains(idx))
-        .map(|(idx, obs)| {
-            let mut score = observation_score(obs, idx, observations.len());
+        .map(|(idx, _)| {
+            let mut score = scores[idx];
             if even.contains(&idx) {
-                score += 40;
+                score += EVEN_SAMPLE_SCORE;
             }
             (score, idx)
         })
@@ -324,17 +372,16 @@ fn even_sample_indices(total: usize) -> BTreeSet<usize> {
     out
 }
 
-fn lowest_prunable_index(observations: &[Observation], selected: &[usize]) -> Option<usize> {
+fn lowest_prunable_index(
+    observations: &[Observation],
+    selected: &[usize],
+    scores: &[i32],
+) -> Option<usize> {
     selected
         .iter()
         .copied()
         .filter(|idx| !is_hard_anchor(observations, *idx))
-        .map(|idx| {
-            (
-                observation_score(&observations[idx], idx, observations.len()),
-                idx,
-            )
-        })
+        .map(|idx| (scores[idx], idx))
         .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
         .map(|(_, idx)| idx)
 }
@@ -345,11 +392,19 @@ fn is_hard_anchor(observations: &[Observation], idx: usize) -> bool {
 
 fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
     let mut score = i32::from(obs.importance);
+    score += recency_score(idx, total);
     score += match obs.kind {
         ObservationKind::UserPrompt => 100,
         ObservationKind::SessionEnd => 95,
-        ObservationKind::Stop => 55,
         ObservationKind::PreCompact => 90,
+        ObservationKind::PostCompaction => 85,
+        // A non-empty Stop carries the opt-in assistant excerpt (#196) — a
+        // high-signal end-of-turn summary or late correction. Score it just
+        // below PreCompact (90), above PostCompaction (85), so it competes for a
+        // sampling slot without TYING any kind (ties resolve by position). An
+        // empty Stop (capture off, or gated out) keeps its low prior.
+        ObservationKind::Stop if !obs.body.trim().is_empty() => 88,
+        ObservationKind::Stop => 55,
         ObservationKind::PostToolUse => 30,
         ObservationKind::Notification => 25,
         ObservationKind::SessionStart => 20,
@@ -377,6 +432,13 @@ fn observation_score(obs: &Observation, idx: usize, total: usize) -> i32 {
         score -= 80;
     }
     score
+}
+
+fn recency_score(idx: usize, total: usize) -> i32 {
+    if total <= 1 {
+        return 0;
+    }
+    (idx.saturating_mul(MAX_RECENCY_SCORE as usize) / (total - 1)) as i32
 }
 
 fn has_high_signal_terms(obs: &Observation) -> bool {
@@ -528,6 +590,37 @@ mod tests {
     }
 
     #[test]
+    fn long_session_selection_prefers_later_corrections_without_losing_anchors_or_sampling() {
+        let mut observations: Vec<_> = (0..80)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "boring", 3))
+            .collect();
+        observations[78] = obs(
+            78,
+            ObservationKind::PostToolUse,
+            "final correction",
+            "tool_family: file\noutcome: unknown\n---\nfinal state supersedes earlier draft",
+            3,
+        );
+        observations[79] = obs(79, ObservationKind::SessionEnd, "session end", "done", 5);
+
+        let projected = project_observations(
+            &observations,
+            &ObservationProjectionConfig::new(20_000, 8, 200),
+        );
+
+        assert_eq!(projected.selected_indices.first().copied(), Some(0));
+        assert_eq!(projected.selected_indices.last().copied(), Some(79));
+        assert!(projected.selected_indices.contains(&78));
+        let even = even_sample_indices(observations.len());
+        assert!(
+            projected
+                .selected_indices
+                .iter()
+                .any(|idx| !is_hard_anchor(&observations, *idx) && even.contains(idx))
+        );
+    }
+
+    #[test]
     fn body_truncation_marker_includes_omitted_chars_and_id() {
         let observations = vec![obs(
             0,
@@ -600,5 +693,103 @@ mod tests {
         let projected = project_observations(&observations, &cfg);
         assert!(projected.text.chars().count() <= cfg.max_total_chars);
         assert!(projected.text.contains("observations omitted"));
+    }
+
+    /// Lock the base reviewer ordering for the opt-in Stop excerpt (#196):
+    /// a non-empty Stop scores below PreCompact (no tie — ties resolve by
+    /// position), above PostCompaction, well above an empty Stop, and below a
+    /// UserPrompt. Same idx/total/importance means only the kind term (and body
+    /// emptiness) differs; neutral text avoids high-signal and anchor bonuses.
+    #[test]
+    fn non_empty_stop_score_sits_below_precompact_above_postcompaction() {
+        let idx = 50;
+        let total = 100;
+        let imp = 5;
+        let mk = |kind, body| observation_score(&obs(idx, kind, "note", body, imp), idx, total);
+
+        let stop_full = mk(ObservationKind::Stop, "the assistant said hello");
+        let stop_empty = mk(ObservationKind::Stop, "");
+        let precompact = mk(ObservationKind::PreCompact, "the assistant said hello");
+        let postcompaction = mk(ObservationKind::PostCompaction, "the assistant said hello");
+        let user_prompt = mk(ObservationKind::UserPrompt, "the assistant said hello");
+
+        // Kind terms: Stop-nonempty 88, PreCompact 90, PostCompaction 85,
+        // Stop-empty 55, UserPrompt 100. Everything else cancels.
+        assert_eq!(stop_full, precompact - 2, "must sit just below PreCompact");
+        assert_eq!(
+            stop_full,
+            postcompaction + 3,
+            "must sit above PostCompaction"
+        );
+        assert_eq!(stop_full, stop_empty + 33, "non-empty must beat empty Stop");
+        assert!(
+            user_prompt > stop_full,
+            "the UserPrompt base priority must remain higher"
+        );
+    }
+
+    /// A late non-empty Stop (the opt-in assistant excerpt with a correction) is
+    /// selected out of a long routine session AND its text reaches the projection.
+    #[test]
+    fn non_empty_stop_late_correction_is_selected_and_rendered() {
+        let mut observations: Vec<_> = (0..60)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "x", 1))
+            .collect();
+        // The assistant's final turn retracts an earlier claim — the exact signal
+        // PR3 wants the reviewer to see. Kept within the excerpt window.
+        observations[40] = obs(
+            40,
+            ObservationKind::Stop,
+            "stop",
+            "CORRECTION_SENTINEL: the earlier fix was wrong; use config.rs instead",
+            6,
+        );
+        let cfg = ObservationProjectionConfig::new(20_000, 12, 2_000);
+        let projected = project_observations(&observations, &cfg);
+
+        assert!(
+            projected.selected_indices.contains(&40),
+            "non-empty Stop must win a sampling slot: {:?}",
+            projected.selected_indices
+        );
+        assert!(
+            projected.text.contains("CORRECTION_SENTINEL"),
+            "the correction must reach the reviewer projection"
+        );
+    }
+
+    /// A sampled multi-turn session retains representative prompts and
+    /// non-empty Stops together. This is not a claim that every prompt fits in
+    /// every bounded projection.
+    #[test]
+    fn sampled_session_retains_prompts_and_non_empty_stops() {
+        let mut observations: Vec<_> = (0..60)
+            .map(|idx| obs(idx, ObservationKind::PostToolUse, "routine", "x", 1))
+            .collect();
+        let prompts = [10, 25, 45];
+        let stops = [15, 30, 50];
+        for &i in &prompts {
+            observations[i] = obs(i, ObservationKind::UserPrompt, "prompt", "a request", 5);
+        }
+        for &i in &stops {
+            observations[i] = obs(i, ObservationKind::Stop, "stop", "assistant summary", 5);
+        }
+        let cfg = ObservationProjectionConfig::new(20_000, 12, 2_000);
+        let projected = project_observations(&observations, &cfg);
+
+        for i in prompts {
+            assert!(
+                projected.selected_indices.contains(&i),
+                "expected UserPrompt at {i} to be selected: {:?}",
+                projected.selected_indices
+            );
+        }
+        for i in stops {
+            assert!(
+                projected.selected_indices.contains(&i),
+                "non-empty Stop at {i} was not selected: {:?}",
+                projected.selected_indices
+            );
+        }
     }
 }

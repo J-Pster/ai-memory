@@ -68,6 +68,184 @@ pub struct NewPage {
     /// gets the pre-multi-user behaviour.
     #[serde(default)]
     pub author_id: Option<crate::UserId>,
+    /// TTL derived from the frontmatter `expires_at:` key (markdown is
+    /// the source of truth; the wiki layer parses and validates it).
+    /// `None` = never expires. Expired pages are hidden from
+    /// search/recent/briefing and hard-deleted by the retention sweep.
+    #[serde(default)]
+    pub expires_at: Option<Timestamp>,
+    /// Salient nouns for this page, from the frontmatter `entities:`
+    /// list the consolidator writes. Normalised by
+    /// [`normalize_entity`] before it reaches the store, which indexes
+    /// them as a retrieval stream (V38). Empty for hand-written pages
+    /// that don't declare any.
+    #[serde(default)]
+    pub entities: Vec<String>,
+    /// Evidence sources backing this write (P2,
+    /// docs/design-hindsight-borrowings.md §3): what produced or
+    /// reaffirmed this page version. The store inserts one
+    /// `page_evidence` row per entry, in the same transaction as the
+    /// page upsert (V63), `INSERT OR IGNORE` so re-citing the same
+    /// source is a no-op. Empty for hand-written pages and every
+    /// pre-2.2 caller — inert data this release, not fed into ranking
+    /// or [`crate::PageAuthority`].
+    #[serde(default)]
+    pub evidence: Vec<PageEvidence>,
+}
+
+/// One piece of evidence supporting a page write (P2,
+/// docs/design-hindsight-borrowings.md §3). Additive substrate only this
+/// release: recorded and surfaced via `SearchExplain::evidence_count`,
+/// never consulted by ranking.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageEvidence {
+    /// What kind of source this is.
+    pub kind: PageEvidenceKind,
+    /// The source's own identifier (a session id, observation id,
+    /// feedback row id, or reconsolidation run id) — opaque to the
+    /// store, unique within `kind` for this page.
+    pub source_id: String,
+}
+
+/// The closed vocabulary of evidence sources a page write can cite.
+/// Matches the `page_evidence.source_kind` CHECK constraint (V63).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEvidenceKind {
+    /// A consolidated session that produced or touched this page.
+    Session,
+    /// A raw observation cited directly (bypassing session-grain
+    /// consolidation).
+    Observation,
+    /// User/agent feedback that reaffirmed the page.
+    Feedback,
+    /// A reconsolidation pass that rewrote or re-confirmed the page.
+    Reconsolidation,
+}
+
+impl PageEvidenceKind {
+    /// Canonical short string for storage. Matches the
+    /// `page_evidence.source_kind` CHECK constraint (V63).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Observation => "observation",
+            Self::Feedback => "feedback",
+            Self::Reconsolidation => "reconsolidation",
+        }
+    }
+}
+
+impl FromStr for PageEvidenceKind {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "session" => Ok(Self::Session),
+            "observation" => Ok(Self::Observation),
+            "feedback" => Ok(Self::Feedback),
+            "reconsolidation" => Ok(Self::Reconsolidation),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown page evidence kind: {other}"
+            ))),
+        }
+    }
+}
+
+/// Longest accepted entity name; longer values are rejected rather than
+/// truncated (a 100-char "entity" is a sentence, not a noun).
+pub const MAX_ENTITY_LEN: usize = 64;
+/// Cap on entities indexed per page. Beyond this the list stops being a
+/// salience signal and starts being a second copy of the body.
+pub const MAX_ENTITIES_PER_PAGE: usize = 10;
+
+/// Normalise one entity name for storage and matching: trim, collapse
+/// internal whitespace, lowercase. Returns `None` when the result is
+/// empty, contains control characters, or is longer than
+/// [`MAX_ENTITY_LEN`]. Processing stops as soon as the input crosses the
+/// bound, so an oversized untrusted value cannot cause a proportional
+/// allocation.
+///
+/// Lowercasing is what makes query-time matching lexical rather than a
+/// second LLM call: `Postgres`, `postgres`, and `POSTGRES` all index and
+/// match as one entity.
+#[must_use]
+pub fn normalize_entity(raw: &str) -> Option<String> {
+    let mut collapsed = String::new();
+    let mut chars = 0;
+    for word in raw.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+            chars += 1;
+        }
+        for ch in word.chars() {
+            if ch.is_control() {
+                return None;
+            }
+            chars += 1;
+            if chars > MAX_ENTITY_LEN {
+                return None;
+            }
+            collapsed.push(ch);
+        }
+    }
+    let normalized = collapsed.to_lowercase();
+    if normalized.is_empty() || normalized.chars().count() > MAX_ENTITY_LEN {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Normalise a whole entity list: drop invalid entries, de-duplicate
+/// while preserving order, and cap at [`MAX_ENTITIES_PER_PAGE`].
+#[must_use]
+pub fn normalize_entities<I, S>(raw: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in raw {
+        let Some(name) = normalize_entity(item.as_ref()) else {
+            continue;
+        };
+        if seen.insert(name.clone()) {
+            out.push(name);
+            if out.len() >= MAX_ENTITIES_PER_PAGE {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Derive a page's indexed entity names from its frontmatter: the
+/// explicit `entities` list an LLM consolidator may emit, plus the
+/// `tags` list nearly every page carries. Both are arrays of strings
+/// meaning "what this page is about"; merging them populates the entity
+/// retrieval stream and `as_of` timelines deterministically, without
+/// depending on an LLM pass that a mature store's pages never received.
+///
+/// Explicit entities come first so they win the per-page cap. Lenient by
+/// design — a missing or non-array field simply contributes nothing, so
+/// this never fails on hand-edited frontmatter; the strict structural
+/// check for the write path lives in the wiki layer.
+#[must_use]
+pub fn frontmatter_entity_names(frontmatter: &serde_json::Value) -> Vec<String> {
+    fn strings(frontmatter: &serde_json::Value, key: &str) -> Vec<String> {
+        frontmatter
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    }
+    let mut merged = strings(frontmatter, "entities");
+    merged.extend(strings(frontmatter, "tags"));
+    normalize_entities(merged)
 }
 
 /// A link target discovered in a page body.
@@ -86,6 +264,50 @@ pub struct LinkTarget {
     pub project: Option<String>,
     /// Wiki path within the target project (root-relative).
     pub path: PagePath,
+    /// Typed relation carried by this edge; `None` = a plain reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<Relation>,
+}
+
+/// The closed typed-edge vocabulary (2.0 item 3). Declared in a page's
+/// `relations:` frontmatter; anything outside this set stays a plain
+/// reference. Closed on purpose: a free-text relation column becomes an
+/// unqueryable folksonomy, and `contradicts` feeds the lint pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Relation {
+    /// The source page describes a cause of the target.
+    Causes,
+    /// The source page fixes the problem the target describes.
+    Fixes,
+    /// The source page contradicts the target (lint surfaces these).
+    Contradicts,
+}
+
+impl Relation {
+    /// Stored `links.link_type` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Causes => "causes",
+            Self::Fixes => "fixes",
+            Self::Contradicts => "contradicts",
+        }
+    }
+
+    /// Parse a frontmatter `relations:` key. Unknown names → `None`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "causes" => Some(Self::Causes),
+            "fixes" => Some(Self::Fixes),
+            "contradicts" => Some(Self::Contradicts),
+            _ => None,
+        }
+    }
+
+    /// Every relation, for schema/docs enumeration.
+    pub const ALL: [Self; 3] = [Self::Causes, Self::Fixes, Self::Contradicts];
 }
 
 impl LinkTarget {
@@ -96,6 +318,7 @@ impl LinkTarget {
             workspace: None,
             project: None,
             path,
+            relation: None,
         }
     }
 
@@ -143,6 +366,8 @@ pub struct Page {
     pub created_at: Timestamp,
     /// Wall-clock last-update time of *this version*.
     pub updated_at: Timestamp,
+    /// TTL instant, if the page carries a frontmatter `expires_at:`.
+    pub expires_at: Option<Timestamp>,
 }
 
 impl Tier {
@@ -154,6 +379,66 @@ impl Tier {
             Self::Episodic => "episodic",
             Self::Semantic => "semantic",
             Self::Procedural => "procedural",
+        }
+    }
+}
+
+/// An explicit judgement on how useful a recalled page was.
+///
+/// The M8 decay formula's only reinforcement signal is the access
+/// counter every search hit bumps, which cannot distinguish "this page
+/// answered the question" from "this page surfaced and wasted a read".
+/// These four signals close that gap: `Helpful` / `NotHelpful` nudge the
+/// page's salience (bounded, see the store's feedback op), while `Stale`
+/// / `Wrong` additionally route the page into the next `memory_lint`
+/// report rather than deleting anything — an agent's judgement lowers
+/// confidence, it does not destroy memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(extend("type" = "string"))]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    /// The page answered the question it surfaced for.
+    Helpful,
+    /// The page surfaced but did not help.
+    NotHelpful,
+    /// The content is outdated — the page needs a refresh.
+    Stale,
+    /// The content is factually wrong, not merely dated.
+    Wrong,
+}
+
+impl FeedbackKind {
+    /// Canonical short string for storage and serialisation. Matches the
+    /// `page_feedback.kind` CHECK constraint (V37).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Helpful => "helpful",
+            Self::NotHelpful => "not_helpful",
+            Self::Stale => "stale",
+            Self::Wrong => "wrong",
+        }
+    }
+
+    /// Whether this signal should surface as a `memory_lint` finding.
+    #[must_use]
+    pub const fn routes_to_lint(&self) -> bool {
+        matches!(self, Self::Stale | Self::Wrong)
+    }
+}
+
+impl FromStr for FeedbackKind {
+    type Err = crate::MemoryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "helpful" => Ok(Self::Helpful),
+            "not_helpful" => Ok(Self::NotHelpful),
+            "stale" => Ok(Self::Stale),
+            "wrong" => Ok(Self::Wrong),
+            other => Err(crate::MemoryError::MalformedRecord(format!(
+                "unknown feedback kind: {other} (want helpful|not_helpful|stale|wrong)"
+            ))),
         }
     }
 }
@@ -200,6 +485,92 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Tier::Procedural).unwrap(),
             "\"procedural\""
+        );
+    }
+
+    #[test]
+    fn feedback_kind_round_trips_and_flags_lint_routing() {
+        for k in [
+            FeedbackKind::Helpful,
+            FeedbackKind::NotHelpful,
+            FeedbackKind::Stale,
+            FeedbackKind::Wrong,
+        ] {
+            assert_eq!(k.as_str().parse::<FeedbackKind>().unwrap(), k);
+        }
+        assert!("nope".parse::<FeedbackKind>().is_err());
+        assert!(!FeedbackKind::Helpful.routes_to_lint());
+        assert!(!FeedbackKind::NotHelpful.routes_to_lint());
+        assert!(FeedbackKind::Stale.routes_to_lint());
+        assert!(FeedbackKind::Wrong.routes_to_lint());
+    }
+
+    #[test]
+    fn normalize_entity_lowercases_trims_and_collapses() {
+        assert_eq!(
+            normalize_entity("  Postgres  ").as_deref(),
+            Some("postgres")
+        );
+        assert_eq!(
+            normalize_entity("Writer\n\tActor").as_deref(),
+            Some("writer actor")
+        );
+        assert_eq!(normalize_entity("   ").as_deref(), None);
+        assert_eq!(normalize_entity("").as_deref(), None);
+        assert_eq!(
+            normalize_entity(&"x".repeat(MAX_ENTITY_LEN)).as_deref(),
+            Some("x".repeat(MAX_ENTITY_LEN).as_str()),
+        );
+        assert_eq!(normalize_entity(&"x".repeat(MAX_ENTITY_LEN + 1)), None);
+        assert_eq!(normalize_entity("writer\0actor"), None);
+        assert_eq!(normalize_entity(&"x".repeat(1_000_000)), None);
+    }
+
+    #[test]
+    fn normalize_entities_dedupes_preserves_order_and_caps() {
+        assert_eq!(
+            normalize_entities(["SQLite", "sqlite", " FTS5 ", ""]),
+            vec!["sqlite".to_string(), "fts5".to_string()],
+        );
+        let many: Vec<String> = (0..MAX_ENTITIES_PER_PAGE + 5)
+            .map(|i| format!("entity{i}"))
+            .collect();
+        assert_eq!(normalize_entities(&many).len(), MAX_ENTITIES_PER_PAGE);
+    }
+
+    #[test]
+    fn page_evidence_kind_round_trips() {
+        for k in [
+            PageEvidenceKind::Session,
+            PageEvidenceKind::Observation,
+            PageEvidenceKind::Feedback,
+            PageEvidenceKind::Reconsolidation,
+        ] {
+            assert_eq!(k.as_str().parse::<PageEvidenceKind>().unwrap(), k);
+        }
+        assert!("nope".parse::<PageEvidenceKind>().is_err());
+    }
+
+    #[test]
+    fn frontmatter_entity_names_merges_entities_and_tags_leniently() {
+        // Explicit entities first (they win the cap), then tags; dupes drop.
+        assert_eq!(
+            frontmatter_entity_names(&serde_json::json!({
+                "entities": ["FTS5"],
+                "tags": ["fts5", "Search"],
+            })),
+            vec!["fts5".to_string(), "search".to_string()],
+        );
+        // Tags alone are enough — the common case on a mature store.
+        assert_eq!(
+            frontmatter_entity_names(&serde_json::json!({"tags": ["Storage"]})),
+            vec!["storage".to_string()],
+        );
+        // Missing or malformed fields contribute nothing, never panic.
+        assert!(frontmatter_entity_names(&serde_json::json!({})).is_empty());
+        assert!(
+            frontmatter_entity_names(&serde_json::json!({"tags": "not-a-list", "entities": 7}))
+                .is_empty(),
         );
     }
 }

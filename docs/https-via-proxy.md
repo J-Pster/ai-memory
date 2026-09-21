@@ -24,16 +24,21 @@ this case. Most ai-memory installs never need a proxy.
 Add a TLS-terminating proxy in front of ai-memory when any of these
 apply:
 
-- **Multi-user mode is on** (`[auth].token_pepper` set, users created via `ai-memory user add`). Per-user tokens travel between clients and the server — sniffable over plain HTTP on the LAN. See [`docs/users.md`](users.md).
+- **Multi-user mode is on** (at least one user row exists; `[auth].token_pepper`
+  is the credential prerequisite). Native `aim_` keys travel between clients and
+  the server — sniffable over plain HTTP on the LAN. See
+  [`docs/users.md`](users.md).
 - **The server is bound beyond loopback** (`AI_MEMORY_BIND=0.0.0.0:49374` or a LAN-routable IP). Anyone on the network segment sees plaintext token traffic and `/web` cookies.
-- **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after Basic auth lives in the clear over HTTP.
+- **You access `/web` from a different machine** than the one running ai-memory. The browser session cookie set after password login lives in the clear over HTTP.
 - **You're exposing ai-memory beyond the LAN.** Cloudflare Tunnel or a public-domain Caddy with Let's Encrypt are the two patterns most homelab operators land on.
 
-ai-memory will warn at startup when it binds to a non-loopback address
-without auth, and again (one-shot) on the first request that didn't
-arrive via `X-Forwarded-Proto: https`. The warnings are advisory —
-the server doesn't refuse to start over plain HTTP. The decision to
-add TLS is yours; this page is the recipes.
+ai-memory refuses unauthenticated non-loopback HTTP by default. Machine-only
+Bearer deployments may still bind authenticated plain HTTP and receive a loud
+warning because those credentials remain sniffable. Human authentication is
+stricter: a non-loopback listener refuses startup unless
+`AI_MEMORY_AUTH__SECURE_COOKIE=true`, which is the operator's explicit signal
+that a trusted HTTPS proxy owns the browser-facing edge. Non-Secure human
+cookies are supported only on an actual loopback listener.
 
 ## Pick a path
 
@@ -119,6 +124,7 @@ Caddy will:
 
 ```bash
 AI_MEMORY_AUTH_TOKEN=...long-random-token-from-generate-auth-token...
+AI_MEMORY_AUTH__SECURE_COOKIE=true
 AI_MEMORY_ALLOWED_HOSTS=memory.example.com,localhost,127.0.0.1
 AI_MEMORY_BIND=0.0.0.0:49374
 ```
@@ -155,9 +161,11 @@ ai-memory install-hooks --agent  claude-code --apply \
     --server-url "https://memory.example.com/wiki" --auth-token "$AI_MEMORY_AUTH_TOKEN"
 ```
 
-The built-in browser is then at `https://memory.example.com/wiki/web`; add
-`AI_MEMORY_WEB_SLUG=/` if you want the browser or custom `--web-ui-dir` SPA at
-`https://memory.example.com/wiki` itself.
+The web surface is then at `https://memory.example.com/wiki/web`; add
+`AI_MEMORY_WEB_SLUG=/` if you want the built-in browser or custom
+`--web-ui-dir` SPA at `https://memory.example.com/wiki` itself. Human console
+login requires the custom SPA; the built-in server-rendered wiki remains
+protected data rather than an authentication page.
 
 **Safety rules on both flags.** `AI_MEMORY_BASE_PATH` and
 `AI_MEMORY_WEB_SLUG` go through the same normaliser. Segments must be
@@ -302,6 +310,7 @@ step above (Cloudflare manages the CNAME automatically).
 
 ```bash
 AI_MEMORY_AUTH_TOKEN=...long-random-token...
+AI_MEMORY_AUTH__SECURE_COOKIE=true
 AI_MEMORY_ALLOWED_HOSTS=memory.example.com,localhost,127.0.0.1
 AI_MEMORY_BIND=0.0.0.0:49374
 CLOUDFLARE_TUNNEL_TOKEN=eyJ...long-base64-from-the-cf-dashboard...
@@ -405,17 +414,65 @@ LaunchDaemon on macOS. Same shape as the Docker variant.
 
 ---
 
+## Long-running requests: `bootstrap` and proxy idle timeouts
+
+`ai-memory bootstrap` on a large repository holds a **single POST open for
+the whole multi-chunk run** — often 20+ minutes — while the server makes
+LLM calls, with no bytes flowing over the wire in between. A reverse proxy
+with a default idle/read timeout in front of the server will cut that
+connection (`Connection reset by peer`), and the run is lost.
+
+If you run `bootstrap` through a proxy, raise or disable the upstream
+read/write timeout for ai-memory's route.
+
+**Caddy** — disable the backend read/write timeouts on the `reverse_proxy`:
+
+```caddyfile
+memory.example.com {
+    reverse_proxy ai-memory:49374 {
+        transport http {
+            read_timeout 0
+            write_timeout 0
+        }
+    }
+}
+```
+
+**nginx** — raise `proxy_read_timeout` / `proxy_send_timeout` (default 60s)
+well past your longest run:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:49374;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    # plus the http/1.1 + Connection "" lines from the nginx template above
+}
+```
+
+This only matters for the long-held `bootstrap` POST; ordinary MCP and
+`/api/v1` requests are short and unaffected. (A genuinely failed chunk still
+loses the run today — the durable-progress/`--resume` question is tracked
+separately; see #614.)
+
+---
+
 ## What ai-memory does to support being behind a proxy
 
 Nothing special — the server intentionally generates no absolute URLs
 in responses, so it doesn't matter whether `https://` or `http://`
 sits in front. The bearer token middleware reads `Authorization`
 directly off the request, which proxies forward verbatim. The
-`/api/v1` ETag is computed from request-independent fields. The
-`/web` cookie set after Basic auth uses `SameSite=Lax` without
-`Secure`, which lets it ride either transport — when fronted with
-HTTPS, modern browsers automatically tighten the cookie to the proxy
-origin's secure flag set anyway.
+`/api/v1` ETag is computed from request-independent fields.
+
+For browser access to `/web` through HTTPS, set
+`AI_MEMORY_AUTH__SECURE_COOKIE=true` (or `[auth] secure_cookie = true`). This
+marks the `ai_memory_session` cookie `Secure`; it is always `HttpOnly`,
+`SameSite=Strict`, and `Path=/`. ai-memory intentionally does **not** infer
+HTTPS from `X-Forwarded-Proto` or any other proxy header. Close direct HTTP
+access to the public hostname, or redirect it to HTTPS. Human auth on a
+non-loopback listener will not start without this setting. It remains false by
+default only so direct loopback smoke/development can use plain HTTP.
 
 The only thing to mind: **`AI_MEMORY_ALLOWED_HOSTS` must include the
 public hostname**, not just `localhost`. The host-allowlist middleware
@@ -435,3 +492,16 @@ If you can't take one of these paths cleanly, the honest answer is
 already trust." The configuration that gives operators the wrong
 mental model — looking secure, not being secure — is worse than
 either.
+
+## The session-aware MCP bridge and HTTPS
+
+`ai-memory mcp-bridge` reaches `https://` server URLs. Earlier releases could not:
+its transport pulled in a second `reqwest` with no TLS backend compiled, so any
+non-`http` scheme was refused before a connection was attempted. If you front
+ai-memory with a TLS-terminating proxy as described above, point the bridge at the
+proxied `https://` URL directly — a second, local proxy on each client machine is
+not needed.
+
+The bridge uses the platform certificate verifier, so it trusts the same roots the
+operating system does. A certificate the OS does not trust — a self-signed one, or a
+private CA that has not been installed into the system trust store — is rejected.

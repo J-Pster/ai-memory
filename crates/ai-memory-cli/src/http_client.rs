@@ -7,18 +7,88 @@
 //! ## Configuration
 //!
 //! [`crate::config::Config`] captures `AI_MEMORY_SERVER_URL` and
-//! `AI_MEMORY_AUTH_TOKEN` exactly once; this module only consumes the
-//! resolved values.
+//! `AI_MEMORY_AUTH_TOKEN` exactly once; this module consumes those values
+//! and can fall back to the stored OIDC device-flow token used by native hooks.
 
+use std::fmt;
 use std::io::{BufWriter, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::commands::serve::normalize_prefix;
 use crate::config::{Config, DEFAULT_SERVER_URL};
+use ai_memory_web::normalize_prefix;
+
+/// Non-success response returned by the configured ai-memory server.
+#[derive(Debug)]
+pub(crate) struct ServerResponseError {
+    method: reqwest::Method,
+    path: String,
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl ServerResponseError {
+    #[must_use]
+    pub(crate) const fn status(&self) -> reqwest::StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+impl fmt::Display for ServerResponseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {}: server returned {}: {}",
+            self.method, self.path, self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for ServerResponseError {}
+
+fn server_response_error(
+    method: reqwest::Method,
+    url: &reqwest::Url,
+    status: reqwest::StatusCode,
+    body: String,
+) -> anyhow::Error {
+    ServerResponseError {
+        method,
+        path: url.path().to_owned(),
+        status,
+        body,
+    }
+    .into()
+}
+
+/// Pass a 2xx response through, else consume the body into a
+/// [`ServerResponseError`].
+///
+/// Only the request path reaches the error, so userinfo and query
+/// credentials in the URL never land in a message. `reqwest` does not carry
+/// the request method on the response, so callers supply it.
+async fn require_success(
+    method: reqwest::Method,
+    resp: reqwest::Response,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let url = resp.url().clone();
+    let body = resp.text().await.unwrap_or_default();
+    Err(server_response_error(method, &url, status, body))
+}
 
 /// Resolved server target — origin URL + base-path prefix + optional bearer token.
 #[derive(Debug, Clone)]
@@ -36,9 +106,12 @@ pub struct ServerEndpoint {
 }
 
 impl ServerEndpoint {
-    /// Build the endpoint from the already-loaded process config.
+    /// Build the endpoint from config, resolving bearer auth and base path.
     ///
-    /// The base-path prefix the server is mounted under (so client routes
+    /// Bearer precedence matches hooks: static config/env token first, stored
+    /// OIDC device token second, no token last.
+    ///
+    /// The base-path prefix the server is mounted under, so client routes
     /// resolve as `<origin><base><path>` instead of 404ing) is resolved
     /// from, in order of precedence:
     /// 1. the **path component of `AI_MEMORY_SERVER_URL`** (the remote-client
@@ -49,11 +122,17 @@ impl ServerEndpoint {
     ///    "one config-read path" invariant; the CLI runs in the same
     ///    container as `serve`, which already reads the same env var via
     ///    clap to nest its router).
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
+    pub async fn from_config_resolving_auth(config: &Config) -> Self {
+        let client = reqwest::Client::new();
+        let token = crate::auth_bearer::resolve_bearer(
+            &client,
+            &config.oidc_device_token_path(),
+            config.auth.bearer_token.as_deref(),
+        )
+        .await;
         Self::build(
             Some(config.server_url.clone()),
-            config.auth.bearer_token.clone(),
+            token,
             config.server_url_configured(),
             Some(config.base_path.clone()).filter(|s| !s.is_empty()),
         )
@@ -119,6 +198,21 @@ impl ServerEndpoint {
         format!("{}{}{path}", self.url, self.base_path)
     }
 
+    /// Stable, credential-free identity for client-local state tied to this
+    /// server. The normalized mount path is part of the identity; bearer
+    /// material deliberately is not.
+    pub(crate) fn identity(&self) -> String {
+        let raw = format!("{}{}", self.url.trim_end_matches('/'), self.base_path);
+        let Ok(mut parsed) = reqwest::Url::parse(&raw) else {
+            return "<invalid-server-url>".to_owned();
+        };
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        parsed.set_query(None);
+        parsed.set_fragment(None);
+        parsed.as_str().trim_end_matches('/').to_owned()
+    }
+
     /// Apply auth header to a `reqwest::RequestBuilder` if a token is set.
     pub(crate) fn authenticate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth_token {
@@ -169,14 +263,32 @@ pub async fn get_json<T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
-    }
+    let resp = require_success(reqwest::Method::GET, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from GET {url}"))
+}
+
+/// PATCH JSON body to `<endpoint>{path}`, deserialise JSON response.
+///
+/// # Errors
+/// Same as [`get_json`].
+pub async fn patch_json<B: Serialize, T: DeserializeOwned>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+) -> Result<T> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.patch(&url).json(body));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    let resp = require_success(reqwest::Method::PATCH, resp).await?;
+    resp.json::<T>()
+        .await
+        .with_context(|| format!("parsing JSON body from PATCH {url}"))
 }
 
 /// POST JSON body to `<endpoint>{path}`, deserialise JSON response.
@@ -189,6 +301,36 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
     body: &B,
 ) -> Result<T> {
     post_json_with_query(endpoint, path, &[], body).await
+}
+
+/// POST JSON and require a successful response without decoding its body.
+pub async fn post_json_no_content<B: Serialize>(
+    endpoint: &ServerEndpoint,
+    path: &str,
+    body: &B,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.post(&url).json(body));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    require_success(reqwest::Method::POST, resp).await?;
+    Ok(())
+}
+
+/// POST an empty body and require a successful response.
+pub async fn post_empty(endpoint: &ServerEndpoint, path: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let url = endpoint.build_url(path);
+    let req = endpoint.authenticate(client.post(&url));
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| augment_connect_error(e, endpoint, &url))?;
+    require_success(reqwest::Method::POST, resp).await?;
+    Ok(())
 }
 
 /// POST JSON body to `<endpoint>{path}` with URL-encoded query params.
@@ -209,11 +351,7 @@ pub async fn post_json_with_query<B: Serialize, T: DeserializeOwned>(
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
-    }
+    let resp = require_success(reqwest::Method::POST, resp).await?;
     resp.json::<T>()
         .await
         .with_context(|| format!("parsing JSON body from POST {url}"))
@@ -295,16 +433,12 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     let client = reqwest::Client::new();
     let url = endpoint.build_url(path);
     let req = endpoint.authenticate(client.post(&url));
-    let mut resp = req
+    let resp = req
         .send()
         .await
         .map_err(|e| augment_connect_error(e, endpoint, &url))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("server returned {status}: {body}");
-    }
-    let file = std::fs::File::create(dest)
+    let mut resp = require_success(reqwest::Method::POST, resp).await?;
+    let file = private_output_file(dest)
         .with_context(|| format!("creating output file {}", dest.display()))?;
     let mut writer = BufWriter::new(file);
     let mut written = 0_u64;
@@ -324,9 +458,62 @@ pub async fn post_to_file(endpoint: &ServerEndpoint, path: &str, dest: &Path) ->
     Ok(written)
 }
 
+/// Open a downloaded backup output file with private permissions before the
+/// first response bytes are written. Existing user-selected output files keep
+/// their existing permissions when overwritten.
+fn private_output_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_backup_output_is_private_when_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("backup.tar.gz");
+        private_output_file(&output).unwrap();
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn response_errors_include_method_and_credential_free_path() {
+        let url = reqwest::Url::parse(
+            "https://username:password@example.test/workstream/runs?access_token=secret",
+        )
+        .expect("test URL parses");
+        let error = server_response_error(
+            reqwest::Method::POST,
+            &url,
+            reqwest::StatusCode::NOT_FOUND,
+            "missing".to_owned(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "POST /workstream/runs: server returned 404 Not Found: missing"
+        );
+        let structured = error
+            .downcast_ref::<ServerResponseError>()
+            .expect("response errors retain their structured type");
+        assert_eq!(structured.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(structured.body(), "missing");
+        assert!(!error.to_string().contains("username"));
+        assert!(!error.to_string().contains("password"));
+        assert!(!error.to_string().contains("access_token"));
+        assert!(!error.to_string().contains("secret"));
+    }
 
     // ----------------------------------------------------------------
     // ServerEndpoint::from_pair
@@ -367,6 +554,22 @@ mod tests {
     fn from_pair_non_empty_token_preserved() {
         let ep = ServerEndpoint::from_pair(None, Some("secret".to_string()));
         assert_eq!(ep.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn client_state_identity_normalizes_mounts_and_never_contains_credentials() {
+        let first = ServerEndpoint::from_pair(
+            Some("http://alice:secret@MEMORY.example:49374/wiki/".to_owned()),
+            None,
+        );
+        let second = ServerEndpoint::from_pair(
+            Some("http://memory.example:49374/wiki".to_owned()),
+            Some("bearer-secret".to_owned()),
+        );
+
+        assert_eq!(first.identity(), second.identity());
+        assert!(!first.identity().contains("alice"));
+        assert!(!first.identity().contains("secret"));
     }
 
     // ----------------------------------------------------------------
@@ -563,5 +766,42 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer tok123");
+    }
+
+    #[tokio::test]
+    async fn from_config_resolving_auth_uses_stored_oidc_for_authorization_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.auth.bearer_token = None;
+        ai_memory_llm::OidcToken {
+            access: secrecy::SecretString::from("oidc-access".to_string()),
+            refresh: secrecy::SecretString::from("refresh-token".to_string()),
+            expires_at_ms: u64::MAX,
+            extra: ai_memory_llm::OidcExtras {
+                issuer: "https://issuer.example.com/realms/team".to_string(),
+                client_id: "ai-memory-cli".to_string(),
+                token_endpoint: "https://issuer.example.com/token".to_string(),
+            },
+        }
+        .save(&config.oidc_device_token_path())
+        .expect("save test OIDC token");
+
+        let ep = ServerEndpoint::from_config_resolving_auth(&config).await;
+        let client = reqwest::Client::new();
+        let req = ep
+            .authenticate(client.get("http://localhost"))
+            .build()
+            .unwrap();
+        let auth = req
+            .headers()
+            .get("authorization")
+            .expect("Authorization header must be set")
+            .to_str()
+            .unwrap();
+
+        assert_eq!(auth, "Bearer oidc-access");
     }
 }

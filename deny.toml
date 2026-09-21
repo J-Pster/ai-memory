@@ -3,7 +3,11 @@
 # and pin to the official crates.io registry.
 
 [graph]
-all-features = false
+# CI runs cargo-deny with --all-features (see .github/workflows/ci.yml), so build
+# the same graph here. This keeps the documented local gate `cargo deny check`
+# (AGENTS.md, CONTRIBUTING.md) checking the exact feature set CI enforces, instead
+# of the narrower default-features graph.
+all-features = true
 no-default-features = false
 
 [output]
@@ -12,11 +16,11 @@ feature-depth = 1
 [advisories]
 version = 2
 ignore = [
-    # syntect transitively pulls these unmaintained crates. They are not
-    # network-facing in ai-memory's usage and there is no safe upstream upgrade
-    # path yet; keep cargo-deny useful for actionable advisories.
-    "RUSTSEC-2025-0141", # bincode 1.3.3 unmaintained
-    "RUSTSEC-2024-0320", # yaml-rust 0.4.5 unmaintained
+    # RUSTSEC-2024-0436: `paste` is unmaintained. Compile-time
+    # proc-macro helper pulled by the candle ML stack (local
+    # embeddings); no runtime code ships from it. Revisit when candle
+    # replaces it upstream.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

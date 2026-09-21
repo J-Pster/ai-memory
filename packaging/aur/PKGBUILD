@@ -1,5 +1,18 @@
 # Maintainer: AkitaOnRails <boss@akitaonrails.com>
 
+# NOTE: pkgver/pkgrel and the sha256sums below are PLACEHOLDERS.
+# `.github/workflows/release.yml` copies this file at publish time and
+# rewrites all of them from the release tag before pushing to the AUR:
+#
+#     sed -i -e "s/^pkgver=.*/pkgver=${version}/" \
+#            -e "s/^pkgrel=.*/pkgrel=1/" ...
+#
+# So the value here never reaches a user, and bumping it by hand fixes
+# nothing while going stale again at the next release. Check the published
+# package instead:
+#
+#     curl -s 'https://aur.archlinux.org/rpc/v5/info?arg[]=ai-memory'
+#
 pkgname=ai-memory
 pkgver=0.3.2
 pkgrel=1
@@ -14,7 +27,7 @@ optdepends=(
 )
 backup=('etc/ai-memory/config.toml' 'etc/ai-memory/env')
 install=ai-memory.install
-options=('!debug')
+options=('!debug' '!lto')
 conflicts=('ai-memory-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -38,6 +51,10 @@ check() {
     export RUSTUP_TOOLCHAIN=1.95
     export CARGO_TARGET_DIR=target
     export TAILWIND_SKIP=1
+    # Pin CARGO_HOME to the real registry (populated by build()) before the
+    # HOME override below points cargo at an empty ~/.cargo, or --frozen fails
+    # to resolve the vendored registry it already downloaded.
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
     export HOME="$srcdir/test-home"
     mkdir -p "$HOME"
     cargo test --frozen --release -p ai-memory-cli --bin ai-memory

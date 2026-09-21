@@ -7,8 +7,14 @@
 //! - `POST /admin/import-normalize`, LLM first-pass normalization of
 //!   imported pages (classify kind/tier, repair mojibake) via supersession.
 //! - `POST /admin/auto-improve`   — review one session and apply or stage proposals.
+//! - `POST /admin/auto-improve/report` — read-only auto-improve telemetry report.
 //! - `POST /admin/curator`        — dry-run or stage a rule-based curator report.
 //! - `GET  /admin/status`         — lifetime counts + server data-dir info.
+//! - `GET  /admin/projects`       — authoritative `(workspace, project)` list.
+//! - `GET  /admin/open-sessions`  — open (not yet ended) sessions for one scope + agent.
+//! - `GET  /admin/sessions/by-agent` — session counts per agent CLI for one scope.
+//! - `GET  /admin/activity/by-client` — MCP tool-call counts per client (server-wide).
+//! - `GET  /admin/audit-log`      — paginated read of the append-only `audit_log`.
 //! - `GET  /admin/search?q=`      — FTS5 hits against the wiki index.
 //! - `POST /admin/reorg`          — retro-fit sessions to per-cwd projects.
 //! - `POST /admin/lint`           — run the M8 lint pass.
@@ -17,8 +23,16 @@
 //! - `POST /admin/commit`         — stage + commit the wiki tree via git.
 //! - `GET  /admin/checkpoints`    — list recent wiki git checkpoints.
 //! - `POST /admin/restore-page`   — restore one page from a checkpoint.
-//! - `POST /admin/purge-project`  — delete a project and all its data.
+//! - `POST /admin/purge-project`  — delete a project's rows and wiki files
+//!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
+//! - `POST /admin/purge-session`  — delete one session and what it derived.
 //! - `POST /admin/rename-project` — rename a project (column-only; no files move).
+//! - `POST /admin/rename-workspace` — rename a workspace and refresh scope manifests.
+//! - `POST /admin/compact`        — reclaim free pages; deletes nothing.
+//! - `POST /admin/delete-workspace` — delete a workspace and its projects
+//!   (logical unless `compact` is set; see `ai_memory_store::Compaction`).
+//! - `POST /admin/merge-workspace` — fold every project of one workspace into
+//!   another, then delete the emptied source workspace.
 //! - `POST /admin/move-project`   — move a project into another workspace
 //!   (copy latest pages via the write path, then purge the source).
 //! - `POST /admin/write-page`     — write or update a wiki page atomically.
@@ -33,27 +47,35 @@
 
 use std::sync::Arc;
 
+use std::future::Future;
 use std::io::Seek;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 use ai_memory_consolidate::{
-    AutoImproveReviewConfig, Bootstrap, BootstrapConfig, BootstrapOutcome, BootstrapSource,
-    CuratorParams, CuratorReport, RehomePage, SourceCounts, build_rehome_plan,
-    prune_sources_to_budget, render_curator_report_markdown, rewrite_links,
-    run_auto_improve_review, run_curator_report, run_lint, run_sweep,
+    AutoImproveReviewConfig, AutoImproveTelemetryParams, AutoImproveTelemetryReport, Bootstrap,
+    BootstrapConfig, BootstrapOutcome, BootstrapSource, CuratorParams, CuratorReport,
+    EmbedBackfillCounts, EmbedBackfillOptions, ObservationRetention, RehomePage, SourceCounts,
+    build_rehome_plan, prune_sources_to_budget, render_auto_improve_telemetry_report_markdown,
+    render_curator_report_markdown, rewrite_links, run_auto_improve_review,
+    run_auto_improve_telemetry_report, run_curator_report_with_breadth, run_embedding_backfill,
+    run_lint, run_sweep_with_options,
 };
 use ai_memory_core::{
-    ActiveProject, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME, DEFAULT_WORKSPACE_NAME,
-    PagePath, ProjectId, SessionId, Tier, WorkspaceId,
+    ActiveProject, AgentKind, AutoImproveProposalId, Capability, DEFAULT_PROJECT_NAME,
+    DEFAULT_WORKSPACE_NAME, PagePath, ProjectId, SessionId, Tier, WorkspaceId,
 };
 use ai_memory_llm::{Embedder, LlmProvider, ProviderHealth, ProviderHealthSnapshot};
 use ai_memory_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, AutoImproveProposalStatus,
-    DecayParams, EmbeddingWrite, NewAutoImproveProposal, ReaderPool, RejectAutoImproveProposal,
-    ScopeResolutionError, StageAutoImproveRun, StoreError, WriterHandle, create_explicit_scope,
-    f32_vec_to_bytes, lookup_existing_scope,
+    ApproveAutoImproveProposalResult, AuditLogFilter, AutoImproveProposalOperation,
+    AutoImproveProposalStatus, DecayParams, NewAutoImproveProposal, PagesMode, ReaderPool,
+    RejectAutoImproveProposal, ScopeResolutionError, SkippedProposal, StageAutoImproveRun,
+    StoreError, WriterHandle, create_explicit_scope, f32_vec_to_bytes, lookup_existing_scope,
+    lookup_existing_workspace,
 };
-use ai_memory_wiki::{AdmissionContext, AdmissionOp, Markdown, Wiki, WikiError, WritePageRequest};
+use ai_memory_wiki::{
+    AdmissionContext, AdmissionOp, Markdown, SessionPageFile, Wiki, WikiError, WritePageRequest,
+};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -61,7 +83,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::StreamExt;
@@ -69,7 +91,15 @@ use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
-const EMBEDDING_WRITE_BATCH: usize = 100;
+const CONTRIBUTORS_WEBHOOK_NAME: &str = "contributors";
+
+/// Sweep knobs that live beside `DecayParams` rather than inside it, injected
+/// as one Extension so adding the next one is not a third router constructor.
+#[derive(Clone, Copy, Default)]
+struct SweepTuning {
+    breadth_weight: f64,
+    retention: ObservationRetention,
+}
 
 /// Shared state for the admin router.
 #[derive(Clone)]
@@ -86,10 +116,17 @@ pub struct AdminState {
     /// approval; otherwise it approves them immediately through the normal wiki
     /// write path.
     pub auto_improve_require_approval: bool,
+    /// Server-configured defaults used by direct admin auto-improvement.
+    /// Request fields remain explicit overrides; omitted eval settings inherit
+    /// this operator policy instead of disabling eval silently.
+    pub auto_improve_review_config: AutoImproveReviewConfig,
     /// Optional embedder. When `None`, `/admin/embed` returns 503.
     pub embedder: Option<Arc<dyn Embedder>>,
     /// Passive process-scoped health recorder for configured providers.
     pub provider_health: ProviderHealth,
+    /// Shared hook-ingestion counters, written by the hook path and read
+    /// here for status reporting.
+    pub ingest_metrics: std::sync::Arc<ai_memory_core::IngestMetrics>,
     /// Retention-decay parameters forwarded from server config.
     pub decay_params: DecayParams,
     /// Server's resolved data directory (e.g. `/data` in the docker
@@ -110,12 +147,12 @@ pub struct AdminState {
     /// handler so a second caller waits its turn (request stays open
     /// until the lock is acquired, then proceeds normally).
     pub bootstrap_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Per-server token pepper, used by the user-management endpoints
-    /// (`POST /admin/users`, `…/rotate-token`) to hash freshly-issued
-    /// tokens before they land in `users.token_hash`. `None` when the
-    /// operator hasn't set `[auth].token_pepper` in config (single-user
-    /// installs that predate v0.8); user-management endpoints then
-    /// return 503 `multi-user not enabled`.
+    /// Per-server token pepper, used by `/admin/api-credentials` to hash
+    /// freshly-issued `aim_` secrets before they land in
+    /// `api_credentials.token_hash`. `None` when the operator hasn't set
+    /// `[auth].token_pepper` in config (single-user installs that predate
+    /// v0.8); native API-credential endpoints then return 503
+    /// `multi-user not enabled`.
     pub token_pepper: Option<ai_memory_store::TokenPepper>,
     /// Shared in-process pointer to the project the agent is currently
     /// active in (published by the hook router). Read by `move-project` to
@@ -124,13 +161,43 @@ pub struct AdminState {
     /// hook router is attached (admin-only tests).
     pub active_project: ActiveProject,
     /// Optional hook to PROACTIVELY evict the hook router's per-cwd
-    /// `(workspace_id, project_id)` cache for a project that just moved
-    /// workspaces. Called with the moved `project_id` after a successful move
-    /// so the next hook event re-resolves cleanly instead of tripping the
-    /// pairing trigger on a stale cached pair first. Fire-and-forget
-    /// (best-effort); the trigger + router re-resolve are the correctness net.
-    /// `None` when no hook router is attached (stdio / admin-only tests).
-    pub on_project_moved: Option<std::sync::Arc<dyn Fn(ProjectId) + Send + Sync>>,
+    /// `(workspace_id, project_id)` cache after admin scope mutations. Admin
+    /// handlers await this after successful moves/purges/deletes/renames so
+    /// the next hook event re-resolves cleanly instead of racing through a
+    /// stale cached pair. `None` when no hook router is attached (stdio /
+    /// admin-only tests).
+    pub scope_invalidator: Option<ScopeInvalidator>,
+    /// True when a trusted authenticating proxy is configured to assert
+    /// end-user identities (`[auth].actor_proxy_bearer_token`).
+    ///
+    /// Proxy-asserted operators never get a `users` row, so `users_exist()`
+    /// alone answers "does this deployment distinguish operators" with a
+    /// permanent no — and every proxied caller walks through the
+    /// single-operator escape hatch on the `/admin/*` gate. Static config, set
+    /// once at startup; `false` for every deployment that never configures a
+    /// proxy secret, which is what keeps single-operator servers on their
+    /// historical behaviour.
+    pub trusted_proxy_identity: bool,
+}
+
+/// Async hook-router project-cache invalidator installed by the serve command.
+pub type ScopeInvalidator = Arc<
+    dyn Fn(ScopeInvalidation) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync,
+>;
+
+/// Hook-router project-cache invalidation target for admin scope mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeInvalidation {
+    /// Evict cache entries whose resolved project id matches.
+    Project(ProjectId),
+    /// Evict cache entries whose resolved workspace id matches.
+    Workspace(WorkspaceId),
+}
+
+async fn invalidate_scope_cache(state: &AdminState, target: ScopeInvalidation) {
+    if let Some(evict) = &state.scope_invalidator {
+        evict(target).await;
+    }
 }
 
 /// JSON request body for `POST /admin/bootstrap`.
@@ -157,6 +224,10 @@ struct BootstrapRequest {
     /// Allow re-bootstrap when `wiki/bootstrap.md` already exists.
     #[serde(default)]
     force: bool,
+    /// Resume an interrupted bootstrap: reuse the chunks already completed
+    /// for the same sources instead of re-running them (#621).
+    #[serde(default)]
+    resume: bool,
 }
 
 fn default_max_input_tokens() -> usize {
@@ -196,12 +267,50 @@ struct AutoImproveRequest {
     /// Whether future raw fallback details may be considered.
     #[serde(default)]
     include_raw_fallback: bool,
+    /// Maximum existing _rules/ and procedures/ pages included for patch proposals.
+    #[serde(default = "default_auto_improve_max_patchable_pages")]
+    max_patchable_pages: usize,
+    /// Maximum body chars rendered per patchable target page.
+    #[serde(default = "default_auto_improve_max_patchable_body_chars")]
+    max_patchable_body_chars: usize,
+    /// Maximum patch edits per proposal.
+    #[serde(default = "default_auto_improve_max_edits_per_proposal")]
+    max_edits_per_proposal: usize,
+    /// Maximum content chars in one patch edit.
+    #[serde(default = "default_auto_improve_max_edit_content_chars")]
+    max_edit_content_chars: usize,
+    /// Maximum aggregate changed chars in one patch proposal.
+    #[serde(default = "default_auto_improve_max_changed_chars_per_proposal")]
+    max_changed_chars_per_proposal: usize,
+    /// Maximum patch edits accepted across one review run.
+    #[serde(default = "default_auto_improve_max_patch_edits_per_run")]
+    max_patch_edits_per_run: usize,
+    /// Maximum recent rejection-buffer entries rendered into prompt context.
+    #[serde(default = "default_auto_improve_max_rejection_context")]
+    max_rejection_context: usize,
+    /// Maximum age in days for rejection-buffer prompt context.
+    #[serde(default = "default_auto_improve_rejection_context_days")]
+    rejection_context_days: u32,
+    /// Maximum materialized final body size.
+    #[serde(default = "default_auto_improve_max_final_body_chars")]
+    max_final_body_chars: usize,
+    /// Maximum approximate tokens allowed in one _rules/ page.
+    #[serde(default = "default_auto_improve_max_rule_page_tokens")]
+    max_rule_page_tokens: usize,
+    /// Maximum approximate tokens allowed in one procedures/ page.
+    #[serde(default = "default_auto_improve_max_procedure_page_tokens")]
+    max_procedure_page_tokens: usize,
     /// Synthetic actor used for staged proposal provenance.
     #[serde(default = "default_auto_improve_proposal_actor")]
     proposal_actor: String,
     /// Pending proposal sidecar folder.
     #[serde(default = "default_auto_improve_pending_path")]
     pending_path: String,
+    /// Optional executable proposal eval gate. When omitted, direct admin
+    /// requests inherit the server's configured eval policy; CLI requests send
+    /// their local config explicitly.
+    #[serde(default)]
+    eval: Option<ai_memory_consolidate::AutoImproveEvalConfig>,
     /// Removed compatibility field. Requests that still send it fail closed so
     /// old preview callers cannot accidentally write pages.
     #[serde(default)]
@@ -224,6 +333,10 @@ struct AutoImproveStageResponse {
     warnings: Vec<String>,
     rejected_candidates_count: usize,
     proposals: Vec<AutoImproveProposalOutcome>,
+    /// Proposals the reviewer produced but the store did not stage, with the
+    /// reason. Always present (empty on a clean run) so a consumer can tell
+    /// "nothing was dropped" from "this build does not report drops".
+    skipped: Vec<SkippedProposal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +345,37 @@ struct AutoImproveProposalOutcome {
     sidecar_path: String,
     status: String,
     page_id: Option<String>,
+}
+
+/// JSON request body for `POST /admin/auto-improve/report`.
+#[derive(Deserialize)]
+struct AutoImproveTelemetryReportRequest {
+    /// Workspace name (must already exist).
+    #[serde(default = "default_workspace")]
+    workspace: String,
+    /// Project name (must already exist).
+    #[serde(default = "default_project")]
+    project: String,
+    /// Lookback window in days.
+    #[serde(default = "default_auto_improve_telemetry_since_days")]
+    since_days: u32,
+    /// Maximum rows in each top-N count table.
+    #[serde(default = "default_auto_improve_telemetry_top_limit")]
+    limit: usize,
+    /// Stage one pending telemetry report page instead of returning a read-only report.
+    #[serde(default)]
+    stage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AutoImproveTelemetryReportStageResponse {
+    run_id: String,
+    proposal_ids: Vec<String>,
+    sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
+    report: AutoImproveTelemetryReport,
 }
 
 /// JSON request body for `POST /admin/curator`.
@@ -259,8 +403,51 @@ struct CuratorStageResponse {
     run_id: String,
     proposal_ids: Vec<String>,
     sidecar_paths: Vec<String>,
+    /// Same reason as [`AutoImproveStageResponse::skipped`]: a single-proposal
+    /// run that collides otherwise returns an empty `proposal_ids` and no clue.
+    skipped: Vec<SkippedProposal>,
     report: CuratorReport,
 }
+
+/// Query for `GET /admin/handoffs` (#513).
+#[derive(Debug, Deserialize)]
+struct OpenHandoffsQuery {
+    workspace: String,
+    project: String,
+    #[serde(default = "default_open_handoffs_limit")]
+    limit: usize,
+}
+
+const fn default_open_handoffs_limit() -> usize {
+    50
+}
+
+/// Query for `GET /admin/messages` (cross-project agent messaging, V64).
+#[derive(Debug, Deserialize)]
+struct ListMessagesQuery {
+    workspace: String,
+    project: String,
+    #[serde(rename = "box", default = "default_message_box")]
+    mailbox: String,
+    #[serde(default = "default_list_messages_limit")]
+    limit: usize,
+}
+
+fn default_message_box() -> String {
+    "inbox".into()
+}
+
+const fn default_list_messages_limit() -> usize {
+    50
+}
+
+/// Body cap for `POST /admin/messages/send` (V64). The body crosses a
+/// project-isolation boundary and is untrusted input on the receiving side;
+/// capped the same way handoff text fields are, after secret-scrubbing.
+const MESSAGE_BODY_MAX_CHARS: usize = 8000;
+
+/// Subject cap for `POST /admin/messages/send` (V64).
+const MESSAGE_SUBJECT_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Deserialize)]
 struct PendingWritesQuery {
@@ -308,6 +495,50 @@ fn default_auto_improve_max_proposals() -> usize {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROPOSALS
 }
 
+fn default_auto_improve_max_patchable_pages() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_PAGES
+}
+
+fn default_auto_improve_max_patchable_body_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCHABLE_BODY_CHARS
+}
+
+fn default_auto_improve_max_edits_per_proposal() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDITS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_edit_content_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_EDIT_CONTENT_CHARS
+}
+
+fn default_auto_improve_max_changed_chars_per_proposal() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_CHANGED_CHARS_PER_PROPOSAL
+}
+
+fn default_auto_improve_max_patch_edits_per_run() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PATCH_EDITS_PER_RUN
+}
+
+fn default_auto_improve_max_rejection_context() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_REJECTION_CONTEXT
+}
+
+fn default_auto_improve_rejection_context_days() -> u32 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS
+}
+
+fn default_auto_improve_max_final_body_chars() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_FINAL_BODY_CHARS
+}
+
+fn default_auto_improve_max_rule_page_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS
+}
+
+fn default_auto_improve_max_procedure_page_tokens() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_MAX_PROCEDURE_PAGE_TOKENS
+}
+
 fn default_auto_improve_proposal_actor() -> String {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR.into()
 }
@@ -316,13 +547,38 @@ fn default_auto_improve_pending_path() -> String {
     ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_PENDING_PATH.into()
 }
 
+fn default_auto_improve_telemetry_since_days() -> u32 {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_SINCE_DAYS
+}
+
+fn default_auto_improve_telemetry_top_limit() -> usize {
+    ai_memory_consolidate::DEFAULT_AUTO_IMPROVE_TELEMETRY_TOP_LIMIT
+}
+
+fn hex_to_sha256(hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err("expected 64 hex chars".into());
+    }
+    let mut out = [0_u8; 32];
+    for (idx, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let s = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
+        out[idx] = u8::from_str_radix(s, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
 /// Build the admin axum [`Router`]. Mounts:
 /// - `POST /admin/backup`
 /// - `POST /admin/bootstrap`
 /// - `POST /admin/import-normalize`
 /// - `POST /admin/auto-improve`
+/// - `POST /admin/auto-improve/report`
 /// - `POST /admin/curator`
 /// - `GET  /admin/status`
+/// - `GET  /admin/projects`
+/// - `GET  /admin/open-sessions`
+/// - `GET  /admin/sessions/by-agent`
+/// - `GET  /admin/activity/by-client`
 /// - `GET  /admin/audit-contamination`
 /// - `GET  /admin/search`
 /// - `GET  /admin/read-page`
@@ -336,18 +592,46 @@ fn default_auto_improve_pending_path() -> String {
 /// - `POST /admin/purge-project`
 /// - `POST /admin/rename-project`
 /// - `POST /admin/move-project`
+/// - `POST /admin/move-session`
+/// - `POST /admin/merge-workspace`
 /// - `POST /admin/write-page`
 /// - `POST /admin/delete-page`
 /// - `POST /admin/delete-pages`
 /// - user-management routes under `/admin/users*`
 pub fn admin_router(state: AdminState) -> Router {
+    admin_router_with_decay_breadth(state, 0.0)
+}
+
+/// Build the admin router with the optional distinct-reader retention weight.
+pub fn admin_router_with_decay_breadth(state: AdminState, breadth_weight: f64) -> Router {
+    admin_router_with_sweep_tuning(state, breadth_weight, ObservationRetention::default())
+}
+
+/// Build the admin router with every sweep knob that lives outside
+/// `DecayParams`, including the opt-in observation prune (disabled by default).
+pub fn admin_router_with_sweep_tuning(
+    state: AdminState,
+    breadth_weight: f64,
+    retention: ObservationRetention,
+) -> Router {
     let state = Arc::new(state);
     let operational = Router::new()
         .route("/admin/backup", post(handle_backup))
+        .route("/admin/export-okf", post(handle_export_okf))
         .route("/admin/bootstrap", post(handle_bootstrap))
         .route("/admin/import-normalize", post(handle_import_normalize))
         .route("/admin/auto-improve", post(handle_auto_improve))
+        .route(
+            "/admin/auto-improve/report",
+            post(handle_auto_improve_report),
+        )
         .route("/admin/curator", post(handle_curator))
+        .route("/admin/handoffs", get(handle_open_handoffs_list))
+        .route("/admin/handoffs/expire", post(handle_expire_handoffs))
+        .route("/admin/messages", get(handle_list_messages))
+        .route("/admin/messages/send", post(handle_send_message))
+        .route("/admin/messages/pop", post(handle_pop_message))
+        .route("/admin/messages/cancel", post(handle_cancel_messages))
         .route("/admin/pending-writes", get(handle_pending_writes_list))
         .route(
             "/admin/pending-writes/{id}",
@@ -366,10 +650,15 @@ pub fn admin_router(state: AdminState) -> Router {
             post(handle_pending_write_reject),
         )
         .route("/admin/status", get(handle_status))
+        .route("/admin/projects", get(handle_list_projects))
+        .route("/admin/open-sessions", get(handle_open_sessions))
+        .route("/admin/sessions/by-agent", get(handle_sessions_by_agent))
+        .route("/admin/activity/by-client", get(handle_activity_by_client))
         .route(
             "/admin/audit-contamination",
             get(handle_audit_contamination),
         )
+        .route("/admin/audit-log", get(handle_audit_log))
         .route("/admin/search", get(handle_search))
         .route("/admin/read-page", get(handle_read_page))
         .route("/admin/reorg", post(handle_reorg))
@@ -380,8 +669,14 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/admin/checkpoints", get(handle_checkpoints))
         .route("/admin/restore-page", post(handle_restore_page))
         .route("/admin/purge-project", post(handle_purge_project))
+        .route("/admin/purge-session", post(handle_purge_session))
         .route("/admin/rename-project", post(handle_rename_project))
         .route("/admin/move-project", post(handle_move_project))
+        .route("/admin/move-session", post(handle_move_session))
+        .route("/admin/delete-workspace", post(handle_delete_workspace))
+        .route("/admin/compact", post(handle_compact))
+        .route("/admin/rename-workspace", post(handle_rename_workspace))
+        .route("/admin/merge-workspace", post(handle_merge_workspace))
         .route("/admin/write-page", post(handle_write_page))
         .route("/admin/delete-page", post(handle_delete_page))
         .route("/admin/delete-pages", post(handle_delete_pages))
@@ -391,11 +686,31 @@ pub fn admin_router(state: AdminState) -> Router {
             "/admin/users",
             get(handle_list_users).post(handle_create_user),
         )
+        .route("/admin/human-users", post(handle_create_human_user))
+        .route("/admin/users/{username}", patch(handle_patch_user))
         .route("/admin/users/{username}/expire", post(handle_expire_user))
         .route("/admin/users/{username}/revive", post(handle_revive_user))
         .route(
             "/admin/users/{username}/rotate-token",
             post(handle_rotate_user_token),
+        )
+        .route(
+            "/admin/users/{username}/reset-password",
+            post(handle_reset_password),
+        )
+        .route("/admin/users/{username}/disable", post(handle_disable_user))
+        .route("/admin/users/{username}/enable", post(handle_enable_user))
+        .route(
+            "/admin/api-credentials",
+            get(handle_list_api_credentials).post(handle_create_api_credential),
+        )
+        .route(
+            "/admin/api-credentials/{id}/rotate",
+            post(handle_rotate_api_credential),
+        )
+        .route(
+            "/admin/api-credentials/{id}/revoke",
+            post(handle_revoke_api_credential),
         );
     operational
         .merge(users)
@@ -404,6 +719,10 @@ pub fn admin_router(state: AdminState) -> Router {
             require_root_for_multiuser_admin,
         ))
         .with_state(state)
+        .layer(axum::Extension(SweepTuning {
+            breadth_weight,
+            retention,
+        }))
 }
 
 async fn require_root_for_multiuser_admin(
@@ -416,7 +735,33 @@ async fn require_root_for_multiuser_admin(
         .get::<ai_memory_core::AuthLevel>()
         .copied()
         .unwrap_or(ai_memory_core::AuthLevel::Anonymous);
-    match level.authorize(Capability::Admin, state.token_pepper.is_some()) {
+    // Read this for every request rather than caching a post-creation flag: a
+    // committed first user immediately closes bootstrap admin access, including
+    // across concurrent requests and without a server restart.
+    //
+    // Same notion of "this deployment distinguishes operators" the MCP admin
+    // gate uses. Keyed on `users_exist()` alone, a trusted-proxy deployment
+    // with no `users` rows would wave a proxy-asserted `AuthLevel::User` caller
+    // through every operational route below — purge, delete-page, backup — and
+    // only `/admin/users*` would survive on its own inner root check.
+    let distinguishes_operators = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(exists) => exists,
+        Err(error) => {
+            tracing::error!(%error, "admin authorization could not determine whether users exist");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "admin authorization unavailable: could not verify user configuration"
+                })),
+            )
+                .into_response();
+        }
+    };
+    match level.authorize(Capability::Admin, distinguishes_operators) {
         Ok(()) => next.run(req).await,
         Err(e) => (
             authz_status(e),
@@ -458,7 +803,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                 Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap()
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
             }),
         Err(e) => {
             warn!(error = %e, "backup failed");
@@ -472,7 +817,7 @@ async fn handle_backup(State(state): State<Arc<AdminState>>) -> Response {
                     Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
                 })
         }
     }
@@ -510,6 +855,152 @@ async fn build_backup_tarball_file(state: &AdminState) -> anyhow::Result<tokio::
                 .map_err(|e| anyhow::anyhow!("archiving config.toml: {e}"))?;
         }
 
+        let encoder = tar.into_inner()?;
+        encoder.finish()?;
+    }
+    tar_file.sync_data()?;
+    tar_file.rewind()?;
+    Ok(tokio::fs::File::from_std(tar_file))
+}
+
+// ---------------------------------------------------------------------
+// export-okf
+// ---------------------------------------------------------------------
+
+/// Query for `POST /admin/export-okf`: the one project bundle to export.
+#[derive(Deserialize)]
+struct ExportOkfQuery {
+    workspace: String,
+    project: String,
+}
+
+/// `POST /admin/export-okf?workspace=…&project=…` — stream the project
+/// directory as an OKF v0.2 bundle tarball (docs/okf.md). The wiki files
+/// ARE the bundle (native conformance), so this is a validated copy with
+/// a freshly generated `index.md` (full listing + `okf_version`). Any
+/// non-conformant page file fails the export rather than shipping a
+/// bundle a strict reader would reject.
+async fn handle_export_okf(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<ExportOkfQuery>,
+) -> Response {
+    let ids = match lookup_ws_proj_no_create(&state, q.workspace.trim(), q.project.trim()).await {
+        Ok(ids) => ids,
+        Err((status, body)) => return (status, body).into_response(),
+    };
+    match build_okf_bundle_file(&state, ids.0, ids.1).await {
+        Ok(file) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/gzip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"okf-bundle.tar.gz\"",
+            )
+            .body(Body::from_stream(ReaderStream::new(file)))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Err(e) => {
+            warn!(error = %e, "okf export failed");
+            let body = serde_json::to_vec(&serde_json::json!({ "error": e.to_string() }))
+                .unwrap_or_default();
+            Response::builder()
+                .status(StatusCode::UNPROCESSABLE_ENTITY)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+async fn build_okf_bundle_file(
+    state: &AdminState,
+    ws: ai_memory_core::WorkspaceId,
+    proj: ai_memory_core::ProjectId,
+) -> anyhow::Result<tokio::fs::File> {
+    let bundle_dir = state
+        .data_dir
+        .join("wiki")
+        .join(ws.to_string())
+        .join(proj.to_string());
+    if !bundle_dir.is_dir() {
+        anyhow::bail!("project has no wiki directory yet");
+    }
+
+    // Validate + collect: every non-reserved .md must be conformant.
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut families: Vec<String> = Vec::new();
+    let mut stack = vec![bundle_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                // `_pending/` is the auto-improve staging area — proposal
+                // sidecars, not concept files; a strict OKF reader has no
+                // business seeing them (post-audit finding: an unresolved
+                // pending proposal blocked every export).
+                if entry.file_name() == "_pending" {
+                    continue;
+                }
+                if dir == bundle_dir {
+                    families.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                stack.push(path);
+            } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == "index.md" || name == "log.md" {
+                    continue; // regenerated / not adopted
+                }
+                // A rotated event ledger is the same raw hook capture as the
+                // `log.md` above, only past a month boundary — it carries no
+                // frontmatter, so the conformance gate below failed the whole
+                // export for every project that ever captured an observation
+                // (#748). The check is content-gated exactly like the
+                // migration scan's (#669), so a prose page that happens to be
+                // named `log-2026-09.md` still ships and still has to conform.
+                if ai_memory_wiki::is_rotated_event_ledger(&path) {
+                    continue;
+                }
+                let raw = std::fs::read_to_string(&path)?;
+                let fm = ai_memory_wiki::parse(&raw)
+                    .map(|m| m.frontmatter)
+                    .unwrap_or_default();
+                if !ai_memory_core::okf::is_conformant(&fm) {
+                    anyhow::bail!(
+                        "page {} is not OKF-conformant; run the server once to migrate \
+                         before exporting",
+                        path.strip_prefix(&bundle_dir).unwrap_or(&path).display()
+                    );
+                }
+                files.push(path);
+            }
+        }
+    }
+
+    let mut tar_file = tempfile::tempfile()?;
+    {
+        let encoder = GzEncoder::new(&mut tar_file, Compression::default());
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+        tar.follow_symlinks(false);
+        // Fresh bundle-root index.md: okf_version + full listing.
+        families.sort();
+        let listing: String = families
+            .iter()
+            .map(|f| format!("- [{f}/]({f}/)\n"))
+            .collect();
+        let index = format!(
+            "---\nokf_version: \"0.2\"\n---\n\n# Bundle index\n\nConcept files live in these directories:\n\n{listing}"
+        );
+        let mut header = tar::Header::new_gnu();
+        header.set_size(index.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "index.md", index.as_bytes())?;
+        for path in files {
+            let rel = path.strip_prefix(&bundle_dir).unwrap_or(&path);
+            tar.append_path_with_name(&path, rel)?;
+        }
         let encoder = tar.into_inner()?;
         encoder.finish()?;
     }
@@ -574,6 +1065,62 @@ async fn handle_audit_contamination(
     }
 }
 
+/// Query string for `GET /admin/audit-log`. Names are optional independent
+/// filters; when both workspace and project are present they are resolved
+/// through [`lookup_existing_scope`] so a typo fails closed (404) instead of
+/// looking like an empty log.
+#[derive(Debug, Deserialize)]
+struct AuditLogQuery {
+    workspace: Option<String>,
+    project: Option<String>,
+    op: Option<String>,
+    before_id: Option<i64>,
+    #[serde(default = "default_audit_log_limit")]
+    limit: usize,
+}
+
+fn default_audit_log_limit() -> usize {
+    50
+}
+
+/// `GET /admin/audit-log` — read-only paginated trail of the existing
+/// `audit_log` table. `detail` is returned for schema fidelity; it is not a
+/// payload (the only writer stores the literal `{}`).
+async fn handle_audit_log(
+    State(state): State<Arc<AdminState>>,
+    Query(q): Query<AuditLogQuery>,
+) -> impl IntoResponse {
+    let workspace = trimmed_opt(q.workspace.as_deref()).map(str::to_owned);
+    let project = trimmed_opt(q.project.as_deref()).map(str::to_owned);
+    if let (Some(ws), Some(proj)) = (workspace.as_deref(), project.as_deref()) {
+        match lookup_ws_proj_no_create(&state, ws, proj).await {
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+    let filter = AuditLogFilter {
+        workspace,
+        project,
+        op: trimmed_opt(q.op.as_deref()).map(str::to_owned),
+        before_id: q.before_id,
+        limit: q.limit,
+    };
+    match state.reader.list_audit_events(filter).await {
+        Ok(events) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&events)
+                    .map(|list| serde_json::json!({ "events": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "events": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
 /// JSON response body for `GET /admin/status`. The CLI's `status`
 /// subcommand renders this either as JSON (`--json`) or as a small
 /// human-friendly text block.
@@ -591,14 +1138,67 @@ pub struct StatusReport {
     pub counts: ai_memory_store::StatusCounts,
     /// Derived-index and retrieval-readiness diagnostics.
     pub derived: ai_memory_store::DerivedIndexStatus,
+    /// Physical storage figures — file size and reclaimable free pages — so an
+    /// operator can decide whether a `VACUUM` is worth its exclusive lock.
+    pub storage: ai_memory_store::StorageStatus,
     /// Passive process-scoped provider health.
     pub providers: ProviderHealthSnapshot,
+    /// Hook-ingestion counters for this server process. Counts and one
+    /// timestamp only — never captured content (#428).
+    pub ingest: ai_memory_core::IngestMetricsSnapshot,
+    /// Instantaneous write-queue depth `(queued, capacity)` — the
+    /// wedged-writer signal (2.0 item 7).
+    pub write_queue: (usize, usize),
+    /// Wiki-format state: whether the OKF migration has run, and the
+    /// pre-migration backup archive if its receipt still exists.
+    pub wiki_format: WikiFormatStatus,
+}
+
+/// Wiki-format section of [`StatusReport`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct WikiFormatStatus {
+    /// True once the OKF v0.2 wiki migration has been applied.
+    pub okf_migrated: bool,
+    /// Pre-migration backup archive path, when the receipt exists AND
+    /// the archive file is still on disk.
+    pub backup_archive: Option<String>,
+    /// Size of that archive in bytes.
+    pub backup_archive_bytes: Option<u64>,
+}
+
+/// `GET /admin/projects` — the authoritative list of `(workspace, project)`
+/// pairs (with page counts + last-updated), read-only. Useful to any external
+/// consumer that needs the live project inventory: a dashboard, an export, or
+/// a backup/mirror that lays the wiki out as `wiki/<workspace>/<project>/` and
+/// wants to reconcile against it — any directory whose project no longer
+/// appears here is an orphan (e.g. from a delete that bypassed the admission
+/// chain, such as an offline `--data-dir` purge or a direct DB edit) and can
+/// be pruned so the copy reflects the live server.
+async fn handle_list_projects(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
+    match state.reader.list_projects_with_stats().await {
+        Ok(projects) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "projects": projects })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
 }
 
 async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     match state.reader.status_counts().await {
         Ok(counts) => match state.reader.derived_index_status().await {
             Ok(derived) => {
+                // Three pragma reads; a failure here must not take down the
+                // whole status response, which is also the health probe.
+                let storage = state.reader.storage_status().await.unwrap_or_default();
+                let okf_migrated = state
+                    .reader
+                    .wiki_migration_names()
+                    .await
+                    .map(|names| names.iter().any(|n| n.contains("okf")))
+                    .unwrap_or(false);
+                let backup = ai_memory_wiki::backup::BackupReceipt::load(&state.data_dir)
+                    .filter(ai_memory_wiki::backup::BackupReceipt::archive_present);
                 let report = StatusReport {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     data_dir: state.data_dir.display().to_string(),
@@ -606,7 +1206,17 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                     db_path: state.db_path.display().to_string(),
                     counts,
                     derived,
+                    storage,
                     providers: state.provider_health.snapshot(),
+                    ingest: state.ingest_metrics.snapshot(),
+                    write_queue: state.writer.queue_depth(),
+                    wiki_format: WikiFormatStatus {
+                        okf_migrated,
+                        backup_archive: backup
+                            .as_ref()
+                            .map(|r| r.archive_path.display().to_string()),
+                        backup_archive_bytes: backup.as_ref().map(|r| r.size_bytes),
+                    },
                 };
                 (
                     StatusCode::OK,
@@ -618,6 +1228,235 @@ async fn handle_status(State(state): State<Arc<AdminState>>) -> impl IntoRespons
                 Json(serde_json::json!({ "error": e.to_string() })),
             ),
         },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------
+// open-sessions
+// ---------------------------------------------------------------------
+
+/// Query string for `GET /admin/open-sessions` — open (not yet ended)
+/// sessions for one scope + agent, newest first. Backs the thin
+/// `ai-memory finalize-session` command, which posts synthetic
+/// session-end hooks for whatever this returns.
+#[derive(Debug, Deserialize)]
+struct OpenSessionsQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Agent kind filter, kebab-case (`codex`, `claude-code`, …).
+    agent: String,
+    /// When true, return every open session; otherwise just the newest.
+    #[serde(default)]
+    all: bool,
+    /// Include sessions belonging to OTHER operators.
+    ///
+    /// Off by default because the caller of this endpoint (`finalize-session`)
+    /// acts destructively on what it returns: it ends the session, synthesises
+    /// a page from its observations and mints a handoff carrying its raw
+    /// prompts. Picking "the newest open session in the scope" across everyone
+    /// would do all of that to a colleague's live session. Sessions with no
+    /// recorded operator stay visible either way, so a single-operator server
+    /// is unaffected.
+    #[serde(default)]
+    all_owners: bool,
+    /// When set, narrow to exactly this session id (still subject to the
+    /// owner filter above) instead of newest-first selection — lets a
+    /// caller that captured its own session id at spawn time finalize
+    /// precisely that session, even when other sessions for the same agent
+    /// are open concurrently in the same project (e.g. multiple terminal
+    /// tabs each running Kiro CLI against one repo).
+    #[serde(default)]
+    session_id: Option<SessionId>,
+}
+
+/// Wire shape for one open session in the `GET /admin/open-sessions`
+/// response.
+#[derive(Debug, Serialize)]
+struct OpenSessionEntry {
+    session_id: String,
+    cwd: Option<String>,
+}
+
+/// Query string for `GET /admin/activity/by-client` — MCP tool-call
+/// counts per client. Server-wide: MCP-only clients (the reason this
+/// exists) are not reliably scoped to one project per call, and the
+/// endpoint mirrors the buffer's own granularity.
+///
+/// `since_days = 0` means the whole history, mirroring
+/// `/admin/sessions/by-agent`.
+#[derive(Debug, Deserialize)]
+struct ActivityByClientQuery {
+    #[serde(default)]
+    since_days: u32,
+}
+
+async fn handle_activity_by_client(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ActivityByClientQuery>,
+) -> impl IntoResponse {
+    let since_day = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+            .div_euclid(US_PER_DAY)
+    });
+    match state.reader.client_activity_since(since_day).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&rows)
+                    .map(|list| serde_json::json!({ "by_client": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_client": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Query string for `GET /admin/sessions/by-agent` — how many sessions each
+/// agent CLI opened in one scope.
+///
+/// `since_days = 0` means "no lower bound": count the project's whole
+/// history rather than an empty window, which is what a dashboard asking for
+/// "all time" wants and what a `u32` cannot express as `None`.
+#[derive(Debug, Deserialize)]
+struct SessionsByAgentQuery {
+    /// Workspace name (required).
+    workspace: String,
+    /// Project name (required).
+    project: String,
+    /// Inclusive lookback in days; zero means all history.
+    #[serde(default)]
+    since_days: u32,
+    /// Report every operator's sessions instead of just the caller's. Same
+    /// recovery switch the other scoped admin reads expose.
+    #[serde(default)]
+    all_owners: bool,
+}
+
+/// Microseconds in a day, for the `since_days` window.
+const US_PER_DAY: i64 = 86_400_000_000;
+
+async fn handle_sessions_by_agent(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Query(query): Query<SessionsByAgentQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let since_us = (query.since_days > 0).then(|| {
+        jiff::Timestamp::now()
+            .as_microsecond()
+            .saturating_sub(i64::from(query.since_days).saturating_mul(US_PER_DAY))
+    });
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
+    let counts: ai_memory_store::StoreResult<Vec<ai_memory_store::AgentSessionCount>> = state
+        .reader
+        .session_counts_by_agent(ws, proj, owner_filter, since_us)
+        .await;
+    match counts {
+        Ok(counts) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(&counts)
+                    .map(|list| serde_json::json!({ "by_agent": list }))
+                    .unwrap_or_else(|_| serde_json::json!({ "by_agent": [] })),
+            ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// Parse a kebab-case agent wire string into an [`AgentKind`].
+fn parse_agent_kind(raw: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|kind| kind.as_str() == raw)
+}
+
+async fn handle_open_sessions(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Query(query): Query<OpenSessionsQuery>,
+) -> impl IntoResponse {
+    if query.all && query.session_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "all and session_id cannot be combined"
+            })),
+        );
+    }
+    let Some(agent) = parse_agent_kind(&query.agent) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown agent kind: {}", query.agent)
+            })),
+        );
+    };
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let owner_filter = if query.all_owners {
+        ai_memory_core::OwnerFilter::Any
+    } else {
+        ai_memory_core::OwnerFilter::for_actor_context(
+            &actor_ext.map_or_else(ai_memory_core::ActorContext::anonymous, |ext| ext.0),
+        )
+    };
+    let sessions = if let Some(session_id) = query.session_id {
+        state
+            .reader
+            .open_session_for_scope_agent_by_id(ws, proj, agent, owner_filter, session_id)
+            .await
+            .map(|session| session.into_iter().collect())
+    } else {
+        let limit = if query.all { None } else { Some(1) };
+        state
+            .reader
+            .open_sessions_for_scope_agent(ws, proj, agent, owner_filter, limit)
+            .await
+    };
+    match sessions {
+        Ok(sessions) => {
+            let sessions: Vec<OpenSessionEntry> = sessions
+                .into_iter()
+                .map(|s| OpenSessionEntry {
+                    session_id: s.session_id.to_string(),
+                    cwd: s.cwd,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(&sessions)
+                        .map(|list| serde_json::json!({ "sessions": list }))
+                        .unwrap_or_else(|_| serde_json::json!({ "sessions": [] })),
+                ),
+            )
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -663,7 +1502,7 @@ async fn handle_search(
                 Ok((ws, proj)) => {
                     state
                         .reader
-                        .search_pages_for_project(ws, proj, query.q, limit)
+                        .search_pages_for_project(ws, proj, query.q, limit, None)
                         .await
                 }
                 Err(e) => return e,
@@ -764,7 +1603,7 @@ async fn handle_read_page(
     } else if let Some(q) = query.q {
         let hits = match state
             .reader
-            .search_pages_for_project(ws, proj, q.clone(), 1)
+            .search_pages_for_project(ws, proj, q.clone(), 1, None)
             .await
         {
             Ok(h) => h,
@@ -894,6 +1733,16 @@ async fn lookup_ws_proj_no_create(
         .map_err(scope_err)
 }
 
+/// Look up a workspace by name **without** auto-creating it.
+async fn lookup_ws_no_create(
+    state: &AdminState,
+    workspace: &str,
+) -> Result<WorkspaceId, (StatusCode, Json<serde_json::Value>)> {
+    lookup_existing_workspace(&state.reader, workspace)
+        .await
+        .map_err(scope_err)
+}
+
 fn scope_err(err: ScopeResolutionError) -> (StatusCode, Json<serde_json::Value>) {
     let status = if err.is_bad_request() {
         StatusCode::BAD_REQUEST
@@ -996,12 +1845,14 @@ async fn handle_bootstrap(
         since: None,
         dry_run: req.dry_run,
         force: req.force,
+        resume: req.resume,
     };
 
     let bootstrap = Bootstrap {
         reader: state.reader.clone(),
         wiki: state.wiki.clone(),
         llm,
+        writer: state.writer.clone(),
     };
 
     match bootstrap.process_sources(&cfg, req.sources).await {
@@ -1031,7 +1882,22 @@ fn bootstrap_error_response(
         BootstrapError::Llm(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "bootstrap", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
+/// Record a failure the server owns.
+///
+/// A 5xx says the request was fine and *we* could not serve it, so the reason
+/// belongs in the server's log: the response body reaches one client once and
+/// is gone when its process exits, which is how an upstream provider 404
+/// managed to fail every bootstrap while the log showed only the run starting
+/// (#692). A 4xx stays quiet — the caller was told, and the caller was at
+/// fault.
+fn log_server_error(status: StatusCode, operation: &str, error: &dyn std::fmt::Display) {
+    if status.is_server_error() {
+        warn!(%status, operation, %error, "admin request failed");
+    }
 }
 
 /// Build a dry-run [`BootstrapOutcome`] without an LLM by applying the
@@ -1390,7 +2256,7 @@ async fn handle_import_normalize(
                 },
                 Err(e) => NormalizeBatchOutcome::Failed {
                     batch_idx,
-                    transient: is_transient_llm_error(&e),
+                    transient: e.is_transient(),
                     error: e.to_string(),
                     paths: batch_paths,
                 },
@@ -1604,6 +2470,7 @@ async fn write_normalized_page(
             title: Some(upd.title.clone()),
             admission_ctx,
             author_id,
+            evidence: Vec::new(),
             actor: actor.clone(),
         })
         .await
@@ -1662,7 +2529,7 @@ async fn normalize_batch_with_retries(
         {
             Ok(result) => return Ok(result),
             Err(e) => {
-                if attempt >= NORMALIZE_MAX_RETRIES || !is_transient_llm_error(&e) {
+                if attempt >= NORMALIZE_MAX_RETRIES || !e.is_transient() {
                     return Err(e);
                 }
                 attempt += 1;
@@ -1676,26 +2543,6 @@ async fn normalize_batch_with_retries(
                 tokio::time::sleep(delay).await;
             }
         }
-    }
-}
-
-/// Whether an [`LlmError`] looks TRANSIENT, worth a retry, versus a
-/// permanent config error. Transient: transport failures (`error sending
-/// request`, connect/timeout) and 5xx provider responses. Permanent:
-/// 4xx (auth/400/422), unexpected shape, schema, not-configured.
-fn is_transient_llm_error(e: &ai_memory_llm::LlmError) -> bool {
-    use ai_memory_llm::LlmError;
-    match e {
-        // Reqwest transport errors: connect, timeout, "error sending
-        // request for url", exactly the live failure mode this hardens.
-        LlmError::Http(_) => true,
-        // Provider HTTP error: retry only on 5xx (and 429 rate-limit).
-        // 4xx is a request/config problem a retry won't fix.
-        LlmError::Provider { status, .. } => *status == 429 || *status >= 500,
-        // Exhausted an inner retry budget already: don't loop again here.
-        LlmError::RetriesExhausted(_) => false,
-        // Shape/serde/schema/auth/not-configured are deterministic.
-        _ => false,
     }
 }
 
@@ -1762,15 +2609,68 @@ async fn handle_auto_improve(
         include_raw_fallback: req.include_raw_fallback,
         proposal_actor: req.proposal_actor.clone(),
         pending_path: req.pending_path.clone(),
+        max_patchable_pages: req.max_patchable_pages,
+        max_patchable_body_chars: req.max_patchable_body_chars,
+        max_edits_per_proposal: req.max_edits_per_proposal,
+        max_edit_content_chars: req.max_edit_content_chars,
+        max_changed_chars_per_proposal: req.max_changed_chars_per_proposal,
+        max_patch_edits_per_run: req.max_patch_edits_per_run,
+        max_rejection_context: req.max_rejection_context,
+        rejection_context_days: req.rejection_context_days,
+        max_final_body_chars: req.max_final_body_chars,
+        max_rule_page_tokens: req.max_rule_page_tokens,
+        max_procedure_page_tokens: req.max_procedure_page_tokens,
+        eval: req
+            .eval
+            .clone()
+            .unwrap_or_else(|| state.auto_improve_review_config.eval.clone()),
     };
 
-    let report = run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg)
-        .await
-        .map_err(auto_improve_error_response)?;
+    let report =
+        run_auto_improve_review(&state.reader, &*llm, ws, proj, req.session_id, cfg.clone())
+            .await
+            .map_err(auto_improve_error_response)?;
+    // Whose suggestion this is. It scopes the one-pending-per-target rule
+    // (V42), and is taken from the authenticated actor's qualified identity
+    // key rather than a `users` row, because most identified operators on a
+    // shared server are named by an authenticating proxy and never get one.
+    //
+    // Only where operators are actually told apart, though: on a
+    // single-operator server this call would otherwise stage into bucket
+    // `user:<root_username>` while the scheduler and the report handlers stage
+    // into the unattributed one, leaving two proposals pending for the same
+    // page — the collision V42 promises cannot happen.
+    //
+    // Both halves go through the shared accessors — `identity_key` for "which
+    // human is this", `owner_identity` for "does this deployment name them" —
+    // rather than re-deriving either here. Its `memory_auto_improve` sibling
+    // stages into the same V42 bucket, and a bucket computed two ways is a
+    // bucket that eventually disagrees with itself.
+    let staging_owner = ai_memory_core::owner_identity(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        state
+            .reader
+            .distinguishes_operators(state.trusted_proxy_identity)
+            .await
+            .map_err(|e| internal_err(e.to_string()))?,
+    );
     let proposals = auto_improve_new_proposals(&state, ws, proj, &report).await?;
-    let staged =
-        stage_auto_improve_report(&state, ws, proj, req.session_id, &req, &report, proposals)
-            .await?;
+    let staged = stage_auto_improve_report(
+        &state,
+        AutoImproveStagingScope {
+            ws,
+            proj,
+            session_id: req.session_id,
+            cfg: &cfg,
+            staging_owner,
+        },
+        &report,
+        proposals,
+    )
+    .await?;
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
@@ -1809,6 +2709,10 @@ async fn handle_auto_improve(
                 warnings: report.warnings,
                 rejected_candidates_count: report.rejected_candidates.len(),
                 proposals: outcomes,
+                // Store-level collisions the reviewer's run never staged.
+                // Dropped silently, a run reporting N-1 proposals has nothing
+                // saying the Nth ever existed.
+                skipped: staged.skipped,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
         ),
@@ -1897,17 +2801,25 @@ async fn auto_improve_new_proposals(
                 Json(serde_json::json!({ "error": format!("invalid proposal path: {e}") })),
             )
         })?;
-        let operation = if state
+        let target_exists = state
             .reader
             .page_body_by_ids(ws, proj, path.as_str())
             .await
             .map_err(|e| internal_err(e.to_string()))?
-            .is_some()
+            .is_some();
+        let operation = if p.edit_mode == "patch"
+            || (target_exists && path.as_str() == "_slots/current-focus.md")
         {
             AutoImproveProposalOperation::Update
         } else {
             AutoImproveProposalOperation::Create
         };
+        let expected_base_body_sha256 = p
+            .expected_base_body_sha256
+            .as_deref()
+            .map(hex_to_sha256)
+            .transpose()
+            .map_err(|e| internal_err(format!("invalid expected_base_body_sha256: {e}")))?;
         proposals.push(NewAutoImproveProposal {
             operation,
             target_path: path,
@@ -1919,6 +2831,9 @@ async fn auto_improve_new_proposals(
                 .map_err(|e| internal_err(e.to_string()))?,
             body_markdown: p.body_markdown.clone(),
             artifact_sha256: None,
+            edit_mode: Some(p.edit_mode.clone()),
+            patch_json: serde_json::to_value(&p.edits).ok(),
+            expected_base_body_sha256,
         });
     }
     Ok(proposals)
@@ -1928,48 +2843,117 @@ struct StagedAutoImproveData {
     run_id: ai_memory_core::AutoImproveRunId,
     proposal_ids: Vec<AutoImproveProposalId>,
     sidecar_paths: Vec<String>,
+    /// Proposals the store refused to stage. Dropping these here would hand the
+    /// operator a run reporting N-1 proposals with nothing saying the Nth
+    /// existed — the silent drop the per-proposal skip was meant to end.
+    skipped: Vec<SkippedProposal>,
+}
+
+/// Everything `stage_auto_improve_report` needs about WHO and WHERE, bundled so
+/// the helper keeps a readable arity.
+struct AutoImproveStagingScope<'a> {
+    ws: WorkspaceId,
+    proj: ProjectId,
+    session_id: SessionId,
+    cfg: &'a AutoImproveReviewConfig,
+    /// Typed operator that staged the run; also scopes the
+    /// one-pending-per-target rule.
+    staging_owner: Option<ai_memory_core::IdentityKey>,
 }
 
 async fn stage_auto_improve_report(
     state: &AdminState,
-    ws: WorkspaceId,
-    proj: ProjectId,
-    session_id: SessionId,
-    req: &AutoImproveRequest,
+    scope: AutoImproveStagingScope<'_>,
     report: &ai_memory_consolidate::AutoImproveReport,
     proposals: Vec<NewAutoImproveProposal>,
 ) -> Result<StagedAutoImproveData, (StatusCode, Json<serde_json::Value>)> {
+    let AutoImproveStagingScope {
+        ws,
+        proj,
+        session_id,
+        cfg,
+        staging_owner,
+    } = scope;
     let staged = state
         .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: Some(session_id),
-            provider: Some(report.provider.clone()),
-            model: Some(report.model.clone()),
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::to_value(&report.warnings)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
-                .unwrap_or_else(|_| serde_json::json!([])),
-            config_json: serde_json::json!({
-                "min_observations": req.min_observations,
-                "min_session_duration_secs": req.min_session_duration_secs,
-                "min_confidence": req.min_confidence,
-                "max_input_tokens": req.max_input_tokens,
-                "max_proposals_per_run": req.max_proposals_per_run,
-                "include_raw_fallback": req.include_raw_fallback,
-            }),
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some(req.proposal_actor.clone()),
-                ..ai_memory_core::ActorContext::default()
+        .stage_auto_improve_run_for_owner(
+            StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: Some(session_id),
+                provider: Some(report.provider.clone()),
+                model: Some(report.model.clone()),
+                summary: Some(report.summary.clone()),
+                warnings_json: serde_json::to_value(&report.warnings)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                rejected_candidates_json: serde_json::to_value(&report.rejected_candidates)
+                    .unwrap_or_else(|_| serde_json::json!([])),
+                config_json: serde_json::json!({
+                    "min_observations": cfg.min_observations,
+                    "min_session_duration_secs": cfg.min_session_duration_secs,
+                    "min_confidence": cfg.min_confidence,
+                    "max_input_tokens": cfg.max_input_tokens,
+                    "max_proposals_per_run": cfg.max_proposals_per_run,
+                    "include_raw_fallback": cfg.include_raw_fallback,
+                    "max_patchable_pages": cfg.max_patchable_pages,
+                    "max_patchable_body_chars": cfg.max_patchable_body_chars,
+                    "max_edits_per_proposal": cfg.max_edits_per_proposal,
+                    "max_edit_content_chars": cfg.max_edit_content_chars,
+                    "max_changed_chars_per_proposal": cfg.max_changed_chars_per_proposal,
+                    "max_patch_edits_per_run": cfg.max_patch_edits_per_run,
+                    "max_rejection_context": cfg.max_rejection_context,
+                    "rejection_context_days": cfg.rejection_context_days,
+                    "max_final_body_chars": cfg.max_final_body_chars,
+                    "max_rule_page_tokens": cfg.max_rule_page_tokens,
+                    "max_procedure_page_tokens": cfg.max_procedure_page_tokens,
+                    "eval": cfg.eval,
+                }),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some(cfg.proposal_actor.clone()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals,
             },
-            proposals,
-        })
+            staging_owner,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
-    for id in &staged.proposal_ids {
+    let sidecar_paths = write_auto_improve_sidecars(state, ws, proj, &staged.proposal_ids).await?;
+    Ok(StagedAutoImproveData {
+        run_id: staged.run_id,
+        proposal_ids: staged.proposal_ids,
+        sidecar_paths,
+        skipped: staged.skipped,
+    })
+}
+
+async fn target_operation_for_page(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    target: &PagePath,
+) -> Result<AutoImproveProposalOperation, (StatusCode, Json<serde_json::Value>)> {
+    if state
+        .reader
+        .page_body_by_ids(ws, proj, target.as_str())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .is_some()
+    {
+        Ok(AutoImproveProposalOperation::Update)
+    } else {
+        Ok(AutoImproveProposalOperation::Create)
+    }
+}
+
+async fn write_auto_improve_sidecars(
+    state: &AdminState,
+    ws: WorkspaceId,
+    proj: ProjectId,
+    proposal_ids: &[AutoImproveProposalId],
+) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+    let mut sidecar_paths = Vec::with_capacity(proposal_ids.len());
+    for id in proposal_ids {
         let path = state
             .wiki
             .write_auto_improve_sidecar(ws, proj, *id)
@@ -1977,11 +2961,7 @@ async fn stage_auto_improve_report(
             .map_err(|e| internal_err(e.to_string()))?;
         sidecar_paths.push(path.display().to_string());
     }
-    Ok(StagedAutoImproveData {
-        run_id: staged.run_id,
-        proposal_ids: staged.proposal_ids,
-        sidecar_paths,
-    })
+    Ok(sidecar_paths)
 }
 
 fn auto_improve_error_response(
@@ -1992,18 +2972,120 @@ fn auto_improve_error_response(
         AutoImproveError::SessionNotFound(_) => StatusCode::NOT_FOUND,
         AutoImproveError::SessionOutOfScope { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         AutoImproveError::Llm(_) => StatusCode::BAD_GATEWAY,
+        AutoImproveError::Eval(_) => StatusCode::BAD_GATEWAY,
         AutoImproveError::Memory(_) => StatusCode::BAD_REQUEST,
         AutoImproveError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
+    log_server_error(status, "auto-improve", &e);
     (status, Json(serde_json::json!({ "error": e.to_string() })))
 }
 
 // ---------------------------------------------------------------------
-// curator report
+// auto-improve telemetry report
 // ---------------------------------------------------------------------
+
+async fn handle_auto_improve_report(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<AutoImproveTelemetryReportRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
+    let params = AutoImproveTelemetryParams {
+        since_days: req.since_days,
+        top_limit: req.limit.clamp(1, 100),
+    };
+    let report = run_auto_improve_telemetry_report(
+        &state.reader,
+        ws,
+        proj,
+        &req.workspace,
+        &req.project,
+        params.clone(),
+    )
+    .await
+    .map_err(|e| internal_err(e.to_string()))?;
+    if req.stage {
+        let body_markdown = render_auto_improve_telemetry_report_markdown(&report);
+        let target_path = auto_improve_report_target_path();
+        let target = PagePath::new(target_path).map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": format!("invalid auto-improve report target path: {e}") })),
+            )
+        })?;
+        let operation = target_operation_for_page(&state, ws, proj, &target).await?;
+        let staged = state
+            .writer
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                workspace_id: ws,
+                project_id: proj,
+                session_id: None,
+                provider: None,
+                model: None,
+                summary: Some(format!("Auto-improve telemetry report: {}", report.summary)),
+                warnings_json: serde_json::json!([]),
+                rejected_candidates_json: serde_json::json!([]),
+                config_json: serde_json::json!({
+                    "mode": "stage",
+                    "auto_improve_report": true,
+                    "params": params,
+                }),
+                proposal_actor: ai_memory_core::ActorContext {
+                    agent: Some("auto_improve_report".into()),
+                    ..ai_memory_core::ActorContext::default()
+                },
+                proposals: vec![NewAutoImproveProposal {
+                    operation,
+                    target_path: target,
+                    kind: "auto_improve_report".into(),
+                    title: "Auto-improve Telemetry Report".into(),
+                    confidence: 1.0,
+                    rationale: "Telemetry report only; approval writes the report page and performs no learning-memory changes.".into(),
+                    evidence_json: serde_json::json!({
+                        "summary": report.summary.clone(),
+                        "findings": report.findings.clone(),
+                        "params": report.params.clone(),
+                    }),
+                    body_markdown,
+                    artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
+                }],
+                },
+                None,
+            )
+            .await
+            .map_err(|e| internal_err(e.to_string()))?;
+        let sidecar_paths =
+            write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(AutoImproveTelemetryReportStageResponse {
+                    run_id: staged.run_id.to_string(),
+                    proposal_ids: staged
+                        .proposal_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    sidecar_paths,
+                    skipped: staged.skipped,
+                    report,
+                })
+                .unwrap_or_else(|_| serde_json::json!({})),
+            ),
+        ));
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
 
 async fn handle_curator(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(tuning): axum::Extension<SweepTuning>,
     Json(req): Json<CuratorRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let mode = req.mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -2027,13 +3109,14 @@ async fn handle_curator(
 
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
     let params = CuratorParams::default();
-    let mut report = run_curator_report(
+    let mut report = run_curator_report_with_breadth(
         &state.reader,
         ws,
         proj,
         &req.workspace,
         &req.project,
         params.clone(),
+        tuning.breadth_weight,
     )
     .await
     .map_err(|e| internal_err(e.to_string()))?;
@@ -2054,64 +3137,52 @@ async fn handle_curator(
             Json(serde_json::json!({ "error": format!("invalid curator target path: {e}") })),
         )
     })?;
-    let operation = if state
-        .reader
-        .page_body_by_ids(ws, proj, target.as_str())
-        .await
-        .map_err(|e| internal_err(e.to_string()))?
-        .is_some()
-    {
-        AutoImproveProposalOperation::Update
-    } else {
-        AutoImproveProposalOperation::Create
-    };
+    let operation = target_operation_for_page(&state, ws, proj, &target).await?;
 
     let staged = state
-        .writer
-        .stage_auto_improve_run(StageAutoImproveRun {
-            workspace_id: ws,
-            project_id: proj,
-            session_id: None,
-            provider: None,
-            model: None,
-            summary: Some(report.summary.clone()),
-            warnings_json: serde_json::json!([]),
-            rejected_candidates_json: serde_json::json!([]),
-            config_json: serde_json::json!({
-                "mode": "stage",
-                "curator": true,
-                "params": params,
-            }),
-            proposal_actor: ai_memory_core::ActorContext {
-                agent: Some("curator".into()),
-                ..ai_memory_core::ActorContext::default()
-            },
-            proposals: vec![NewAutoImproveProposal {
-                operation,
-                target_path: target,
-                kind: "curator_report".into(),
-                title: "Curator Report".into(),
-                confidence: 1.0,
-                rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
-                evidence_json: serde_json::json!({
-                    "summary": report.summary.clone(),
-                    "findings": report.findings.clone(),
-                }),
-                body_markdown,
-                artifact_sha256: None,
-            }],
-        })
+            .writer
+            .stage_auto_improve_run_for_owner(
+                StageAutoImproveRun {
+                    workspace_id: ws,
+                    project_id: proj,
+                    session_id: None,
+                    provider: None,
+                    model: None,
+                    summary: Some(report.summary.clone()),
+                    warnings_json: serde_json::json!([]),
+                    rejected_candidates_json: serde_json::json!([]),
+                    config_json: serde_json::json!({
+                        "mode": "stage",
+                        "curator": true,
+                        "params": params,
+                    }),
+                    proposal_actor: ai_memory_core::ActorContext {
+                        agent: Some("curator".into()),
+                        ..ai_memory_core::ActorContext::default()
+                    },
+                    proposals: vec![NewAutoImproveProposal {
+                        operation,
+                        target_path: target,
+                        kind: "curator_report".into(),
+                        title: "Curator Report".into(),
+                        confidence: 1.0,
+                        rationale: "Rule-based curator report only; approval writes the report page and performs no maintenance actions.".into(),
+                        evidence_json: serde_json::json!({
+                            "summary": report.summary.clone(),
+                            "findings": report.findings.clone(),
+                        }),
+                        body_markdown,
+                        artifact_sha256: None,
+                        edit_mode: None,
+                        patch_json: None,
+                        expected_base_body_sha256: None,
+                    }],
+                },
+            None,
+        )
         .await
         .map_err(|e| internal_err(e.to_string()))?;
-    let mut sidecar_paths = Vec::with_capacity(staged.proposal_ids.len());
-    for id in &staged.proposal_ids {
-        let path = state
-            .wiki
-            .write_auto_improve_sidecar(ws, proj, *id)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?;
-        sidecar_paths.push(path.display().to_string());
-    }
+    let sidecar_paths = write_auto_improve_sidecars(&state, ws, proj, &staged.proposal_ids).await?;
     Ok((
         StatusCode::OK,
         Json(
@@ -2123,6 +3194,7 @@ async fn handle_curator(
                     .map(ToString::to_string)
                     .collect(),
                 sidecar_paths,
+                skipped: staged.skipped,
                 report,
             })
             .unwrap_or_else(|_| serde_json::json!({})),
@@ -2134,6 +3206,359 @@ fn curator_target_path() -> String {
     let now = jiff::Timestamp::now().to_string();
     let date = now.get(0..10).unwrap_or("latest");
     format!("notes/curator-{date}.md")
+}
+
+fn auto_improve_report_target_path() -> String {
+    let stamp = jiff::Timestamp::now().as_microsecond();
+    format!("notes/auto-improve-report-{stamp}.md")
+}
+
+/// List open handoffs so an operator can cancel one (#513).
+///
+/// `memory_handoff_cancel` requires an exact id and nothing exposed one, so a
+/// backlog showed up as a count in `status` and could not be addressed.
+/// Read-only, oldest first, and content-free: identity, provenance and age,
+/// never the handoff body.
+async fn handle_open_handoffs_list(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<OpenHandoffsQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let limit = query.limit.clamp(1, 500);
+    match state
+        .reader
+        .open_handoffs_for_project(ws, proj, limit)
+        .await
+    {
+        Ok(handoffs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "handoffs": handoffs })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// `POST /admin/handoffs/expire` request body.
+#[derive(Deserialize)]
+struct ExpireHandoffsRequest {
+    workspace: String,
+    project: String,
+    /// Mandatory. Without `confirm: true` the server returns 400.
+    confirm: bool,
+    /// Only expire handoffs at least this many days old. Omitted clears the
+    /// whole open backlog for the scope.
+    #[serde(default)]
+    older_than_days: Option<u32>,
+}
+
+/// `POST /admin/handoffs/expire` — clear the open handoff backlog for one
+/// scope.
+///
+/// Unlike the automatic sweep this does not spare manual or
+/// different-directory handoffs. Those exemptions are what the leftover
+/// backlog is made of, so honouring them here would expire nothing. It is a
+/// state change rather than a delete: the summary and provenance survive and
+/// the handoff simply stops being consumable (#513).
+async fn handle_expire_handoffs(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<ExpireHandoffsRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "expiring the handoff backlog requires confirm=true"
+            })),
+        );
+    }
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+
+    // Same owner scoping as cancel: a caller clears their own and shared
+    // batons, never somebody else's.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let owner_filter = ai_memory_core::OwnerFilter::for_actor_context(&actor);
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+
+    let older_than_us = req.older_than_days.map(|days| {
+        jiff::Timestamp::now().as_microsecond() - i64::from(days) * 24 * 60 * 60 * 1_000_000
+    });
+
+    match state
+        .writer
+        .expire_open_handoffs(ws, proj, owner_filter, older_than_us, author_id)
+        .await
+    {
+        Ok(expired) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "expired": expired,
+                "workspace": req.workspace,
+                "project": req.project,
+            })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// List one side of a project's cross-project mailbox (V64): `box=inbox`
+/// (default) is mail addressed to it, `box=outbox` is mail it has sent and
+/// can still cancel. Oldest first, capped at `limit`. See
+/// `docs/agent-messaging.md`.
+async fn handle_list_messages(
+    State(state): State<Arc<AdminState>>,
+    Query(query): Query<ListMessagesQuery>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &query.workspace, &query.project).await
+    {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let mailbox = match query.mailbox.as_str() {
+        "inbox" => ai_memory_core::MessageBox::Inbox,
+        "outbox" => ai_memory_core::MessageBox::Outbox,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("box must be \"inbox\" or \"outbox\", got {other:?}")
+                })),
+            );
+        }
+    };
+    let limit = query.limit.clamp(1, 200);
+    match state.reader.list_messages(ws, proj, mailbox, limit).await {
+        Ok(messages) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "messages": messages })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` request body (V64).
+#[derive(Debug, Deserialize)]
+struct SendMessageRequest {
+    from_workspace: String,
+    from_project: String,
+    to_workspace: String,
+    to_project: String,
+    #[serde(default)]
+    subject: Option<String>,
+    body: String,
+}
+
+/// Map a message-store failure to a response. `InvalidState` is the
+/// full-inbox rejection (`ops::MAX_PENDING_INBOX_MESSAGES`) — a caller error,
+/// not a server fault, so it surfaces as 409 rather than 500 (mirrors
+/// [`map_user_store_err`]).
+fn map_message_store_err(e: StoreError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        StoreError::InvalidState(msg) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        other => internal_err(other.to_string()),
+    }
+}
+
+/// `POST /admin/messages/send` — drop a message into another project's
+/// inbox (V64). Both scopes are resolved with the no-create lookup: sending
+/// to a typo'd project must fail closed rather than silently creating it.
+///
+/// Security: `body` and `subject` are secret-scrubbed with the same
+/// [`ai_memory_core::Sanitizer`] the hook ingress uses before they are
+/// capped and stored — this endpoint is not a path around redaction.
+async fn handle_send_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<SendMessageRequest>,
+) -> impl IntoResponse {
+    let (from_ws, from_proj) =
+        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.from_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+    let (to_ws, to_proj) =
+        match lookup_ws_proj_no_create(&state, &req.to_workspace, &req.to_project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    let sanitizer = ai_memory_core::Sanitizer::builtin();
+    let body =
+        ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(&req.body), MESSAGE_BODY_MAX_CHARS);
+    let subject = req
+        .subject
+        .as_deref()
+        .map(|s| {
+            ai_memory_core::truncate_utf8_bytes(&sanitizer.scrub(s), MESSAGE_SUBJECT_MAX_CHARS)
+        })
+        .filter(|s| !s.is_empty());
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    // Owner is the sender's storage key, same as `handoff_begin` — attribution
+    // only (never a read filter), and `None` when the actor is anonymous or
+    // the deployment doesn't tell its operators apart.
+    let from_owner_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let message = ai_memory_core::NewAgentMessage {
+        from_workspace_id: from_ws,
+        from_project_id: from_proj,
+        from_agent: AgentKind::Other,
+        from_session_id: None,
+        from_owner_user,
+        to_workspace_id: to_ws,
+        to_project_id: to_proj,
+        subject,
+        body,
+    };
+
+    match state.writer.insert_message(message).await {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message_id": id.to_string() })),
+        ),
+        Err(e) => map_message_store_err(e),
+    }
+}
+
+/// `POST /admin/messages/pop` request body (V64).
+#[derive(Debug, Deserialize)]
+struct PopMessageRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+fn parse_optional_message_id(
+    raw: Option<&str>,
+) -> Result<Option<ai_memory_core::MessageId>, (StatusCode, Json<serde_json::Value>)> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<ai_memory_core::MessageId>)
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "message_id must be a full UUID" })),
+            )
+        })
+}
+
+/// `POST /admin/messages/pop` — claim exactly one pending message from this
+/// project's inbox (V64). With `message_id`, pops that one; otherwise the
+/// oldest pending. Returns `{"message": null}` when nothing matched.
+async fn handle_pop_message(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<PopMessageRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    let distinguishes = match state
+        .reader
+        .distinguishes_operators(state.trusted_proxy_identity)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return internal_err(e.to_string()),
+    };
+    let claiming_user = ai_memory_core::owner_stamp(
+        actor_ext
+            .as_ref()
+            .and_then(|axum::Extension(actor)| actor.identity_key())
+            .as_ref(),
+        distinguishes,
+    );
+
+    let claim = ai_memory_core::MessageClaim {
+        workspace_id: ws,
+        project_id: proj,
+        claiming_agent: AgentKind::Other,
+        claiming_session: None,
+        claiming_user,
+    };
+
+    match state.writer.pop_message(claim, specific_id).await {
+        Ok(Some(message)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "message": message,
+                "security_notice": ai_memory_core::UNTRUSTED_MESSAGE_NOTICE,
+            })),
+        ),
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "message": null }))),
+        Err(e) => internal_err(e.to_string()),
+    }
+}
+
+/// `POST /admin/messages/cancel` request body (V64).
+#[derive(Debug, Deserialize)]
+struct CancelMessagesRequest {
+    workspace: String,
+    project: String,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// `POST /admin/messages/cancel` — retract still-pending outbox messages
+/// this project sent (V64). With `message_id`, cancels just that one;
+/// otherwise every pending message the project has sent.
+async fn handle_cancel_messages(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CancelMessagesRequest>,
+) -> impl IntoResponse {
+    let (ws, proj) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+        Ok(ids) => ids,
+        Err(e) => return e,
+    };
+    let specific_id = match parse_optional_message_id(req.message_id.as_deref()) {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    match state.writer.cancel_messages(ws, proj, specific_id).await {
+        Ok(cancelled) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "cancelled": cancelled })),
+        ),
+        Err(e) => internal_err(e.to_string()),
+    }
 }
 
 async fn handle_pending_writes_list(
@@ -2183,7 +3608,7 @@ async fn pending_detail(
     (
         WorkspaceId,
         ProjectId,
-        ai_memory_store::AutoImproveProposalDetail,
+        ai_memory_store::OwnedAutoImproveProposalDetail,
     ),
     (StatusCode, Json<serde_json::Value>),
 > {
@@ -2196,7 +3621,7 @@ async fn pending_detail(
     let (ws, proj) = lookup_ws_proj_no_create(state, &query.workspace, &query.project).await?;
     let detail = state
         .reader
-        .auto_improve_proposal_detail(ws, proj, id)
+        .auto_improve_proposal_detail_with_owner(ws, proj, id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| {
@@ -2228,7 +3653,8 @@ async fn handle_pending_write_diff(
     Query(query): Query<PendingWriteScopeQuery>,
 ) -> impl IntoResponse {
     match pending_detail(&state, &id, &query).await {
-        Ok((ws, proj, detail)) => {
+        Ok((ws, proj, owned)) => {
+            let detail = &owned.detail;
             let before = state
                 .reader
                 .page_body_by_ids(ws, proj, detail.summary.target_path.as_str())
@@ -2632,8 +4058,11 @@ async fn handle_lint(
         state.llm.as_ref(),
         ws,
         proj,
-        req.dry_run,
-        !req.no_llm,
+        ai_memory_consolidate::LintOptions {
+            dry_run: req.dry_run,
+            use_llm: !req.no_llm,
+            decay_lambda: state.decay_params.lambda,
+        },
     )
     .await
     .map(|report| {
@@ -2665,16 +4094,20 @@ struct ForgetSweepRequest {
 
 async fn handle_forget_sweep(
     State(state): State<Arc<AdminState>>,
+    axum::Extension(tuning): axum::Extension<SweepTuning>,
     Json(req): Json<ForgetSweepRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let (ws, proj) = lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await?;
 
-    run_sweep(
+    run_sweep_with_options(
         &state.reader,
         &state.writer,
+        Some(&state.wiki),
         ws,
         proj,
         &state.decay_params,
+        tuning.breadth_weight,
+        tuning.retention,
         req.dry_run,
     )
     .await
@@ -2737,23 +4170,6 @@ pub struct EmbedReport {
     pub dim: u32,
 }
 
-#[derive(Default)]
-struct EmbedCounts {
-    embedded: usize,
-    skipped: usize,
-    failed: usize,
-    would_embed: usize,
-}
-
-impl EmbedCounts {
-    fn absorb(&mut self, other: Self) {
-        self.embedded += other.embedded;
-        self.skipped += other.skipped;
-        self.failed += other.failed;
-        self.would_embed += other.would_embed;
-    }
-}
-
 async fn embed_project_pages(
     state: &AdminState,
     embedder: &Arc<dyn Embedder>,
@@ -2761,87 +4177,18 @@ async fn embed_project_pages(
     proj: ProjectId,
     reembed: bool,
     dry_run: bool,
-) -> Result<EmbedCounts, (StatusCode, Json<serde_json::Value>)> {
-    let provider = embedder.provider().to_string();
-    let model = embedder.model().to_string();
-    let dim = embedder.dim();
-
-    let candidates = state
-        .reader
-        .decay_candidates(ws, proj)
-        .await
-        .map_err(|e| internal_err(e.to_string()))?;
-
-    let already: std::collections::HashSet<_> = if reembed {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .reader
-            .embedded_page_ids(ws, proj, provider.clone(), model.clone(), dim)
-            .await
-            .map_err(|e| internal_err(e.to_string()))?
-            .into_iter()
-            .collect()
-    };
-
-    let mut counts = EmbedCounts::default();
-    let mut pending = Vec::with_capacity(EMBEDDING_WRITE_BATCH);
-
-    for cand in candidates {
-        if !reembed && already.contains(&cand.id) {
-            counts.skipped += 1;
-            continue;
-        }
-        if dry_run {
-            counts.would_embed += 1;
-            continue;
-        }
-        let md = match state.wiki.read_page(ws, proj, &cand.path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: skip unreadable page");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        if md.body.trim().is_empty() {
-            counts.skipped += 1;
-            continue;
-        }
-        let vec = match embedder.embed_document(&md.body).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(path = %cand.path, error = %e, "embed: provider call failed");
-                counts.failed += 1;
-                continue;
-            }
-        };
-        pending.push(EmbeddingWrite {
-            page_id: cand.id,
-            vector_bytes: f32_vec_to_bytes(&vec),
-            provider: provider.clone(),
-            model: model.clone(),
-            dim,
-        });
-        if pending.len() >= EMBEDDING_WRITE_BATCH {
-            flush_embedding_batch(
-                &state.writer,
-                &mut pending,
-                &mut counts.embedded,
-                &mut counts.failed,
-            )
-            .await;
-        }
-    }
-    flush_embedding_batch(
+) -> Result<EmbedBackfillCounts, (StatusCode, Json<serde_json::Value>)> {
+    run_embedding_backfill(
+        &state.reader,
         &state.writer,
-        &mut pending,
-        &mut counts.embedded,
-        &mut counts.failed,
+        &state.wiki,
+        embedder,
+        ws,
+        proj,
+        EmbedBackfillOptions { reembed, dry_run },
     )
-    .await;
-
-    Ok(counts)
+    .await
+    .map_err(|e| internal_err(e.to_string()))
 }
 
 async fn handle_embed(
@@ -2864,7 +4211,7 @@ async fn handle_embed(
     let model = embedder.model().to_string();
     let dim = embedder.dim();
 
-    let mut totals = EmbedCounts::default();
+    let mut totals = EmbedBackfillCounts::default();
 
     if req.all_projects {
         if let Some(ws) = state
@@ -2931,25 +4278,6 @@ async fn handle_embed(
         StatusCode::OK,
         Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
     ))
-}
-
-async fn flush_embedding_batch(
-    writer: &WriterHandle,
-    pending: &mut Vec<EmbeddingWrite>,
-    embedded: &mut usize,
-    failed: &mut usize,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let batch = std::mem::replace(pending, Vec::with_capacity(EMBEDDING_WRITE_BATCH));
-    let count = batch.len();
-    if let Err(e) = writer.store_embeddings(batch).await {
-        *failed += count;
-        warn!(count, error = %e, "embed: store_embeddings failed");
-    } else {
-        *embedded += count;
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -3147,6 +4475,181 @@ async fn handle_restore_page(
 }
 
 // ---------------------------------------------------------------------
+// purge-session
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/purge-session`.
+#[derive(Deserialize)]
+struct PurgeSessionRequest {
+    /// Workspace name. Must already exist; 404 otherwise.
+    workspace: String,
+    /// Project name. Must already exist; 404 otherwise.
+    project: String,
+    /// Full `sessions.id` UUID. A session that does not belong to the named
+    /// workspace/project is a 404 — the id alone is never authority over
+    /// another scope.
+    session_id: String,
+    /// Mandatory confirmation flag. Without `confirm: true` the server
+    /// returns 400 — purging is destructive and irreversible.
+    confirm: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/purge-session`.
+#[derive(Debug, Serialize)]
+pub struct PurgeSessionReport {
+    /// Session id that was purged.
+    pub session_id: String,
+    /// Human workspace name.
+    pub workspace: String,
+    /// Human project name.
+    pub project: String,
+    /// Number of observations deleted.
+    pub observations_deleted: u64,
+    /// Number of authored handoffs deleted.
+    pub handoffs_deleted: u64,
+    /// Number of page rows deleted, counting superseded versions.
+    pub pages_deleted: u64,
+    /// Number of auto-improvement runs deleted.
+    pub auto_improve_runs_deleted: u64,
+    /// Distinct wiki page paths whose database rows were deleted.
+    pub removed_paths: Vec<PagePath>,
+    /// Distinct wiki page paths removed from disk after the database purge.
+    pub files_deleted: Vec<PagePath>,
+    /// Distinct wiki page paths that could not be removed from disk.
+    pub files_failed: Vec<PagePath>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran).
+    pub compacted: bool,
+    /// Pre-purge checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-purge checkpoint, if the purge changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `POST /admin/purge-session` — delete one session and everything derived
+/// from it, inside a single workspace/project scope.
+async fn handle_purge_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<PurgeSessionRequest>,
+) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+
+    let session_id = match req.session_id.trim().parse::<SessionId>() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "session_id must be a full UUID" })),
+            );
+        }
+    };
+
+    let (ws_id, proj_id) =
+        match lookup_ws_proj_no_create(&state, &req.workspace, &req.project).await {
+            Ok(ids) => ids,
+            Err(e) => return e,
+        };
+
+    // Admission runs before anything is deleted so a reject-policy webhook can
+    // refuse while every row is still intact — same order as purge-project.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let ctx = AdmissionContext {
+        workspace: req.workspace.clone(),
+        project: req.project.clone(),
+        op: AdmissionOp::PurgeSession,
+        actor,
+        ..Default::default()
+    };
+    let mut dispatch_ctx = match state
+        .wiki
+        .admit_purge_session(ws_id, proj_id, Some(ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let label = format!("{}/{}: {}", req.workspace, req.project, session_id);
+    let pre_checkpoint = match checkpoint_or_500(&state.wiki, format!("pre-purge-session {label}"))
+    {
+        Ok(oid) => oid,
+        Err(e) => return e,
+    };
+
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
+    let outcome = match state
+        .wiki
+        .purge_session(ws_id, proj_id, session_id, author_id, compaction)
+        .await
+    {
+        Ok(s) => s,
+        // Absent from this scope (or already purged) is a 404, not a fault.
+        Err(WikiError::Store(e @ StoreError::NotFound(_))) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let ai_memory_wiki::PurgeSessionOutcome {
+        summary,
+        files_deleted,
+        files_failed,
+    } = outcome;
+    if !files_failed.is_empty()
+        && let Some(ref mut ctx) = dispatch_ctx
+    {
+        ctx.partial_failure = true;
+    }
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
+
+    let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-session {label}"));
+
+    let report = PurgeSessionReport {
+        session_id: session_id.to_string(),
+        workspace: req.workspace,
+        project: req.project,
+        observations_deleted: summary.observations_deleted,
+        handoffs_deleted: summary.handoffs_deleted,
+        pages_deleted: summary.pages_deleted,
+        auto_improve_runs_deleted: summary.auto_improve_runs_deleted,
+        removed_paths: summary.removed_paths,
+        files_deleted,
+        files_failed,
+        compacted: summary.compacted,
+        pre_checkpoint,
+        checkpoint,
+    };
+
+    (StatusCode::OK, Json(json_or_empty(&report)))
+}
+
+// ---------------------------------------------------------------------
 // purge-project
 // ---------------------------------------------------------------------
 
@@ -3160,6 +4663,16 @@ struct PurgeProjectRequest {
     /// Mandatory confirmation flag. Without `confirm: true` the server
     /// returns 400 — purging is destructive and irreversible.
     confirm: bool,
+    /// Purge even when a managed workstream under this project still holds a
+    /// live run lease. Off by default: the cascade would delete that lease row
+    /// out from under a running agent, which then cannot save its history.
+    #[serde(default)]
+    force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
 }
 
 /// Wire-format summary returned by `POST /admin/purge-project`.
@@ -3177,10 +4690,21 @@ pub struct PurgeProjectReport {
     pub handoffs_deleted: u64,
     /// Number of `page_embeddings` rows deleted.
     pub embeddings_deleted: u64,
+    /// Number of managed `workstreams` rows deleted via cascade.
+    pub workstreams_deleted: u64,
+    /// Number of `managed_runs` rows deleted via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose `raw/workstreams/<id>/` segment
+    /// directories were included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
     /// Paths removed from disk (the project's UUID-namespaced directory).
     pub files_deleted: Vec<String>,
     /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
     pub files_failed: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete: the rows are gone from the API and from search,
+    /// but their bytes stay in free pages until the file is next rewritten.
+    pub compacted: bool,
     /// Pre-purge checkpoint, if the tree had uncommitted changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_checkpoint: Option<String>,
@@ -3189,11 +4713,83 @@ pub struct PurgeProjectReport {
     pub checkpoint: Option<String>,
 }
 
+async fn remove_workstream_segment_storage(
+    state: &AdminState,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let mut deleted = Vec::with_capacity(workstream_ids.len());
+    let mut failed = Vec::new();
+
+    for workstream_id in workstream_ids {
+        let path = state
+            .data_dir
+            .join("raw")
+            .join("workstreams")
+            .join(workstream_id);
+        let path_display = path.display().to_string();
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => deleted.push(path_display),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    operation,
+                    path = %path_display,
+                    error = %error,
+                    "scope purge failed to remove workstream segment directory"
+                );
+                failed.push(path_display);
+            }
+        }
+    }
+
+    (deleted, failed)
+}
+
+async fn remove_purged_project_storage(
+    state: &AdminState,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workstream_ids: &[String],
+    operation: &'static str,
+) -> (Vec<String>, Vec<String>) {
+    let project_root = state.wiki.project_root(workspace_id, project_id);
+    let project_root_display = project_root.display().to_string();
+    let mut deleted = Vec::with_capacity(workstream_ids.len() + 1);
+    let mut failed = Vec::new();
+
+    match state
+        .wiki
+        .remove_project_dir(workspace_id, project_id)
+        .await
+    {
+        Ok(()) => deleted.push(project_root_display.clone()),
+        Err(error) => {
+            warn!(
+                operation,
+                path = %project_root_display,
+                error = %error,
+                "project purge failed to remove wiki directory"
+            );
+            failed.push(project_root_display);
+        }
+    }
+
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, workstream_ids, operation).await;
+    deleted.extend(raw_deleted);
+    failed.extend(raw_failed);
+
+    (deleted, failed)
+}
+
 async fn handle_purge_project(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<PurgeProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     if !req.confirm {
         return (
             StatusCode::BAD_REQUEST,
@@ -3243,30 +4839,41 @@ async fn handle_purge_project(
         Err(e) => return e,
     };
 
-    let summary = match state.writer.purge_project(ws_id, proj_id, &label).await {
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+
+    let summary = match state
+        .writer
+        .purge_project(ws_id, proj_id, &label, author_id, req.force, compaction)
+        .await
+    {
         Ok(s) => s,
+        // A live managed run is a conflict, not a server fault: the operator
+        // can finish the session or retry with `force`. Same status the
+        // heartbeat itself returns when a lease is gone, so the two agree.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            );
+        }
         Err(e) => return internal_err(e.to_string()),
     };
 
-    // Remove the entire per-project directory: <wiki_root>/<ws_uuid>/<proj_uuid>/.
-    // DB cascade already deleted all rows. Directory removal remains best-effort
-    // and is reported separately, matching the pre-admission purge contract.
-    let proj_root_str = state
-        .wiki
-        .project_root(ws_id, proj_id)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(ws_id, proj_id).await {
-        Ok(()) => {
-            files_deleted.push(proj_root_str);
-        }
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "purge-project: failed to remove project dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // DB cascade already deleted all rows. Remove both the wiki project root
+    // and every raw managed-workstream segment directory best-effort, reporting
+    // partial failures without disguising the committed database purge.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        &state,
+        ws_id,
+        proj_id,
+        &summary.workstream_ids,
+        "purge-project",
+    )
+    .await;
     // Mirrors that track filesystem reality (a git-push mirror) want to
     // know the on-disk dir is still present even though the DB rows are
     // gone, so they can refuse to drop their own copy in violation of
@@ -3279,7 +4886,10 @@ async fn handle_purge_project(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
+
+    state.active_project.clear_project(proj_id);
+    invalidate_scope_cache(&state, ScopeInvalidation::Project(proj_id)).await;
 
     let checkpoint = checkpoint_or_warn(&state.wiki, format!("purge-project {label}"));
 
@@ -3290,6 +4900,10 @@ async fn handle_purge_project(
         observations_deleted: summary.observations_deleted,
         handoffs_deleted: summary.handoffs_deleted,
         embeddings_deleted: summary.embeddings_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
+        compacted: summary.compacted,
         files_deleted,
         files_failed,
         pre_checkpoint,
@@ -3305,6 +4919,321 @@ async fn handle_purge_project(
 // ---------------------------------------------------------------------
 // rename-project
 // ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/rename-workspace`.
+#[derive(Deserialize)]
+struct RenameWorkspaceRequest {
+    /// Current workspace name (must exist).
+    from: String,
+    /// New workspace name. Must be non-empty, no slashes, and not already used.
+    to: String,
+}
+
+/// Wire-format summary returned by `POST /admin/rename-workspace`.
+#[derive(Debug, Serialize)]
+pub struct RenameWorkspaceResult {
+    /// Previous workspace name.
+    pub from: String,
+    /// New workspace name.
+    pub to: String,
+    /// Post-rename mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Number of scope manifests refreshed after the SQLite rename.
+    pub manifests_refreshed: usize,
+    /// Non-fatal manifest refresh failure after the SQLite rename committed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_warning: Option<String>,
+}
+
+/// `POST /admin/rename-workspace` — rename a workspace (column-only; the
+/// on-disk dir is UUID-keyed, so nothing moves). 404 unknown, 422 taken/invalid.
+async fn handle_rename_workspace(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<RenameWorkspaceRequest>,
+) -> impl IntoResponse {
+    let ws_id = match lookup_ws_no_create(&state, &req.from).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+    if let Err(e) = state.writer.rename_workspace(ws_id, req.to.clone()).await {
+        let status = match &e {
+            StoreError::WorkspaceNameTaken(_) | StoreError::InvalidWorkspaceName(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        return (status, Json(serde_json::json!({ "error": e.to_string() })));
+    }
+    let (manifests_refreshed, manifest_warning) = match state.wiki.backfill_scope_manifests().await
+    {
+        Ok(n) => (n, None),
+        Err(e) => {
+            warn!(error = %e, "rename-workspace: scope-manifest backfill failed after rename");
+            (0, Some(e.to_string()))
+        }
+    };
+    invalidate_scope_cache(&state, ScopeInvalidation::Workspace(ws_id)).await;
+    let checkpoint = checkpoint_or_warn(
+        &state.wiki,
+        format!("rename-workspace {} -> {}", req.from, req.to),
+    );
+    let result = RenameWorkspaceResult {
+        from: req.from.clone(),
+        to: req.to.clone(),
+        checkpoint,
+        manifests_refreshed,
+        manifest_warning,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+    )
+}
+
+/// JSON request body for `POST /admin/delete-workspace`.
+#[derive(Deserialize)]
+struct DeleteWorkspaceRequest {
+    /// Workspace name to delete (must exist).
+    workspace: String,
+    /// Delete even when the workspace still holds projects. Without it, a
+    /// non-empty workspace is refused so a typo can't wipe live data.
+    #[serde(default)]
+    force: bool,
+    /// Reclaim freed bytes: rebuild the FTS indexes and `VACUUM` after the
+    /// delete commits. Off by default; see `ai_memory_store::Compaction` for
+    /// the cost and for what it does not guarantee.
+    #[serde(default)]
+    compact: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/delete-workspace`.
+#[derive(Debug, Serialize)]
+pub struct DeleteWorkspaceResult {
+    /// Workspace name that was deleted.
+    pub workspace: String,
+    /// Projects removed via the `workspace_id` cascade.
+    pub projects_deleted: u64,
+    /// `pages` rows removed via cascade (all versions).
+    pub pages_deleted: u64,
+    /// Managed `workstreams` rows removed via cascade.
+    pub workstreams_deleted: u64,
+    /// `managed_runs` rows removed via cascade.
+    pub managed_runs_deleted: u64,
+    /// Ids of the deleted workstreams whose raw segment directories were
+    /// included in the post-commit cleanup.
+    pub workstream_ids: Vec<String>,
+    /// Paths removed from disk (the workspace directory and raw segments).
+    pub files_deleted: Vec<String>,
+    /// Paths that could not be removed from disk (non-fatal; DB rows are gone).
+    pub files_failed: Vec<String>,
+    /// Whether the freed bytes were reclaimed (`VACUUM` ran). False for a
+    /// plain logical delete: the rows are gone from the API and from search,
+    /// but their bytes stay in free pages until the file is next rewritten.
+    pub compacted: bool,
+    /// Pre-delete checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-delete mirror checkpoint, if one was taken.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// `POST /admin/delete-workspace` — remove a workspace and, via cascade, every
+/// project/page under it. Guarded: refuses a non-empty workspace unless
+/// `force` (a typo shouldn't wipe live data). Orphan-workspace cleanup.
+/// JSON request body for `POST /admin/compact`.
+#[derive(Deserialize)]
+struct CompactRequest {
+    /// Mandatory confirmation. Not because compaction destroys anything — it
+    /// deletes nothing — but because it takes an exclusive lock and rewrites
+    /// the whole database, so every write blocks until it finishes. That is an
+    /// availability decision, and it should be deliberate.
+    confirm: bool,
+}
+
+/// Wire-format summary returned by `POST /admin/compact`.
+#[derive(Debug, Serialize)]
+pub struct CompactReport {
+    /// Database size in bytes before the rebuild + `VACUUM`.
+    pub bytes_before: u64,
+    /// Database size in bytes afterwards.
+    pub bytes_after: u64,
+    /// Bytes returned to the filesystem (saturating at zero).
+    pub bytes_reclaimed: u64,
+}
+
+/// `POST /admin/compact` — rebuild the FTS indexes and `VACUUM`, deleting
+/// nothing. The on-demand form of what the destructive commands offer as
+/// `--compact`.
+async fn handle_compact(
+    State(state): State<Arc<AdminState>>,
+    Json(req): Json<CompactRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "compact rewrites the whole database under an exclusive \
+                          lock; pass confirm: true to proceed"
+            })),
+        );
+    }
+    match state.writer.compact().await {
+        Ok(summary) => {
+            let report = CompactReport {
+                bytes_before: summary.bytes_before,
+                bytes_after: summary.bytes_after,
+                bytes_reclaimed: summary.bytes_reclaimed(),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn handle_delete_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<DeleteWorkspaceRequest>,
+) -> impl IntoResponse {
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let compaction = if req.compact {
+        ai_memory_store::Compaction::Reclaim
+    } else {
+        ai_memory_store::Compaction::Skip
+    };
+    match delete_workspace_core(&state, &req.workspace, req.force, actor, compaction).await {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null)),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// Delete a workspace and, via cascade, every project/page under it — returning
+/// the summary as data (or the HTTP error a handler surfaces verbatim). Guarded:
+/// refuses a non-empty workspace unless `force`. Shared by
+/// `handle_delete_workspace` and `handle_merge_workspace` (which drains the
+/// source workspace first, then deletes the now-empty shell with `force=false`).
+async fn delete_workspace_core(
+    state: &Arc<AdminState>,
+    workspace: &str,
+    force: bool,
+    actor: ai_memory_core::ActorContext,
+    compaction: ai_memory_store::Compaction,
+) -> Result<DeleteWorkspaceResult, MoveErr> {
+    let ws_id = lookup_ws_no_create(state, workspace).await?;
+
+    if !force {
+        match state
+            .reader
+            .list_projects_with_stats_for_workspace(workspace.to_string())
+            .await
+        {
+            Ok(projects) if !projects.is_empty() => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": StoreError::WorkspaceNotEmpty(projects.len() as u64).to_string()
+                    })),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => return Err(internal_err(e.to_string())),
+        }
+    }
+
+    let purge_ctx = AdmissionContext {
+        workspace: workspace.to_string(),
+        project: String::new(),
+        op: AdmissionOp::PurgeWorkspace,
+        actor,
+        ..Default::default()
+    };
+    let resolved_purge_ctx = match state
+        .wiki
+        .admit_purge_workspace(ws_id, Some(purge_ctx))
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => return Err(internal_err(e.to_string())),
+    };
+
+    let pre_checkpoint =
+        checkpoint_or_500(&state.wiki, format!("pre-delete-workspace {workspace}"))?;
+
+    let summary = match state
+        .writer
+        .delete_workspace(ws_id, force, compaction)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            let status = match &e {
+                StoreError::WorkspaceNotEmpty(_) => StatusCode::CONFLICT,
+                StoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return Err((status, Json(serde_json::json!({ "error": e.to_string() }))));
+        }
+    };
+
+    let ws_root_str = state
+        .wiki
+        .root()
+        .join(ws_id.to_string())
+        .display()
+        .to_string();
+    let mut files_deleted = Vec::with_capacity(summary.workstream_ids.len() + 1);
+    let mut files_failed = Vec::new();
+    match state.wiki.remove_workspace_dir(ws_id).await {
+        Ok(()) => files_deleted.push(ws_root_str.clone()),
+        Err(e) => {
+            warn!(error = %e, workspace = %workspace, path = %ws_root_str, "delete-workspace: on-disk dir removal failed");
+            files_failed.push(ws_root_str);
+        }
+    }
+    let (raw_deleted, raw_failed) =
+        remove_workstream_segment_storage(state, &summary.workstream_ids, "delete-workspace").await;
+    files_deleted.extend(raw_deleted);
+    files_failed.extend(raw_failed);
+
+    let mut dispatch_ctx = resolved_purge_ctx;
+    if !files_failed.is_empty()
+        && let Some(ref mut c) = dispatch_ctx
+    {
+        c.partial_failure = true;
+    }
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
+
+    state.active_project.clear_workspace(ws_id);
+    invalidate_scope_cache(state, ScopeInvalidation::Workspace(ws_id)).await;
+
+    Ok(DeleteWorkspaceResult {
+        workspace: workspace.to_string(),
+        projects_deleted: summary.projects_deleted,
+        pages_deleted: summary.pages_deleted,
+        workstreams_deleted: summary.workstreams_deleted,
+        managed_runs_deleted: summary.managed_runs_deleted,
+        workstream_ids: summary.workstream_ids,
+        compacted: summary.compacted,
+        files_deleted,
+        files_failed,
+        pre_checkpoint,
+        checkpoint: checkpoint_or_warn(&state.wiki, format!("delete-workspace {workspace}")),
+    })
+}
 
 /// JSON request body for `POST /admin/rename-project`.
 #[derive(Deserialize)]
@@ -3336,8 +5265,10 @@ pub struct RenameProjectSummary {
 
 async fn handle_rename_project(
     State(state): State<Arc<AdminState>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     Json(req): Json<RenameProjectRequest>,
 ) -> impl IntoResponse {
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     // Look up workspace + source project; 404 if either is absent.
     let (ws_id, proj_id) = match lookup_ws_proj_no_create(&state, &req.workspace, &req.from).await {
         Ok(ids) => ids,
@@ -3352,7 +5283,7 @@ async fn handle_rename_project(
     // instead of the previous false-200.
     if let Err(e) = state
         .writer
-        .rename_project(ws_id, proj_id, req.to.clone())
+        .rename_project(ws_id, proj_id, req.to.clone(), author_id)
         .await
     {
         let status = match &e {
@@ -3431,12 +5362,13 @@ struct MoveProjectRequest {
     /// Mandatory confirmation flag. The move PURGES the source after
     /// copying, so without `confirm: true` the server returns 400.
     confirm: bool,
-    /// Override the live-session guard. By default the server refuses (409)
+    /// Override the active-project guard. By default the server refuses (409)
     /// to move the project the hook router is currently writing to, since a
     /// live session's next observation would carry a stale workspace id.
     /// `force: true` proceeds anyway (still safe: the move republishes the
     /// active pointer and the (workspace_id, project_id) trigger makes any
-    /// stale write fail cleanly rather than corrupt).
+    /// stale write fail cleanly rather than corrupt). It never overrides a
+    /// live managed-workstream lease in the destructive copy-purge path.
     #[serde(default)]
     force: bool,
     /// Policy for the copy-purge MERGE path when a source page's path already
@@ -3485,6 +5417,9 @@ pub struct MoveProjectReport {
     /// Number of latest pages copied into the destination (copy-purge) or
     /// re-stamped in place (true-move).
     pub pages_copied: u64,
+    /// Managed workstreams re-stamped in place by a lossless true move.
+    /// Copy-purge reports zero because it does not transfer managed history.
+    pub workstreams_moved: u64,
     /// Source paths whose on-disk file could not be read (copy skipped).
     /// When non-empty the source is NOT purged so a fixed re-run is safe.
     pub pages_skipped: Vec<String>,
@@ -3526,6 +5461,12 @@ pub struct PathConflict {
     pub moved_to: String,
 }
 
+/// An error response from a move: the HTTP status + JSON body a handler would
+/// have returned directly. The move core returns this as the `Err` arm so a
+/// single move can be surfaced verbatim by `handle_move_project` or aggregated
+/// by `handle_merge_workspace`.
+type MoveErr = (StatusCode, Json<serde_json::Value>);
+
 /// Lossless cross-workspace move: under the wiki mutation gate, rename the
 /// project's on-disk dir to the destination workspace, then re-stamp its
 /// `workspace_id` across every domain table (one transaction, same
@@ -3538,7 +5479,7 @@ async fn true_move_project(
     src_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Ensure the destination workspace ROW exists (FK target for the
     // re-stamp) without creating a new project — the existing project_id is
     // what we move.
@@ -3548,7 +5489,7 @@ async fn true_move_project(
         .await
     {
         Ok(ws) => ws,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // A true move targets a FRESH destination, so its dir must not already
@@ -3556,7 +5497,7 @@ async fn true_move_project(
     // exclusive mutation guard before it renames anything.
     let dst_dir = state.wiki.project_root(dst_ws, src_proj);
     if dst_dir.exists() {
-        return (
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3564,7 +5505,7 @@ async fn true_move_project(
                     dst_dir.display()
                 )
             })),
-        );
+        ));
     }
 
     let move_ctx = AdmissionContext {
@@ -3587,20 +5528,20 @@ async fn true_move_project(
     {
         Ok(s) => s,
         Err(WikiError::Store(StoreError::NotFound(msg))) => {
-            return (
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": msg })),
-            );
+            ));
         }
         Err(e @ WikiError::DestinationExists(_)) => {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({ "error": e.to_string() })),
-            );
+            ));
         }
         Err(e) => {
             warn!(error = %e, "true-move: move aborted before completion");
-            return internal_err(format!("move aborted (nothing changed): {e}"));
+            return Err(internal_err(format!("move aborted (nothing changed): {e}")));
         }
     };
 
@@ -3608,13 +5549,11 @@ async fn true_move_project(
     // unchanged, only its workspace moved. If a hook had published this project
     // as active, republish it under the destination workspace so the next event
     // resolves cleanly (rather than tripping the pairing trigger first).
-    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
-        state.active_project.set(dst_ws, src_proj);
-    }
+    state
+        .active_project
+        .retarget_project_workspace(src_proj, dst_ws);
     // Proactively drop any stale per-cwd cache entry for the moved project.
-    if let Some(evict) = &state.on_project_moved {
-        evict(src_proj);
-    }
+    invalidate_scope_cache(state, ScopeInvalidation::Project(src_proj)).await;
 
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "true-move: scope-manifest backfill failed after move");
@@ -3633,6 +5572,7 @@ async fn true_move_project(
         merged_into_existing: false,
         moved_via: "true-move",
         pages_copied: summary.pages_moved,
+        workstreams_moved: summary.workstreams_moved,
         pages_skipped: Vec::new(),
         // Nothing is purged in a true move — the source rows ARE the
         // destination rows, just re-stamped.
@@ -3649,10 +5589,7 @@ async fn true_move_project(
         pre_checkpoint,
         checkpoint,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-    )
+    Ok(report)
 }
 
 /// Token inserted between the original stem and the source-workspace
@@ -3719,15 +5656,83 @@ fn page_copy_differs(
     source_tier: Tier,
     source_pinned: bool,
 ) -> bool {
-    let source_frontmatter = match serde_json::to_string(&source.frontmatter) {
-        Ok(value) => value,
-        Err(_) => return true,
-    };
+    // Frontmatter comparison is modulo the per-version `generated.at`,
+    // matching the store's own idempotency projection: two pages whose
+    // only difference is WHEN they were written are the same content.
+    // Comparing it raw made merge-conflict detection timing-flaky — the
+    // same seeded page written across a second boundary 409'd as
+    // "different content" (found via the copy_purge flake on Windows).
+    let existing_frontmatter: serde_json::Value =
+        serde_json::from_str(&existing.frontmatter_json).unwrap_or_default();
     existing.body != source.body
-        || existing.frontmatter_json != source_frontmatter
+        || ai_memory_core::okf::strip_generated_at(&existing_frontmatter)
+            != ai_memory_core::okf::strip_generated_at(&source.frontmatter)
         || existing.title != source_title
         || existing.tier != source_tier.as_str()
         || existing.pinned != source_pinned
+}
+
+#[cfg(test)]
+mod page_copy_differs_tests {
+    use super::*;
+
+    fn stored(fm: serde_json::Value, body: &str) -> ai_memory_store::StoredPageBody {
+        ai_memory_store::StoredPageBody {
+            title: "T".into(),
+            body: body.into(),
+            frontmatter_json: fm.to_string(),
+            tier: "semantic".into(),
+            pinned: false,
+        }
+    }
+
+    /// Two pages whose only difference is WHEN they were written are the
+    /// same content — the projection matches the store's idempotency rule.
+    #[test]
+    fn generated_at_alone_is_not_a_conflict() {
+        let existing = stored(
+            serde_json::json!({"title": "T", "generated": {"by": "x", "at": "2026-09-01T00:00:00Z"}}),
+            "same",
+        );
+        let source = Markdown {
+            frontmatter: serde_json::json!({"title": "T", "generated": {"by": "x", "at": "2026-09-02T00:00:00Z"}}),
+            body: "same".into(),
+        };
+        assert!(!page_copy_differs(
+            &existing,
+            &source,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+    }
+
+    #[test]
+    fn body_and_real_frontmatter_changes_still_conflict() {
+        let existing = stored(serde_json::json!({"title": "T"}), "one");
+        let body_diff = Markdown {
+            frontmatter: serde_json::json!({"title": "T"}),
+            body: "two".into(),
+        };
+        assert!(page_copy_differs(
+            &existing,
+            &body_diff,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+        let fm_diff = Markdown {
+            frontmatter: serde_json::json!({"title": "T", "tags": ["x"]}),
+            body: "one".into(),
+        };
+        assert!(page_copy_differs(
+            &existing,
+            &fm_diff,
+            "T",
+            Tier::Semantic,
+            false
+        ));
+    }
 }
 
 async fn handle_move_project(
@@ -3735,42 +5740,62 @@ async fn handle_move_project(
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     Json(req): Json<MoveProjectRequest>,
 ) -> impl IntoResponse {
+    // Carry the authenticated actor into both legs (move admission + the
+    // source-purge admission) so a scope-guard webhook authorizes by user.
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    match move_project_core(&state, &req, actor).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        ),
+        Err(resp) => resp,
+    }
+}
+
+/// Validate one move request, pick the true-move vs copy-purge path, and
+/// execute it — returning the report as data (or the HTTP error a handler
+/// surfaces verbatim). Shared by `handle_move_project` (one move) and
+/// `handle_merge_workspace` (a move per source project).
+async fn move_project_core(
+    state: &Arc<AdminState>,
+    req: &MoveProjectRequest,
+    actor: ai_memory_core::ActorContext,
+) -> Result<MoveProjectReport, MoveErr> {
     // Destructive: it purges the source after copying. Require confirm.
     if !req.confirm {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "destructive operation requires confirm=true"
             })),
-        );
+        ));
     }
 
     // A same-workspace "move" would get-or-create the SAME project as both
     // source and destination, copy it onto itself, then purge it — data
     // loss. Reject; in-workspace renames go through rename-project.
     if req.from_workspace == req.to_workspace {
-        return (
+        return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": "from_workspace and to_workspace are identical; use rename-project instead"
             })),
-        );
+        ));
     }
 
     // Resolve the SOURCE without auto-creating — 404 on a typo.
     let (src_ws, src_proj) =
-        match lookup_ws_proj_no_create(&state, &req.from_workspace, &req.project).await {
-            Ok(ids) => ids,
-            Err(e) => return e,
-        };
+        lookup_ws_proj_no_create(state, &req.from_workspace, &req.project).await?;
 
     // Live-session guard: refuse to move the project the hook router is
     // currently writing to. A live session's next observation/log would carry
     // the now-stale workspace id (the (workspace_id, project_id) trigger would
     // make it fail, but the operator should consciously opt in). `force: true`
     // proceeds — safe because the move republishes the active pointer below.
-    if !req.force && state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
-        return (
+    if !req.force && state.active_project.contains_project(src_proj) {
+        return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!(
@@ -3779,7 +5804,7 @@ async fn handle_move_project(
                     req.from_workspace, req.project
                 )
             })),
-        );
+        ));
     }
 
     // Detect MERGE: does the destination workspace already hold a same-named
@@ -3790,19 +5815,16 @@ async fn handle_move_project(
             Ok(Some(_))
         ),
         Ok(None) => false,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let pre_checkpoint = match checkpoint_or_500(
+    let pre_checkpoint = checkpoint_or_500(
         &state.wiki,
         format!(
             "pre-move-project {}/{} -> {}/{}",
             req.from_workspace, req.project, req.to_workspace, req.project
         ),
-    ) {
-        Ok(oid) => oid,
-        Err(e) => return e,
-    };
+    )?;
 
     // FRESH destination (no same-named project there) → lossless TRUE MOVE.
     // Re-stamp the source project's workspace_id across every domain table in
@@ -3812,27 +5834,18 @@ async fn handle_move_project(
     // admission webhook. The copy+purge path below is reserved for the MERGE
     // case, where two project_ids can't be re-stamped into one
     // (UNIQUE(workspace_id, name) collision).
-    // Carry the authenticated actor into both legs (move admission + the
-    // source-purge admission) so a scope-guard webhook authorizes by user.
-    let actor = actor_ext
-        .map(|axum::Extension(a)| a)
-        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
-
     if !merged_into_existing {
-        return true_move_project(&state, &req, src_ws, src_proj, pre_checkpoint, actor).await;
+        return true_move_project(state, req, src_ws, src_proj, pre_checkpoint, actor).await;
     }
 
     // MERGE: the destination already holds a same-named project. Get-or-create
     // it (auto-creating the destination workspace) and copy the source's
     // latest pages into it, then purge the source.
-    let (dst_ws, dst_proj) = match create_ws_proj(&state, &req.to_workspace, &req.project).await {
-        Ok(ids) => ids,
-        Err(e) => return e,
-    };
+    let (dst_ws, dst_proj) = create_ws_proj(state, &req.to_workspace, &req.project).await?;
 
     copy_purge_merge(
-        &state,
-        &req,
+        state,
+        req,
         src_ws,
         src_proj,
         dst_ws,
@@ -3841,6 +5854,829 @@ async fn handle_move_project(
         actor,
     )
     .await
+}
+
+// ---------------------------------------------------------------------
+// move-session
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/move-session`.
+///
+/// Two shapes share the route: a single move names `session_id`; a batch
+/// names `from_project` (plus optional `from_workspace`) and moves every
+/// session touching that scope (a `sessions` row there OR observations
+/// stamped into it). Exactly one of the two must be present. A session whose
+/// row already sits in the destination is re-homed: only its rows still
+/// lying elsewhere move (`session_moved: false`).
+#[derive(Deserialize)]
+struct MoveSessionRequest {
+    /// The session to move (single form).
+    #[serde(default)]
+    session_id: Option<SessionId>,
+    /// Source workspace of the batch form. Defaults to `default`.
+    #[serde(default)]
+    from_workspace: Option<String>,
+    /// Source project of the batch form: every session touching it moves.
+    #[serde(default)]
+    from_project: Option<String>,
+    /// Destination workspace. Defaults to the source workspace.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Destination project. Must already exist unless `create` is set.
+    project: String,
+    /// What happens to `sessions/<id>.md`: `move` (default) carries the page
+    /// and its history along; `regenerate` retires it in the source so the
+    /// next consolidation writes a fresh one in the destination.
+    #[serde(default)]
+    pages: PagesMode,
+    /// Without `confirm: true` the server runs the move inside a rolled-back
+    /// transaction and reports what would change (`dry_run: true`).
+    #[serde(default)]
+    confirm: bool,
+    /// Skip the live-session guards: an open session (no session end
+    /// recorded; not applied to a re-home, whose row does not move), a
+    /// `pending`/`running` consolidation job, and, for the batch form, the
+    /// hook router's active-project pointer.
+    #[serde(default)]
+    force: bool,
+    /// Create the destination workspace/project when absent instead of 404.
+    /// A dry run never creates: it reports `would_create_project: true` and
+    /// the counts computed against an absent target.
+    #[serde(default)]
+    create: bool,
+}
+
+/// `workspace/project` pair as names, for report labels.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScopeLabel {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+}
+
+/// Row counts of one session move; identical for the dry run.
+#[derive(Debug, Clone, Serialize)]
+pub struct MoveSessionCounts {
+    /// `observations` rows re-stamped.
+    pub observations: u64,
+    /// `handoffs` rows (produced by the session) re-stamped.
+    pub handoffs: u64,
+    /// `session_consolidation_jobs` rows re-stamped.
+    pub consolidation_jobs: u64,
+    /// `auto_improve_runs` rows re-stamped.
+    pub auto_improve_runs: u64,
+    /// `auto_improve_scheduler_claims` rows re-stamped.
+    pub auto_improve_claims: u64,
+    /// `pages` versions of `sessions/<id>.md` re-stamped (`pages: move`).
+    pub page_versions_moved: u64,
+    /// `pages` rows of `sessions/<id>.md` retired (`pages: regenerate`).
+    pub pages_regenerated: u64,
+}
+
+/// One scope a move gathers observations out of, for the operator's report.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionScopeCount {
+    /// Workspace name.
+    pub workspace: String,
+    /// Project name.
+    pub project: String,
+    /// Observations of the session currently stamped into that scope.
+    pub observations: u64,
+}
+
+/// Wire-format report for one session in `POST /admin/move-session`.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionReport {
+    /// The moved session.
+    pub session_id: String,
+    /// `true` when nothing was written (no `confirm`).
+    pub dry_run: bool,
+    /// Whether the `sessions` row changed scope. `false` for a re-home: the
+    /// row already sat in the destination and only stray rows (the counts
+    /// below) were gathered into it.
+    pub session_moved: bool,
+    /// Dry run with `create` against a destination that does not exist yet:
+    /// the confirm run will create it. Never set on a confirmed move.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
+    /// Every scope holding observations of this session other than the
+    /// destination, with counts. More than one entry — or one that is not
+    /// `from` — means the move drains a project the caller did not name.
+    /// Empty when everything already sits in the destination.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_scopes: Vec<MoveSessionScopeCount>,
+    /// Scope the session came from.
+    pub from: ScopeLabel,
+    /// Scope the session now belongs to.
+    pub to: ScopeLabel,
+    /// Row counts.
+    pub summary: MoveSessionCounts,
+    /// What happened (or would happen) to `sessions/<id>.md`: `"moved"`,
+    /// `"regenerated"`, `"already in destination"` (re-home whose page rows
+    /// all sit in the destination), or `"none"` when the session has no page
+    /// anywhere.
+    pub page: &'static str,
+    /// The session's recorded working directory, left untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Set when `basename(cwd)` differs from the destination project name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_warning: Option<String>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the move changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// Wire-format report for the batch form of `POST /admin/move-session`.
+#[derive(Debug, Serialize)]
+pub struct MoveSessionBatchReport {
+    /// `true` when nothing was written (no `confirm`).
+    pub dry_run: bool,
+    /// Dry run with `create` against a destination that does not exist yet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub would_create_project: bool,
+    /// Source scope.
+    pub from: ScopeLabel,
+    /// Destination scope.
+    pub to: ScopeLabel,
+    /// Sessions touching the source scope (a `sessions` row there or at
+    /// least one observation stamped into it).
+    pub total: usize,
+    /// Sessions moved or re-homed (or, for a dry run, that would be).
+    pub moved: usize,
+    /// One report per session, oldest first (row `started_at` or first
+    /// observation in the source).
+    pub sessions: Vec<MoveSessionReport>,
+    /// Pre-move checkpoint, if the tree had uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_checkpoint: Option<String>,
+    /// Post-move checkpoint, if the batch changed the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+/// One session move, resolved and validated, before any guard runs.
+struct MoveSessionPlan {
+    session_id: SessionId,
+    /// Scope the rows are gathered from: the session row's own scope in the
+    /// single form, the batch source in the batch form (where the row may
+    /// well sit elsewhere, even in `to`).
+    from: (WorkspaceId, ProjectId),
+    from_label: ScopeLabel,
+    to: MoveTarget,
+    to_label: ScopeLabel,
+    /// Where the `sessions` row sits right now.
+    row_scope: (WorkspaceId, ProjectId),
+    cwd: Option<String>,
+}
+
+impl MoveSessionPlan {
+    /// The row already sits in the destination: only stray rows move.
+    fn is_rehome(&self) -> bool {
+        self.to.existing() == Some(self.row_scope)
+    }
+}
+
+/// The destination of a move: an existing scope, or (dry run with `create`
+/// only) a scope that does not exist yet and would be created on confirm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveTarget {
+    Existing((WorkspaceId, ProjectId)),
+    WouldCreate,
+}
+
+impl MoveTarget {
+    fn existing(self) -> Option<(WorkspaceId, ProjectId)> {
+        match self {
+            Self::Existing(scope) => Some(scope),
+            Self::WouldCreate => None,
+        }
+    }
+}
+
+async fn handle_move_session(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
+    Json(req): Json<MoveSessionRequest>,
+) -> Response {
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(u)| u);
+    match (req.session_id, req.from_project.as_deref()) {
+        (Some(session_id), None) => {
+            match move_single_session(&state, &req, session_id, author_id, actor).await {
+                Ok(report) => (StatusCode::OK, Json(json_or_empty(&report))).into_response(),
+                Err(resp) => resp.into_response(),
+            }
+        }
+        (None, Some(from_project)) => {
+            move_session_batch(&state, &req, from_project, author_id, actor).await
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "provide exactly one of session_id (single move) or from_project (batch)"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn json_or_empty<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Best-effort names for a scope; ids stand in when a row vanished
+/// underneath us (a concurrent purge), so a report is still produced.
+async fn scope_label(state: &AdminState, ws: WorkspaceId, proj: ProjectId) -> ScopeLabel {
+    let workspace = state
+        .reader
+        .workspace_name_by_id(ws)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ws.to_string());
+    let project = state
+        .reader
+        .project_name_by_id(ws, proj)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| proj.to_string());
+    ScopeLabel { workspace, project }
+}
+
+/// Resolve the destination scope: existing only (404) unless `create`. A
+/// dry run never writes, so with `create` and no `confirm` an absent
+/// destination resolves to [`MoveTarget::WouldCreate`] instead of a row.
+async fn resolve_move_session_target(
+    state: &AdminState,
+    workspace: &str,
+    project: &str,
+    create: bool,
+    confirm: bool,
+) -> Result<MoveTarget, MoveErr> {
+    if create && confirm {
+        return create_ws_proj(state, workspace, project)
+            .await
+            .map(MoveTarget::Existing);
+    }
+    match lookup_existing_scope(&state.reader, workspace, project).await {
+        Ok(scope) => Ok(MoveTarget::Existing(scope.as_tuple())),
+        Err(e) if create && e.is_not_found() => Ok(MoveTarget::WouldCreate),
+        Err(e) => Err(scope_err(e)),
+    }
+}
+
+/// Dry-run counts of a move into a destination that does not exist yet:
+/// nothing of the session can already be there, so every row keyed to it
+/// moves, and the page rows are those of `from` (moved or retired per
+/// `pages`). Read-only; the store never sees the absent target.
+async fn preview_move_into_absent_target(
+    reader: &ReaderPool,
+    session_id: SessionId,
+    from: (WorkspaceId, ProjectId),
+    pages: PagesMode,
+) -> Result<MoveSessionCounts, StoreError> {
+    let rows = reader.session_dependent_rows(session_id, from).await?;
+    let (page_versions_moved, pages_regenerated) = match pages {
+        PagesMode::Move => (rows.page_versions, 0),
+        PagesMode::Regenerate => (0, rows.page_latest),
+    };
+    Ok(MoveSessionCounts {
+        observations: rows.observations,
+        handoffs: rows.handoffs,
+        consolidation_jobs: rows.consolidation_jobs,
+        auto_improve_runs: rows.auto_improve_runs,
+        auto_improve_claims: rows.auto_improve_claims,
+        page_versions_moved,
+        pages_regenerated,
+    })
+}
+
+/// `(session still open, consolidation job pending or running)` for the
+/// live-session guards.
+async fn session_move_blockers(
+    reader: &ReaderPool,
+    session_id: SessionId,
+) -> Result<(bool, bool), StoreError> {
+    reader
+        .with_conn(move |conn| {
+            let open: bool = conn.query_row(
+                "SELECT ended_at IS NULL FROM sessions WHERE id = ?1",
+                [session_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            let pending: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_consolidation_jobs \
+                 WHERE session_id = ?1 AND state IN ('pending', 'running'))",
+                [session_id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )?;
+            Ok((open, pending))
+        })
+        .await
+}
+
+/// `(session_id, row scope, cwd)` of every session touching a scope (a
+/// `sessions` row there or observations stamped into it), oldest first. The
+/// row scope may differ from the queried scope: that is the phantom-bucket
+/// case the batch re-homes.
+async fn list_scope_sessions(
+    reader: &ReaderPool,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+) -> Result<Vec<(SessionId, (WorkspaceId, ProjectId), Option<String>)>, StoreError> {
+    let ids = reader
+        .session_ids_touching_scope(workspace_id, project_id)
+        .await?;
+    let mut out = Vec::with_capacity(ids.len());
+    for sid in ids {
+        // Observations reference `sessions` (FK on), so a listed id always
+        // has a row; a concurrent purge is the only way to lose it here.
+        if let Some((ws, proj, cwd)) = reader.find_session_scope(sid).await? {
+            out.push((sid, (ws, proj), cwd));
+        }
+    }
+    Ok(out)
+}
+
+fn move_session_store_err(e: StoreError) -> MoveErr {
+    match e {
+        StoreError::NotFound(msg) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": msg })),
+        ),
+        e @ StoreError::PagePathTaken { .. } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{e}; re-run with pages=regenerate or resolve the destination page first"
+                )
+            })),
+        ),
+        other => internal_err(other.to_string()),
+    }
+}
+
+fn move_session_wiki_err(e: WikiError) -> MoveErr {
+    match e {
+        WikiError::Store(store_err) => move_session_store_err(store_err),
+        e @ WikiError::DestinationPageExists(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+        other => internal_err(format!("move-session aborted: {other}")),
+    }
+}
+
+/// The session's cwd is historical truth and stays put; say so when the
+/// hook router's basename heuristic would not map it to the destination.
+fn move_session_cwd_warning(cwd: Option<&str>, to_project: &str) -> Option<String> {
+    let cwd = cwd?;
+    let base = std::path::Path::new(cwd).file_name()?.to_str()?;
+    if base == to_project {
+        return None;
+    }
+    Some(format!(
+        "session cwd '{cwd}' resolves to project '{base}' by basename, not '{to_project}'; \
+         the cwd was left as recorded. New sessions started there still land in '{base}' \
+         unless a .ai-memory.toml marker pins project = \"{to_project}\"; with \
+         [routing] mid_session = \"sticky\" the remaining events of this session follow it."
+    ))
+}
+
+fn move_session_source_scopes(
+    summary: &ai_memory_store::MoveSessionSummary,
+) -> Vec<MoveSessionScopeCount> {
+    summary
+        .source_scopes
+        .iter()
+        .map(|scope| MoveSessionScopeCount {
+            workspace: scope.workspace_name.clone(),
+            project: scope.project_name.clone(),
+            observations: scope.observations,
+        })
+        .collect()
+}
+
+fn move_session_counts(summary: &ai_memory_store::MoveSessionSummary) -> MoveSessionCounts {
+    MoveSessionCounts {
+        observations: summary.observations,
+        handoffs: summary.handoffs,
+        consolidation_jobs: summary.consolidation_jobs,
+        auto_improve_runs: summary.auto_improve_runs,
+        auto_improve_claims: summary.auto_improve_claims,
+        page_versions_moved: summary.page_versions_moved,
+        pages_regenerated: summary.pages_regenerated,
+    }
+}
+
+fn move_session_page_label(
+    pages: PagesMode,
+    touched_rows: bool,
+    touched_file: bool,
+    already_in_target: bool,
+) -> &'static str {
+    match (pages, touched_rows || touched_file) {
+        (_, false) if already_in_target => "already in destination",
+        (_, false) => "none",
+        (PagesMode::Move, true) => "moved",
+        (PagesMode::Regenerate, true) => "regenerated",
+    }
+}
+
+/// Guards, then the dry run or the real move of one planned session. The
+/// caller wraps the call in the pre/post checkpoints so a batch takes one
+/// pair, not one per session.
+async fn move_planned_session(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    plan: MoveSessionPlan,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: &ai_memory_core::ActorContext,
+) -> Result<MoveSessionReport, MoveErr> {
+    let sid = plan.session_id;
+    let rehome = plan.is_rehome();
+
+    // Live-session guards. An open session may still receive events, and a
+    // queued consolidation would write the page under the old scope; both
+    // are the operator's call with `force`. A re-home leaves the row where
+    // it is, so an open session is no reason to refuse gathering its strays.
+    let (open, pending_job) = session_move_blockers(&state.reader, sid)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    if !req.force {
+        if open && !rehome {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "session {sid} is still open (no session end recorded); \
+                         finish it or force the move (--force / force: true)"
+                    )
+                })),
+            ));
+        }
+        if pending_job {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "session {sid} has a pending or running consolidation job; \
+                         wait for it or force the move (--force / force: true)"
+                    )
+                })),
+            ));
+        }
+    }
+
+    let cwd_warning = move_session_cwd_warning(plan.cwd.as_deref(), &plan.to_label.project);
+    let file_name = format!("{sid}.md");
+    let src_file = state
+        .wiki
+        .project_root(plan.from.0, plan.from.1)
+        .join("sessions")
+        .join(&file_name);
+
+    // Dry run with `create` against an absent destination: nothing exists to
+    // collide with, and the store cannot re-stamp into a scope that has no
+    // row, so the counts come from a read-only preview.
+    let to = match plan.to {
+        MoveTarget::Existing(to) => to,
+        MoveTarget::WouldCreate => {
+            debug_assert!(
+                !req.confirm,
+                "an absent target is only planned for a dry run"
+            );
+            let counts = preview_move_into_absent_target(&state.reader, sid, plan.from, req.pages)
+                .await
+                .map_err(|e| internal_err(e.to_string()))?;
+            let touched_rows = counts.page_versions_moved > 0 || counts.pages_regenerated > 0;
+            return Ok(MoveSessionReport {
+                session_id: sid.to_string(),
+                dry_run: true,
+                session_moved: true,
+                would_create_project: true,
+                source_scopes: Vec::new(),
+                from: plan.from_label,
+                to: plan.to_label,
+                page: move_session_page_label(req.pages, touched_rows, src_file.is_file(), false),
+                summary: counts,
+                cwd: plan.cwd,
+                cwd_warning,
+                pre_checkpoint: None,
+                checkpoint: None,
+            });
+        }
+    };
+
+    // A page file already at the destination blocks a page move; checked here
+    // too so the dry run predicts what the wiki re-checks under its lock. When
+    // the source scope IS the destination (single-form re-home) there is no
+    // file to move and the wiki skips the file step too.
+    let dst_file = state
+        .wiki
+        .project_root(to.0, to.1)
+        .join("sessions")
+        .join(&file_name);
+    let file_moves = plan.from != to && src_file.is_file();
+    if req.pages == PagesMode::Move && file_moves && dst_file.exists() {
+        return Err(move_session_wiki_err(WikiError::DestinationPageExists(
+            dst_file.display().to_string(),
+        )));
+    }
+
+    if !req.confirm {
+        let summary = state
+            .writer
+            .move_session(sid, to.0, to.1, req.pages, author_id, false)
+            .await
+            .map_err(move_session_store_err)?;
+        let touched_rows = summary.page_versions_moved > 0 || summary.pages_regenerated > 0;
+        return Ok(MoveSessionReport {
+            session_id: sid.to_string(),
+            dry_run: true,
+            session_moved: summary.session_moved,
+            would_create_project: false,
+            source_scopes: move_session_source_scopes(&summary),
+            from: plan.from_label,
+            to: plan.to_label,
+            summary: move_session_counts(&summary),
+            page: move_session_page_label(
+                req.pages,
+                touched_rows,
+                file_moves,
+                summary.page_versions_in_target > 0,
+            ),
+            cwd: plan.cwd,
+            cwd_warning,
+            pre_checkpoint: None,
+            checkpoint: None,
+        });
+    }
+
+    let move_ctx = AdmissionContext {
+        workspace: plan.from_label.workspace.clone(),
+        project: plan.from_label.project.clone(),
+        destination_workspace: Some(plan.to_label.workspace.clone()),
+        destination_project: Some(plan.to_label.project.clone()),
+        op: AdmissionOp::MoveSession,
+        actor: actor.clone(),
+        ..Default::default()
+    };
+    // The wiki owns the critical section: admission, file move, SQL
+    // re-stamp, and the file rollback on SQL failure.
+    let outcome = state
+        .wiki
+        .move_session_page(sid, plan.from, to, req.pages, author_id, Some(move_ctx))
+        .await
+        .map_err(move_session_wiki_err)?;
+    let touched_rows =
+        outcome.summary.page_versions_moved > 0 || outcome.summary.pages_regenerated > 0;
+    Ok(MoveSessionReport {
+        session_id: sid.to_string(),
+        dry_run: false,
+        session_moved: outcome.summary.session_moved,
+        would_create_project: false,
+        source_scopes: move_session_source_scopes(&outcome.summary),
+        from: plan.from_label,
+        to: plan.to_label,
+        summary: move_session_counts(&outcome.summary),
+        page: move_session_page_label(
+            req.pages,
+            touched_rows,
+            outcome.file != SessionPageFile::Absent,
+            outcome.summary.page_versions_in_target > 0,
+        ),
+        cwd: plan.cwd,
+        cwd_warning,
+        pre_checkpoint: None,
+        checkpoint: None,
+    })
+}
+
+async fn move_single_session(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    session_id: SessionId,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: ai_memory_core::ActorContext,
+) -> Result<MoveSessionReport, MoveErr> {
+    let (from_ws, from_proj, cwd) = state
+        .reader
+        .find_session_scope(session_id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session {session_id} not found") })),
+            )
+        })?;
+    let from_label = scope_label(state, from_ws, from_proj).await;
+    let to_workspace = req
+        .workspace
+        .clone()
+        .unwrap_or_else(|| from_label.workspace.clone());
+    let to =
+        resolve_move_session_target(state, &to_workspace, &req.project, req.create, req.confirm)
+            .await?;
+    let plan = MoveSessionPlan {
+        session_id,
+        from: (from_ws, from_proj),
+        from_label,
+        to,
+        to_label: ScopeLabel {
+            workspace: to_workspace,
+            project: req.project.clone(),
+        },
+        row_scope: (from_ws, from_proj),
+        cwd,
+    };
+
+    if !req.confirm {
+        return move_planned_session(state, req, plan, author_id, &actor).await;
+    }
+    let label = format!(
+        "move-session {session_id} {}/{} -> {}/{}",
+        plan.from_label.workspace,
+        plan.from_label.project,
+        plan.to_label.workspace,
+        plan.to_label.project
+    );
+    let pre_checkpoint = checkpoint_or_500(&state.wiki, format!("pre-{label}"))?;
+    let mut report = move_planned_session(state, req, plan, author_id, &actor).await?;
+    if let Err(e) = state.wiki.backfill_scope_manifests().await {
+        warn!(error = %e, "move-session: scope-manifest backfill failed after move");
+    }
+    report.pre_checkpoint = pre_checkpoint;
+    report.checkpoint = checkpoint_or_warn(&state.wiki, label);
+    Ok(report)
+}
+
+async fn move_session_batch(
+    state: &Arc<AdminState>,
+    req: &MoveSessionRequest,
+    from_project: &str,
+    author_id: Option<ai_memory_core::UserId>,
+    actor: ai_memory_core::ActorContext,
+) -> Response {
+    let from_workspace = req
+        .from_workspace
+        .clone()
+        .unwrap_or_else(|| DEFAULT_WORKSPACE_NAME.to_string());
+    let from = match lookup_ws_proj_no_create(state, &from_workspace, from_project).await {
+        Ok(ids) => ids,
+        Err(e) => return e.into_response(),
+    };
+    let to_workspace = req
+        .workspace
+        .clone()
+        .unwrap_or_else(|| from_workspace.clone());
+    let to = match resolve_move_session_target(
+        state,
+        &to_workspace,
+        &req.project,
+        req.create,
+        req.confirm,
+    )
+    .await
+    {
+        Ok(target) => target,
+        Err(e) => return e.into_response(),
+    };
+    let from_label = ScopeLabel {
+        workspace: from_workspace,
+        project: from_project.to_string(),
+    };
+    let to_label = ScopeLabel {
+        workspace: to_workspace,
+        project: req.project.clone(),
+    };
+    if to.existing() == Some(from) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "source and destination scopes are identical"
+            })),
+        )
+            .into_response();
+    }
+    // Same guard as move-project: the project the hook router is writing to
+    // is not emptied out from under it without an explicit `force`.
+    if !req.force && state.active_project.contains_project(from.1) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "{}/{} is the active session's project; force the move (--force / \
+                     force: true) to move its sessions anyway",
+                    from_label.workspace, from_label.project
+                )
+            })),
+        )
+            .into_response();
+    }
+    let sessions = match list_scope_sessions(&state.reader, from.0, from.1).await {
+        Ok(v) => v,
+        Err(e) => return internal_err(e.to_string()).into_response(),
+    };
+
+    let label = format!(
+        "move-session {}/{} -> {}/{}",
+        from_label.workspace, from_label.project, to_label.workspace, to_label.project
+    );
+    let pre_checkpoint = if req.confirm && !sessions.is_empty() {
+        match checkpoint_or_500(&state.wiki, format!("pre-{label}")) {
+            Ok(oid) => oid,
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        None
+    };
+
+    let total = sessions.len();
+    let mut reports = Vec::with_capacity(total);
+    let mut failure: Option<(SessionId, MoveErr)> = None;
+    for (session_id, row_scope, cwd) in sessions {
+        // The page file follows the page rows: a session rooted in a third
+        // scope (only some observations in the source) is moved whole from
+        // where its row sits; a session already rooted in the destination is
+        // re-homed and its stray page file, if any, is looked for in the
+        // source.
+        let (plan_from, plan_from_label) = if row_scope == from || to.existing() == Some(row_scope)
+        {
+            (from, from_label.clone())
+        } else {
+            (
+                row_scope,
+                scope_label(state, row_scope.0, row_scope.1).await,
+            )
+        };
+        let plan = MoveSessionPlan {
+            session_id,
+            from: plan_from,
+            from_label: plan_from_label,
+            to,
+            to_label: to_label.clone(),
+            row_scope,
+            cwd,
+        };
+        match move_planned_session(state, req, plan, author_id, &actor).await {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                failure = Some((session_id, e));
+                break;
+            }
+        }
+    }
+
+    let checkpoint = if req.confirm && !reports.is_empty() {
+        if let Err(e) = state.wiki.backfill_scope_manifests().await {
+            warn!(error = %e, "move-session: scope-manifest backfill failed after batch");
+        }
+        checkpoint_or_warn(&state.wiki, label)
+    } else {
+        None
+    };
+
+    // Stop at the first error, but say how far the batch got: the sessions
+    // already moved stay moved (each was its own transaction).
+    if let Some((session_id, (status, Json(mut body)))) = failure {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "session_id".into(),
+                serde_json::json!(session_id.to_string()),
+            );
+            obj.insert("dry_run".into(), serde_json::json!(!req.confirm));
+            obj.insert("total".into(), serde_json::json!(total));
+            obj.insert("moved".into(), serde_json::json!(reports.len()));
+            obj.insert("sessions".into(), json_or_empty(&reports));
+            if let Some(oid) = checkpoint {
+                obj.insert("checkpoint".into(), serde_json::json!(oid));
+            }
+        }
+        return (status, Json(body)).into_response();
+    }
+    let report = MoveSessionBatchReport {
+        dry_run: !req.confirm,
+        would_create_project: to == MoveTarget::WouldCreate,
+        from: from_label,
+        to: to_label,
+        total,
+        moved: reports.len(),
+        sessions: reports,
+        pre_checkpoint,
+        checkpoint,
+    };
+    (StatusCode::OK, Json(json_or_empty(&report))).into_response()
 }
 
 /// One source page, with everything the copy loop and the block
@@ -3952,7 +6788,7 @@ async fn copy_purge_merge(
     dst_proj: ProjectId,
     pre_checkpoint: Option<String>,
     actor: ai_memory_core::ActorContext,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Result<MoveProjectReport, MoveErr> {
     // Enumerate the source's latest pages (authoritative on is_latest).
     let summaries = match state
         .reader
@@ -3960,7 +6796,7 @@ async fn copy_purge_merge(
         .await
     {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
     // Single pass over the source: load each page's metadata + body
@@ -3981,14 +6817,14 @@ async fn copy_purge_merge(
             .map(|p| p.path_str.clone())
             .collect();
         if !blocking.is_empty() {
-            return (
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "destination already has pages at these paths with different content; \
                               resolve them or re-run with on_conflict=overwrite or on_conflict=duplicate",
                     "conflicts": blocking,
                 })),
-            );
+            ));
         }
     }
 
@@ -4114,18 +6950,25 @@ async fn copy_purge_merge(
                 // Preserve the stored title verbatim (PageSummary.title is
                 // the DB-derived title), rather than re-deriving it.
                 title: Some(p.title.clone()),
-                // None → the write_page admission chain resolves the
-                // workspace/project NAMES from the destination IDs, so the
-                // git-mirror lands the copy under the destination path.
-                admission_ctx: None,
+                // Skip the named contributors enrich webhook on move copies:
+                // the frontmatter (including the contributors list) is copied
+                // verbatim, so re-enriching each copy adds nothing but blocking
+                // per-page latency to a bulk move. write_page still resolves
+                // the destination NAMES and runs the other hooks (git-mirror),
+                // so the copy lands under the destination path.
+                admission_ctx: Some(AdmissionContext {
+                    skip_webhooks: vec![CONTRIBUTORS_WEBHOOK_NAME.to_string()],
+                    ..AdmissionContext::default()
+                }),
                 author_id: None,
                 actor: actor.clone(),
+                evidence: Vec::new(),
             })
             .await
         {
             Ok(pid) => pid,
             // ANY copy failure aborts BEFORE the purge — the source survives.
-            Err(e) => return internal_err(format!("copy of {} failed: {e}", p.path_str)),
+            Err(e) => return Err(internal_err(format!("copy of {} failed: {e}", p.path_str))),
         };
         // Carry the source embedding over (skip the re-embed) when the source
         // had one for the current model.
@@ -4166,6 +7009,7 @@ async fn copy_purge_merge(
             merged_into_existing: true,
             moved_via: "copy-purge",
             pages_copied,
+            workstreams_moved: 0,
             pages_skipped,
             source_purged: false,
             source_pages_deleted: 0,
@@ -4179,10 +7023,7 @@ async fn copy_purge_merge(
             pre_checkpoint,
             checkpoint,
         };
-        return (
-            StatusCode::OK,
-            Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
-        );
+        return Ok(report);
     }
 
     // PURGE the source — only reached when every page copied successfully.
@@ -4205,32 +7046,63 @@ async fn copy_purge_merge(
         .await
     {
         Ok(ctx) => ctx,
-        Err(e) => return internal_err(e.to_string()),
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    let summary = match state.writer.purge_project(src_ws, src_proj, &label).await {
+    // The source purge is an internal step of move-project (a distinct op that
+    // records its own move report); it is not attributed as a standalone
+    // `purge_project` here, so the audit author is left NULL.
+    // `Skip`: compaction is an operator's explicit choice on a destructive
+    // command, not a side effect of moving a project. A `VACUUM` here would
+    // rewrite the whole database in the middle of a move the caller asked to
+    // be cheap.
+    let summary = match state
+        .writer
+        .purge_project(
+            src_ws,
+            src_proj,
+            &label,
+            None,
+            false,
+            ai_memory_store::Compaction::Skip,
+        )
+        .await
+    {
         Ok(s) => s,
-        Err(e) => return internal_err(e.to_string()),
+        // A live managed run under the source always blocks the destructive
+        // second leg. `force` only overrides the active-project guard; unlike
+        // a true move, copy-purge would delete the lease and strand the raw
+        // transcript. The pages are already copied, so a later retry is
+        // idempotent and leaves the source intact meanwhile.
+        Err(e @ StoreError::ManagedRunActive { .. }) => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{pages_copied} page(s) were copied to {}/{}, but the source \
+                         {label} could not be purged: {e}. The source is intact. \
+                         move-project --force cannot delete a live managed \
+                         workstream during a copy-purge merge; finish or cancel \
+                         the managed run, then retry.",
+                        req.to_workspace, req.project,
+                    )
+                })),
+            ));
+        }
+        Err(e) => return Err(internal_err(e.to_string())),
     };
 
-    // Remove the source's on-disk dir, then dispatch the non-blocking
-    // purge webhook. Pass the workspace/project NAMES we cached in
-    // `resolved_purge_ctx` — the DB rows have just been deleted, so a
-    // name-resolution lookup at dispatch time would find nothing.
-    let proj_root_str = state
-        .wiki
-        .project_root(src_ws, src_proj)
-        .display()
-        .to_string();
-    let mut files_deleted: Vec<String> = Vec::new();
-    let mut files_failed: Vec<String> = Vec::new();
-    match state.wiki.remove_project_dir(src_ws, src_proj).await {
-        Ok(()) => files_deleted.push(proj_root_str),
-        Err(e) => {
-            warn!(path = %proj_root_str, error = %e, "move-project: failed to remove source dir");
-            files_failed.push(proj_root_str);
-        }
-    }
+    // Remove the source's wiki and raw-workstream directories, then dispatch
+    // the non-blocking purge webhook. Pass the workspace/project names cached
+    // in `resolved_purge_ctx`; the DB rows no longer exist for lookup.
+    let (files_deleted, files_failed) = remove_purged_project_storage(
+        state,
+        src_ws,
+        src_proj,
+        &summary.workstream_ids,
+        "move-project",
+    )
+    .await;
     // See `handle_purge_project` for the rationale on `partial_failure`.
     let mut dispatch_ctx = resolved_purge_ctx;
     if !files_failed.is_empty()
@@ -4238,19 +7110,15 @@ async fn copy_purge_merge(
     {
         c.partial_failure = true;
     }
-    state.wiki.dispatch_purge_project(dispatch_ctx.as_ref());
+    state.wiki.dispatch_purge(dispatch_ctx.as_ref());
 
     // The source project_id was just purged; if it was the published active
     // project, the pointer now dangles — clear it so the next hook re-resolves
     // to the (new) project rather than the deleted id.
-    if state.active_project.get().map(|(_, p)| p) == Some(src_proj) {
-        state.active_project.clear();
-    }
+    state.active_project.clear_project(src_proj);
     // Proactively drop any stale per-cwd cache entry for the purged source
     // project (its project_id no longer exists).
-    if let Some(evict) = &state.on_project_moved {
-        evict(src_proj);
-    }
+    invalidate_scope_cache(state, ScopeInvalidation::Project(src_proj)).await;
 
     if let Err(e) = state.wiki.backfill_scope_manifests().await {
         warn!(error = %e, "copy-purge move: scope-manifest backfill failed after move");
@@ -4270,6 +7138,7 @@ async fn copy_purge_merge(
         merged_into_existing: true,
         moved_via: "copy-purge",
         pages_copied,
+        workstreams_moved: 0,
         pages_skipped: Vec::new(),
         source_purged: true,
         source_pages_deleted: summary.pages_deleted,
@@ -4283,9 +7152,173 @@ async fn copy_purge_merge(
         pre_checkpoint,
         checkpoint,
     };
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------
+// merge-workspace
+// ---------------------------------------------------------------------
+
+/// JSON request body for `POST /admin/merge-workspace`.
+#[derive(Deserialize)]
+struct MergeWorkspaceRequest {
+    /// Source workspace to drain and delete. Must exist; 404 on a typo.
+    from: String,
+    /// Destination workspace. Auto-created if absent (each per-project move
+    /// get-or-creates it).
+    to: String,
+    /// Mandatory confirmation. The merge moves every source project (each a
+    /// destructive move that purges the source project) and deletes the emptied
+    /// source workspace, so without `confirm: true` the server returns 400.
+    /// Defaulted so an omitted flag hits that explicit guard rather than a
+    /// generic deserialization 422.
+    #[serde(default)]
+    confirm: bool,
+    /// Override the live-session guard on every per-project move.
+    #[serde(default)]
+    force: bool,
+    /// Conflict policy for a source project that already exists in the
+    /// destination with colliding page paths (copy-purge merge). Default
+    /// `block`. Projects with no destination twin are lossless true-moves and
+    /// ignore this.
+    #[serde(default)]
+    on_conflict: OnConflict,
+}
+
+/// Wire-format report returned by `POST /admin/merge-workspace`.
+#[derive(Debug, Serialize)]
+pub struct MergeWorkspaceReport {
+    /// Source workspace label.
+    pub from: String,
+    /// Destination workspace label.
+    pub to: String,
+    /// One move report per source project, in the order they were moved.
+    pub projects_merged: Vec<MoveProjectReport>,
+    /// Whether the now-empty source workspace was deleted at the end.
+    pub source_workspace_deleted: bool,
+}
+
+/// `POST /admin/merge-workspace` — fold every project of `from` into `to`, then
+/// delete the emptied `from`. Sugar over move-project: each source project runs
+/// the same validated path, so a project that already exists in `to` merges by
+/// content (copy-purge under `on_conflict`) while a fresh one is a lossless
+/// re-stamp. Destructive (each move purges its source project and the source
+/// workspace is removed), so `confirm=true` is required. Stops at the first
+/// failing project — the moves already committed stand, and the failing project
+/// plus the source workspace are left intact for the operator to resolve and
+/// re-run (moves are idempotent).
+async fn handle_merge_workspace(
+    State(state): State<Arc<AdminState>>,
+    actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    Json(req): Json<MergeWorkspaceRequest>,
+) -> impl IntoResponse {
+    if !req.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "destructive operation requires confirm=true"
+            })),
+        );
+    }
+    if req.from == req.to {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "from and to are identical; nothing to merge"
+            })),
+        );
+    }
+
+    // Resolve the SOURCE without auto-creating — 404 on a typo, so a mistyped
+    // source can't create then immediately delete a phantom workspace.
+    if let Err(e) = lookup_ws_no_create(&state, &req.from).await {
+        return e;
+    }
+
+    let projects = match state
+        .reader
+        .list_projects_with_stats_for_workspace(req.from.clone())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return internal_err(e.to_string()),
+    };
+
+    let actor = actor_ext
+        .map(|axum::Extension(a)| a)
+        .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+
+    let mut merged: Vec<MoveProjectReport> = Vec::with_capacity(projects.len());
+    for p in &projects {
+        let move_req = MoveProjectRequest {
+            from_workspace: req.from.clone(),
+            project: p.project_name.clone(),
+            to_workspace: req.to.clone(),
+            confirm: true,
+            force: req.force,
+            on_conflict: req.on_conflict,
+        };
+        match move_project_core(&state, &move_req, actor.clone()).await {
+            Ok(report) => merged.push(report),
+            Err((status, body)) => {
+                let reason = body
+                    .0
+                    .get("error")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "merge stopped at project '{}' in workspace '{}'",
+                            p.project_name, req.from
+                        ),
+                        "failed_project": p.project_name,
+                        "reason": reason,
+                        "projects_merged": merged,
+                        "source_workspace_deleted": false,
+                    })),
+                );
+            }
+        }
+    }
+
+    // Every project moved → the source workspace is now empty. Delete the shell
+    // with force=false: it must be empty, so a race that repopulated it aborts
+    // safely without wiping fresh data.
+    let source_workspace_deleted = match delete_workspace_core(
+        &state,
+        &req.from,
+        false,
+        actor,
+        // The shell is empty by this point; there is nothing to reclaim.
+        ai_memory_store::Compaction::Skip,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err((_status, body)) => {
+            // The moves succeeded; only the final empty-shell delete failed
+            // (e.g. a concurrent write recreated a project). No data was
+            // lost, so report success-with-caveat instead of a hard error.
+            warn!(
+                workspace = %req.from,
+                "merge-workspace: source drained but shell delete failed: {:?}",
+                body
+            );
+            false
+        }
+    };
+
+    let report = MergeWorkspaceReport {
+        from: req.from,
+        to: req.to,
+        projects_merged: merged,
+        source_workspace_deleted,
+    };
     (
         StatusCode::OK,
-        Json(serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}))),
+        Json(serde_json::to_value(&report).unwrap_or(serde_json::Value::Null)),
     )
 }
 
@@ -4362,6 +7395,12 @@ async fn handle_write_page(
             Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
         )
     })?;
+    path.ensure_portable().map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": format!("invalid path: {e}") })),
+        )
+    })?;
 
     let (ws, proj) = create_ws_proj(&state, &req.workspace, &req.project).await?;
 
@@ -4424,6 +7463,7 @@ async fn handle_write_page(
             admission_ctx,
             author_id,
             actor,
+            evidence: Vec::new(),
         })
         .await
         .map_err(|e| internal_err(e.to_string()))?;
@@ -4493,6 +7533,7 @@ async fn handle_delete_page(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     headers: HeaderMap,
     Json(req): Json<DeletePageAdminRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
@@ -4533,9 +7574,10 @@ async fn handle_delete_page(
         None
     };
 
+    let author_id = author_ext.map(|axum::Extension(u)| u);
     state
         .wiki
-        .delete_page(ws, proj, &path, admission_ctx)
+        .delete_page(ws, proj, &path, admission_ctx, author_id)
         .await
         .map_err(|e| internal_err(e.to_string()))?;
     let checkpoint = checkpoint_or_warn(
@@ -4611,6 +7653,7 @@ struct DeletePagesResponse {
 async fn handle_delete_pages(
     State(state): State<Arc<AdminState>>,
     actor_ext: Option<axum::Extension<ai_memory_core::ActorContext>>,
+    author_ext: Option<axum::Extension<ai_memory_core::UserId>>,
     level_ext: Option<axum::Extension<ai_memory_core::AuthLevel>>,
     headers: HeaderMap,
     Json(req): Json<DeletePagesAdminRequest>,
@@ -4679,6 +7722,7 @@ async fn handle_delete_pages(
     let actor = actor_ext
         .map(|axum::Extension(actor)| actor)
         .unwrap_or_else(ai_memory_core::ActorContext::anonymous);
+    let author_id = author_ext.map(|axum::Extension(author_id)| author_id);
     let skip_webhooks = skip_webhooks_for_admin_request(level_ext, &headers);
 
     // Delete every page through the writer/wiki path WITHOUT committing per
@@ -4705,7 +7749,7 @@ async fn handle_delete_pages(
         };
         state
             .wiki
-            .delete_page(ws, proj, &path, admission_ctx)
+            .delete_page(ws, proj, &path, admission_ctx, author_id)
             .await
             .map_err(|e| internal_err(e.to_string()))?;
         deleted += 1;
@@ -4932,6 +7976,7 @@ async fn handle_rehome_by_kind(
                 title: Some(item.title.clone()),
                 admission_ctx,
                 author_id,
+                evidence: Vec::new(),
                 actor: actor.clone(),
             })
             .await
@@ -4977,7 +8022,7 @@ async fn handle_rehome_by_kind(
         });
         state
             .wiki
-            .delete_page(ws, proj, &path, admission_ctx)
+            .delete_page(ws, proj, &path, admission_ctx, author_id)
             .await
             .map_err(|e| internal_err(e.to_string()))?;
         pages_moved += 1;
@@ -5020,51 +8065,74 @@ struct CreateUserRequest {
     name: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    role: Option<ai_memory_core::UserRole>,
 }
 
-/// JSON response for `POST /admin/users` and `…/rotate-token`.
-/// Carries the plaintext token EXACTLY once — the client (CLI or
-/// admin browser) must surface it to the operator and never persist
-/// it; only the SHA-256 digest is kept in the DB. Subsequent reads
-/// (`GET /admin/users`) omit the token field entirely.
+#[derive(Debug, Deserialize)]
+struct PatchUserRequest {
+    #[serde(default)]
+    name: Option<Option<String>>,
+    #[serde(default)]
+    email: Option<Option<String>>,
+    #[serde(default)]
+    role: Option<ai_memory_core::UserRole>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiCredentialRequest {
+    username: String,
+    label: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UserWithTokenResponse {
     user: ai_memory_core::User,
     token: String,
 }
 
-/// JSON response for `GET /admin/users` and lifecycle ops that don't
-/// issue a new token (expire, revive).
+#[derive(Debug, Serialize)]
+struct UserWithPasswordResponse {
+    user: ai_memory_core::User,
+    temporary_password: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UserResponse {
     user: ai_memory_core::User,
 }
 
-/// JSON response for `GET /admin/users`.
 #[derive(Debug, Serialize)]
 struct UserListResponse {
     users: Vec<ai_memory_core::User>,
 }
 
-/// Gate any handler in this section on a root-level request. Returns
-/// the matching error response for the actor's tier (401 anonymous,
-/// 403 user) or `Ok(())` for root.
+#[derive(Debug, Serialize)]
+struct ApiCredentialWithTokenResponse {
+    credential: ai_memory_core::ApiCredential,
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiCredentialListResponse {
+    credentials: Vec<ai_memory_core::ApiCredential>,
+}
+
 fn require_root(
     level: ai_memory_core::AuthLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     level
-        .authorize(Capability::UserManagement, true)
+        .authorize(ai_memory_core::Capability::UserManagement, true)
         .map_err(|e| {
-            (
-                authz_status(e),
-                Json(serde_json::json!({ "error": e.message() })),
-            )
+            let status = if e.is_authentication_required() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            (status, Json(serde_json::json!({ "error": e.message() })))
         })
 }
 
-/// Get the active token-pepper. Returns 503 when multi-user wasn't
-/// configured — same shape as `/admin/embed` returns when no embedder
-/// is wired.
 fn require_pepper(
     state: &AdminState,
 ) -> Result<&ai_memory_store::TokenPepper, (StatusCode, Json<serde_json::Value>)> {
@@ -5078,20 +8146,52 @@ fn require_pepper(
     })
 }
 
-/// Handler for `POST /admin/users`.
-///
-/// Validates the input, generates a fresh 32-byte token, hashes it with
-/// the per-server pepper, and inserts the row. Returns
-/// `UserWithTokenResponse` so the caller can display the plaintext
-/// token exactly once.
-async fn handle_create_user(
-    State(state): State<Arc<AdminState>>,
-    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
-    Json(req): Json<CreateUserRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    require_root(level)?;
-    let pepper = require_pepper(&state)?;
+fn reserved_password(
+    auth: Option<axum::Extension<std::sync::Arc<crate::auth::AuthState>>>,
+    password: &str,
+) -> bool {
+    auth.is_some_and(|axum::Extension(state)| {
+        crate::human_auth::password_is_reserved(&state, password)
+    })
+}
 
+async fn hash_temp_password() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let raw = ai_memory_store::password::generate_temporary_password()
+        .map_err(|e| internal_err(e.to_string()))?;
+    ai_memory_core::validate_human_password(&raw, None, &[])
+        .map_err(|e| validation_error(e.to_string()))?;
+    Ok(raw)
+}
+
+async fn mint_temporary_password(
+    state: &AdminState,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    for _ in 0..8 {
+        let raw = hash_temp_password().await?;
+        if reserved_password(auth.clone(), &raw) {
+            continue;
+        }
+        if let Some(pepper) = state.token_pepper.as_ref() {
+            let hash = ai_memory_store::hash_token(&raw, pepper);
+            match state.reader.token_hash_exists(hash).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => return Err(internal_err(e.to_string())),
+            }
+        }
+        return Ok(raw);
+    }
+    Err(internal_err(
+        "could not mint a unique temporary password".to_string(),
+    ))
+}
+
+async fn create_human_user_response(
+    state: &AdminState,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+    req: CreateUserRequest,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let mut new_user = ai_memory_core::NewUser {
         username: req.username,
         name: req.name,
@@ -5100,34 +8200,82 @@ async fn handle_create_user(
     new_user
         .validate()
         .map_err(|e| validation_error(e.to_string()))?;
-
-    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
-    let token_hash = ai_memory_store::hash_token(&token, pepper);
-
+    let role = req.role.unwrap_or(ai_memory_core::UserRole::User);
+    let raw = mint_temporary_password(state, auth).await?;
+    let phc = ai_memory_store::password::hash_password(raw.clone())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
     let user_id = state
         .writer
-        .create_user(new_user.clone(), token_hash)
+        .create_human_user(new_user, role, Some(phc), true)
         .await
         .map_err(map_user_store_err)?;
-
-    // Round-trip through the reader so we surface the same canonical
-    // shape `GET /admin/users` returns (incl. created_at).
     let user = state
         .reader
         .find_user_by_id(user_id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
         .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(UserWithPasswordResponse {
+                user,
+                temporary_password: raw,
+            })
+            .unwrap_or_default(),
+        ),
+    ))
+}
 
+async fn handle_create_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    if req.role.is_some() {
+        return create_human_user_response(&state, auth, req).await;
+    }
+    let pepper = require_pepper(&state)?;
+    let mut new_user = ai_memory_core::NewUser {
+        username: req.username,
+        name: req.name,
+        email: req.email,
+    };
+    new_user
+        .validate()
+        .map_err(|e| validation_error(e.to_string()))?;
+    let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = ai_memory_store::hash_token(&token, pepper);
+    let user_id = state
+        .writer
+        .create_user(new_user, token_hash)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user_id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("created user vanished from store".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
     ))
 }
 
-/// Handler for `GET /admin/users`. Includes users with expired tokens
-/// (the response's `token_expired_at` field distinguishes them); the
-/// CLI list renderer shows an "expired" flag.
+async fn handle_create_human_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    create_human_user_response(&state, auth, req).await
+}
+
 async fn handle_list_users(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -5144,9 +8292,6 @@ async fn handle_list_users(
     ))
 }
 
-/// Handler for `POST /admin/users/:username/expire`. Idempotent: the
-/// first call stamps `token_expired_at = now()`, subsequent calls
-/// leave the original timestamp untouched (via COALESCE in the store).
 async fn handle_expire_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -5158,22 +8303,19 @@ async fn handle_expire_user(
         .writer
         .expire_user_token(user.id)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
-    // Re-read to surface the new token_expired_at in the response.
+        .map_err(map_user_store_err)?;
     let user = state
         .reader
         .find_user_by_id(user.id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after expire".to_string()))?;
+        .ok_or_else(|| internal_err("user vanished after token expiry".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
     ))
 }
 
-/// Handler for `POST /admin/users/:username/revive`. Clears
-/// `token_expired_at`. Idempotent (revive on an active user is a no-op).
 async fn handle_revive_user(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -5185,24 +8327,19 @@ async fn handle_revive_user(
         .writer
         .revive_user_token(user.id)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(map_user_store_err)?;
     let user = state
         .reader
         .find_user_by_id(user.id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after revive".to_string()))?;
+        .ok_or_else(|| internal_err("user vanished after token revival".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
     ))
 }
 
-/// Handler for `POST /admin/users/:username/rotate-token`. Issues a
-/// fresh token, hashes it with the server pepper, replaces the row's
-/// `token_hash`, and implicitly clears `token_expired_at` (rotating
-/// makes the new token usable immediately even if the prior one was
-/// expired). Returns the plaintext token once.
 async fn handle_rotate_user_token(
     State(state): State<Arc<AdminState>>,
     axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
@@ -5211,15 +8348,13 @@ async fn handle_rotate_user_token(
     require_root(level)?;
     let pepper = require_pepper(&state)?;
     let user = lookup_user_by_username(&state, &username).await?;
-
     let token = ai_memory_store::generate_token().map_err(|e| internal_err(e.to_string()))?;
     let token_hash = ai_memory_store::hash_token(&token, pepper);
-
     let updated = state
         .writer
         .rotate_user_token(user.id, token_hash)
         .await
-        .map_err(|e| internal_err(e.to_string()))?;
+        .map_err(map_user_store_err)?;
     if !updated {
         return Err((
             StatusCode::NOT_FOUND,
@@ -5231,16 +8366,244 @@ async fn handle_rotate_user_token(
         .find_user_by_id(user.id)
         .await
         .map_err(|e| internal_err(e.to_string()))?
-        .ok_or_else(|| internal_err("user vanished after rotate".to_string()))?;
+        .ok_or_else(|| internal_err("user vanished after token rotation".to_string()))?;
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(UserWithTokenResponse { user, token }).unwrap_or_default()),
     ))
 }
 
-/// Shared lookup helper: 404 when the user doesn't exist, else returns
-/// the row. Used by every per-username handler so error shapes stay
-/// uniform across `expire` / `revive` / `rotate-token`.
+async fn handle_patch_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Json(req): Json<PatchUserRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .patch_user(user.id, req.name, req.email, req.role)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after patch".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_reset_password(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    auth: Option<axum::Extension<Arc<crate::auth::AuthState>>>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    let raw = mint_temporary_password(&state, auth).await?;
+    let phc = ai_memory_store::password::hash_password(raw.clone())
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    state
+        .writer
+        .reset_human_password(user.id, phc, true)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after reset".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(UserWithPasswordResponse {
+                user,
+                temporary_password: raw,
+            })
+            .unwrap_or_default(),
+        ),
+    ))
+}
+
+async fn handle_disable_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .set_user_disabled(user.id, true)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after disable".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_enable_user(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let user = lookup_user_by_username(&state, &username).await?;
+    state
+        .writer
+        .set_user_disabled(user.id, false)
+        .await
+        .map_err(map_user_store_err)?;
+    let user = state
+        .reader
+        .find_user_by_id(user.id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("user vanished after enable".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(UserResponse { user }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_create_api_credential(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    Json(req): Json<CreateApiCredentialRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let pepper = require_pepper(&state)?;
+    let user = lookup_user_by_username(&state, &req.username).await?;
+    let token = ai_memory_store::generate_api_key().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = ai_memory_store::hash_token(&token, pepper);
+    let preview = ai_memory_store::api_key_preview(&token);
+    let id = state
+        .writer
+        .create_api_credential(
+            ai_memory_core::ApiCredentialId::new(),
+            user.id,
+            req.label,
+            token_hash,
+            Some(preview),
+        )
+        .await
+        .map_err(map_user_store_err)?;
+    let credential = state
+        .reader
+        .find_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("credential vanished after create".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(ApiCredentialWithTokenResponse { credential, token })
+                .unwrap_or_default(),
+        ),
+    ))
+}
+
+async fn handle_list_api_credentials(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let credentials = state
+        .reader
+        .list_api_credentials()
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(ApiCredentialListResponse { credentials }).unwrap_or_default()),
+    ))
+}
+
+async fn handle_rotate_api_credential(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let pepper = require_pepper(&state)?;
+    let id: ai_memory_core::ApiCredentialId = id
+        .parse()
+        .map_err(|e: ai_memory_core::MemoryError| validation_error(e.to_string()))?;
+    let token = ai_memory_store::generate_api_key().map_err(|e| internal_err(e.to_string()))?;
+    let token_hash = ai_memory_store::hash_token(&token, pepper);
+    let preview = ai_memory_store::api_key_preview(&token);
+    let updated = state
+        .writer
+        .rotate_api_credential(id, token_hash, Some(preview))
+        .await
+        .map_err(map_user_store_err)?;
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such credential" })),
+        ));
+    }
+    let credential = state
+        .reader
+        .find_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| internal_err("credential vanished after rotate".to_string()))?;
+    Ok((
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(ApiCredentialWithTokenResponse { credential, token })
+                .unwrap_or_default(),
+        ),
+    ))
+}
+
+async fn handle_revoke_api_credential(
+    State(state): State<Arc<AdminState>>,
+    axum::Extension(level): axum::Extension<ai_memory_core::AuthLevel>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_root(level)?;
+    let id: ai_memory_core::ApiCredentialId = id
+        .parse()
+        .map_err(|e: ai_memory_core::MemoryError| validation_error(e.to_string()))?;
+    state
+        .writer
+        .revoke_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?;
+    let credential = state
+        .reader
+        .find_api_credential(id)
+        .await
+        .map_err(|e| internal_err(e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no such credential" })),
+            )
+        })?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "credential": credential })),
+    ))
+}
+
 async fn lookup_user_by_username(
     state: &AdminState,
     username: &str,
@@ -5258,7 +8621,6 @@ async fn lookup_user_by_username(
     })
 }
 
-/// Convert a username/email validation error into a 400 response.
 fn validation_error(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
@@ -5266,16 +8628,16 @@ fn validation_error(msg: String) -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
-/// Map StoreError to the right HTTP status. UNIQUE violations on
-/// username / email become 409; everything else is a 500.
 fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde_json::Value>) {
     match e {
-        ai_memory_store::StoreError::Duplicate(msg) => (
+        ai_memory_store::StoreError::Duplicate(msg)
+        | ai_memory_store::StoreError::InvalidState(msg) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": msg })),
         ),
         ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidUsername(msg))
-        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidEmail(msg)) => {
+        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidEmail(msg))
+        | ai_memory_store::StoreError::Memory(ai_memory_core::MemoryError::InvalidPassword(msg)) => {
             validation_error(msg)
         }
         other => internal_err(other.to_string()),
@@ -5285,7 +8647,10 @@ fn map_user_store_err(e: ai_memory_store::StoreError) -> (StatusCode, Json<serde
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_memory_core::{AgentKind, NewObservation, NewSession, ObservationKind};
+    use ai_memory_core::{
+        ActorContext, AgentKind, IdentityKey, NewObservation, NewSession, ObservationKind,
+    };
+    use ai_memory_core::{Sanitized, Sanitizer};
     use ai_memory_llm::{ChatRequest, ChatResponse, LlmResult};
     use ai_memory_store::Store;
     use axum::body::to_bytes;
@@ -5355,11 +8720,13 @@ mod tests {
             .unwrap()
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5370,7 +8737,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         let resp = router
@@ -5388,20 +8756,401 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["providers"]["llm"]["status"], "disabled");
         assert_eq!(json["providers"]["embedding"]["status"], "disabled");
+        // 2.0 item 7: the report carries the wedged-writer gauge and the
+        // wiki-format state — a fresh store is natively conformant (no
+        // migration ran) with no backup archive.
+        assert!(json["write_queue"].is_array(), "{json}");
+        assert_eq!(json["wiki_format"]["okf_migrated"], false);
+        assert!(json["wiki_format"]["backup_archive"].is_null());
     }
 
-    fn read_page_test_router() -> (TempDir, Router) {
+    /// The MCP-only complement: per-client tool-call counters served
+    /// back with the same window semantics as by-agent.
+    #[tokio::test]
+    async fn activity_by_client_aggregates_and_bounds_the_window() {
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone())
             .unwrap()
             .with_store_reader(store.reader.clone());
+        let today = jiff::Timestamp::now()
+            .as_microsecond()
+            .div_euclid(US_PER_DAY);
+        store
+            .writer
+            .bump_client_activity(vec![
+                ("vscode".into(), today, 4, 1),
+                ("vscode".into(), today - 40, 7, 0),
+                ("claude-desktop".into(), today, 1, 0),
+            ])
+            .await
+            .unwrap();
+
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49376".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Whole history: the 40-day-old bucket counts.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"],
+            serde_json::json!([
+                { "client": "vscode", "reads": 11, "writes": 1 },
+                { "client": "claude-desktop", "reads": 1, "writes": 0 },
+            ]),
+            "volume-desc across all history: {json}"
+        );
+
+        // A 7-day window drops the old bucket.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_client"][0],
+            serde_json::json!({ "client": "vscode", "reads": 4, "writes": 1 }),
+            "{json}"
+        );
+    }
+
+    /// The dashboard read: session counts grouped per agent CLI, with the
+    /// scope failing closed and never auto-created.
+    #[tokio::test]
+    async fn sessions_by_agent_counts_per_agent_and_fails_closed_on_unknown_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        for (project_id, agent) in [
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::ClaudeCode),
+            (target, AgentKind::Cursor),
+            // A different scope must not leak into the target's totals.
+            (other_project, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        for (agent, owner) in [(AgentKind::ClaudeCode, "alice"), (AgentKind::Codex, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id: SessionId::new(),
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: agent,
+                    cwd: None,
+                    actor_user: Some(IdentityKey::User(owner.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49375".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 2 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "counts are per agent, scoped, count-desc: {json}"
+        );
+
+        // A named operator sees their rows plus shared legacy rows, but not a
+        // colleague's. The recovery switch deliberately includes all owners.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "named callers see own plus shared sessions only: {json}"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent?workspace=default&project=target&all_owners=true",
+                    )
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"],
+            serde_json::json!([
+                { "agent": "claude-code", "sessions": 3 },
+                { "agent": "codex", "sessions": 1 },
+                { "agent": "cursor", "sessions": 1 },
+            ]),
+            "all_owners includes every operator: {json}"
+        );
+
+        // Zero is the explicit all-history spelling and must not become an
+        // empty time window.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=target&since_days=0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "since_days=0 means the whole history, not an empty window: {json}"
+        );
+
+        // A window wider than the epoch saturates into "all history" rather
+        // than overflowing: `u32::MAX` days times a day of microseconds does
+        // not fit in the i64 the cutoff is computed in.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/sessions/by-agent\
+                         ?workspace=default&project=target&since_days=4294967295",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["by_agent"].as_array().unwrap().len(),
+            2,
+            "a saturating window counts everything, it does not panic or empty: {json}"
+        );
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sessions_filters_by_scope_and_agent() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_agent = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        let alice = SessionId::new();
+        let bob = SessionId::new();
+        for (id, project_id, agent) in [
+            (older, target, AgentKind::Codex),
+            (other_agent, target, AgentKind::ClaudeCode),
+            (other_scope, other_project, AgentKind::Codex),
+            (ended, target, AgentKind::Codex),
+            (latest, target, AgentKind::Codex),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind: agent,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+        for (id, user) in [(alice, "alice"), (bob, "bob")] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id: target,
+                    agent_kind: AgentKind::Codex,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user: Some(IdentityKey::User(user.into()).storage_key()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5412,9 +9161,707 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Default: only the newest open session for the scope + agent.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], latest.to_string());
+        assert_eq!(sessions[0]["cwd"], "/tmp/target");
+
+        // `all=true`: every open codex session in the scope, ended and
+        // other-scope/other-agent sessions excluded.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+
+        // A named operator gets their own open sessions plus shared legacy
+        // sessions, never a colleague's. This is the exact route consumed by
+        // the destructive `finalize-session` command.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=codex&all=true")
+                    .extension(ActorContext {
+                        user: Some("alice".into()),
+                        ..ActorContext::default()
+                    })
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = json["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| session["session_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&alice.to_string().as_str()));
+        assert!(ids.contains(&latest.to_string().as_str()));
+        assert!(ids.contains(&older.to_string().as_str()));
+        assert!(!ids.contains(&bob.to_string().as_str()));
+
+        // Unknown agent kind fails closed with a 400.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown scope fails closed with a 404 — never auto-created.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=ghost&agent=codex")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            store
+                .reader
+                .find_project(ws, "ghost".to_string())
+                .await
+                .unwrap()
+                .is_none(),
+            "read route must not auto-create scopes"
+        );
+    }
+
+    /// Regression for the race a naive wrapper hits with several concurrent
+    /// Kiro CLI tabs against one repo: two open sessions for the same
+    /// agent+scope exist (`older`, `latest`), and `?session_id=` must return
+    /// exactly the one requested — never falling back to "newest open" —
+    /// while still composing with the owner filter (a session_id belonging
+    /// to another operator must not be reachable just by knowing its id,
+    /// same invariant `all_owners` already protects for the default query).
+    #[tokio::test]
+    async fn open_sessions_session_id_targets_exact_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default".to_string())
+            .await
+            .unwrap();
+        let target = store
+            .writer
+            .get_or_create_project(ws, "target".to_string(), None)
+            .await
+            .unwrap();
+        let other_project = store
+            .writer
+            .get_or_create_project(ws, "other".to_string(), None)
+            .await
+            .unwrap();
+        let older = SessionId::new();
+        let latest = SessionId::new();
+        let other_scope = SessionId::new();
+        let ended = SessionId::new();
+        let bobs_session = SessionId::new();
+        let wrong_agent = SessionId::new();
+        for (id, project_id, agent_kind, actor_user) in [
+            (older, target, AgentKind::KiroCli, None),
+            (latest, target, AgentKind::KiroCli, None),
+            (other_scope, other_project, AgentKind::KiroCli, None),
+            (ended, target, AgentKind::KiroCli, None),
+            (wrong_agent, target, AgentKind::Codex, None),
+            (
+                bobs_session,
+                target,
+                AgentKind::KiroCli,
+                Some(IdentityKey::User("bob".into()).storage_key()),
+            ),
+        ] {
+            store
+                .writer
+                .begin_session(NewSession {
+                    id,
+                    workspace_id: ws,
+                    project_id,
+                    agent_kind,
+                    cwd: Some(std::path::PathBuf::from("/tmp/target")),
+                    actor_user,
+                })
+                .await
+                .unwrap();
+        }
+        store.writer.end_session(ended, None).await.unwrap();
+
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+
+        // Targeting `older` by id must return only `older`, not `latest`.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sessions = json["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "must not fall back to newest-open");
+        assert_eq!(sessions[0]["session_id"], older.to_string());
+
+        // A session id that belongs to a different project must not be
+        // reachable just by knowing the id — scope is still enforced.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={other_scope}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "a session from another project must not be reachable by id"
+        );
+
+        // An already-ended session id is not "open" and must not match.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={ended}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // An exact id from another agent remains outside the requested
+        // agent boundary even when its scope matches.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={wrong_agent}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 0);
+
+        // A colleague's session id is not reachable without all_owners, even
+        // when the exact id is known — session_id composes with the owner
+        // filter (AND), it doesn't bypass it.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["sessions"].as_array().unwrap().len(),
+            0,
+            "session_id must not bypass the owner filter"
+        );
+
+        // ...but composes correctly WITH all_owners set.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id={bobs_session}&all_owners=true"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["sessions"].as_array().unwrap().len(), 1);
+
+        // Selection modes are mutually exclusive instead of silently giving
+        // one of them precedence.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&all=true&session_id={older}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A malformed session_id fails closed with a 400, not a silent
+        // empty/ignored filter.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/open-sessions?workspace=default&project=target&agent=kiro-cli&session_id=not-a-uuid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    fn read_page_test_router() -> (TempDir, Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: None,
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         (tmp, router)
+    }
+
+    /// The exported tarball is a valid OKF v0.2 bundle: fresh index.md
+    /// with okf_version, every concept file conformant (docs/okf.md).
+    #[tokio::test]
+    async fn export_okf_streams_a_conformant_bundle() {
+        let (_tmp, router) = read_page_test_router();
+        post_write_page(
+            &router,
+            "default",
+            "scratch",
+            "gotchas/build.md",
+            "watch out",
+        )
+        .await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let mut names = Vec::new();
+        let mut index_body = String::new();
+        let mut page_body = String::new();
+        for entry in ar.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().display().to_string();
+            use std::io::Read as _;
+            let mut content = String::new();
+            entry.read_to_string(&mut content).unwrap();
+            if name == "index.md" {
+                index_body = content.clone();
+            }
+            if name == "gotchas/build.md" {
+                page_body = content.clone();
+            }
+            names.push(name);
+        }
+        assert!(names.contains(&"index.md".to_string()), "{names:?}");
+        assert!(names.contains(&"gotchas/build.md".to_string()), "{names:?}");
+        assert!(index_body.contains("okf_version: \"0.2\""));
+        let fm = ai_memory_wiki::parse(&page_body).unwrap().frontmatter;
+        assert!(ai_memory_core::okf::is_conformant(&fm));
+        assert_eq!(fm["type"], "Gotcha");
+    }
+
+    /// Post-audit regression: the things a REAL deployment's tree holds
+    /// beside concept pages — typed scope manifests and _pending
+    /// proposal sidecars — must not block the export. Sidecars are
+    /// excluded; manifests ship typed.
+    #[tokio::test]
+    async fn export_okf_tolerates_manifests_and_skips_pending() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let ws_dir = std::fs::read_dir(tmp.path().join("wiki"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+            .unwrap();
+        let proj_dir = std::fs::read_dir(&ws_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        // Typed manifest (what the fixed backfill writes) + a pending
+        // sidecar with no frontmatter (what staging writes).
+        std::fs::write(
+            proj_dir.join("_meta.md"),
+            "---\nproject: scratch\ntype: Scope Manifest\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(proj_dir.join("_pending/auto-improve")).unwrap();
+        std::fs::write(
+            proj_dir.join("_pending/auto-improve/proposal.md"),
+            "# A staged proposal\n\nno frontmatter at all",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "_meta.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("_pending")),
+            "pending sidecars must not ship: {names:?}"
+        );
+    }
+
+    /// The project root of any store that ever captured an observation
+    /// holds a rotated hook ledger (`log-YYYY-MM.md`, no frontmatter).
+    /// It is raw capture, not a concept file: the export drops it the
+    /// way it already drops `log.md`, instead of failing the whole
+    /// bundle on the conformance gate (#748). Both shapes are covered —
+    /// a bare ledger and one the OKF migration stamped frontmatter onto.
+    #[tokio::test]
+    async fn export_okf_skips_the_rotated_event_ledger() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-08.md"),
+            "## [2026-08-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj_dir.join("log-2026-07.md"),
+            "---\ntype: Note\n---\n\n## [2026-07-01T00:00:00Z] session_start | opened scratch\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "notes/a.md"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "raw event ledgers must not ship: {names:?}"
+        );
+    }
+
+    /// End-to-end companion to the hand-written ledger test above: the
+    /// export must drop the ledger the REAL capture path produces, not
+    /// merely a file whose bytes a test typed by hand. #748 was exactly a
+    /// disagreement between two subsystems — the hook that appends
+    /// `log-YYYY-MM.md` and the export that walked it — so the regression
+    /// is only truly guarded when the ledger under test is the one
+    /// `ai_memory_hooks::log::append_event` itself writes, named for the
+    /// event's own month.
+    #[tokio::test]
+    async fn export_okf_skips_the_ledger_real_capture_writes() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let router = admin_router(admin_state_for_store(&tmp, &store, wiki.clone()));
+
+        // A real knowledge page, created through the normal write path.
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+
+        // The rotated ledger, created the way capture creates it: the exact
+        // `append_event` the hook router calls, which names the file for the
+        // event's own month (`log-YYYY-MM.md`) and writes a frontmatter-less
+        // `## [ts] ...` entry.
+        let scope = lookup_existing_scope(&store.reader, "default", "scratch")
+            .await
+            .unwrap();
+        ai_memory_hooks::log::append_event(
+            &wiki,
+            scope.workspace_id,
+            scope.project_id,
+            jiff::Timestamp::now(),
+            ai_memory_hooks::HookEvent::SessionStart,
+            "opened scratch",
+        )
+        .unwrap();
+
+        // Guard against a vacuous pass: capture must actually have written a
+        // rotated ledger into the project root the export walks.
+        let proj_root = wiki.project_root(scope.workspace_id, scope.project_id);
+        assert!(
+            std::fs::read_dir(&proj_root)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("log-")),
+            "capture must have written a rotated ledger for the test to be meaningful"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Export succeeds instead of aborting on the frontmatter-less ledger.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dec = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut ar = tar::Archive::new(dec);
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "notes/a.md"),
+            "the real knowledge page must ship: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("log-")),
+            "the ledger real capture wrote must not ship: {names:?}"
+        );
+    }
+
+    /// Content gate control for #748: the ledger carve-out keys off the
+    /// body, so an ordinary page named like a ledger is still a page —
+    /// it ships in the bundle, and it still has to declare a `type`.
+    #[tokio::test]
+    async fn export_okf_still_conforms_a_prose_page_named_like_a_ledger() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("log-2026-09.md"),
+            "---\ntitle: September log\n---\n\nProse about last month, not hook output.\n",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The single project scope dir under a freshly seeded `scratch`
+    /// store. The wiki root also holds `.git`, and `read_dir` order is
+    /// arbitrary, so the UUID-named scope dirs are selected explicitly.
+    fn scratch_project_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+        let uuid_dir = |parent: &std::path::Path| {
+            std::fs::read_dir(parent)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| p.is_dir() && p.file_name().is_none_or(|n| n != ".git"))
+                .expect("scope dir")
+        };
+        uuid_dir(&uuid_dir(&data_dir.join("wiki")))
+    }
+
+    /// A bundle with a non-conformant page must fail the export rather
+    /// than ship something a strict reader rejects.
+    #[tokio::test]
+    async fn export_okf_refuses_a_nonconformant_page() {
+        let (tmp, router) = read_page_test_router();
+        post_write_page(&router, "default", "scratch", "notes/a.md", "fine").await;
+        // Fabricate a pre-migration file next to it.
+        let proj_dir = scratch_project_dir(tmp.path());
+        std::fs::write(
+            proj_dir.join("notes/legacy.md"),
+            "---\ntitle: Legacy\n---\nno type here",
+        )
+        .unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/export-okf?workspace=default&project=scratch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     fn admin_state_for_store(tmp: &TempDir, store: &Store, wiki: Wiki) -> AdminState {
@@ -5428,11 +9875,13 @@ mod tests {
         llm: Option<Arc<dyn LlmProvider>>,
     ) -> AdminState {
         AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -5443,7 +9892,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         }
     }
 
@@ -5490,6 +9940,9 @@ mod tests {
                     evidence_json: serde_json::json!([{"source":"test"}]),
                     body_markdown: body.into(),
                     artifact_sha256: None,
+                    edit_mode: None,
+                    patch_json: None,
+                    expected_base_body_sha256: None,
                 }],
             })
             .await
@@ -5536,6 +9989,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "write-page setup failed");
+    }
+
+    #[tokio::test]
+    async fn admin_write_page_refuses_git_reserved_and_non_portable_paths() {
+        let (_tmp, router) = read_page_test_router();
+        for bad in [
+            ".git",
+            ".git/config",
+            "notes/.git",
+            "notes/.git/sub.md",
+            "notes/git~1",
+            "notes/git~1/foo.md",
+            "CON.md",
+            "notes/aux.md",
+            "notes/a|b.md",
+        ] {
+            let req_body = serde_json::json!({
+                "workspace": "default",
+                "project": "audit",
+                "path": bad,
+                "body": "bad path body",
+            });
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/admin/write-page")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for {bad:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5699,6 +10192,7 @@ mod tests {
             admission_ctx: None,
             author_id: None,
             actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
         })
         .await
         .unwrap();
@@ -5712,22 +10206,26 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "focus changed and durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
 
@@ -5813,6 +10311,489 @@ mod tests {
         );
     }
 
+    /// The V42 staging bucket is keyed on
+    /// [`ai_memory_core::ActorContext::identity_key`] through
+    /// [`ai_memory_core::owner_identity`], not on `actor.user`, so an operator
+    /// identified by a complete OIDC issuer/subject pair lands in an
+    /// issuer-qualified bucket rather than the unattributed one. The
+    /// `memory_auto_improve` MCP tool computes the same bucket, and the V42
+    /// one-pending-per-target promise is what breaks when it does.
+    #[tokio::test]
+    async fn auto_improve_buckets_an_oidc_operator_by_qualified_identity() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // A trusted proxy is configured, so the deployment distinguishes its
+        // operators even with no `users` rows — which is exactly the case where
+        // reaching for `actor.user` sees nobody.
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.trusted_proxy_identity = true;
+        let router = admin_router(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/admin/auto-improve")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "workspace": "default",
+                    "project": "scratch",
+                    "session_id": session_id.to_string(),
+                    "min_observations": 1,
+                    "min_session_duration_secs": 0,
+                    "min_confidence": 0.75,
+                    "max_proposals_per_run": 5
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ai_memory_core::ActorContext {
+            issuer: Some("https://issuer.example".into()),
+            sub: Some("subject-42".into()),
+            ..ai_memory_core::ActorContext::anonymous()
+        });
+        req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The bucket the contract stamps, built through the API rather than
+        // hand-written, so this test follows the encoding if it ever moves.
+        let expected_bucket = ai_memory_core::IdentityKey::Subject {
+            issuer: "https://issuer.example".into(),
+            subject: "subject-42".into(),
+        }
+        .storage_key();
+        let staged = store
+            .reader
+            .list_auto_improve_proposals(ws, proj, None, 10)
+            .await
+            .unwrap();
+        assert!(!staged.is_empty(), "the fake LLM proposes two pages");
+        for proposal in &staged {
+            let detail = store
+                .reader
+                .auto_improve_proposal_detail_with_owner(ws, proj, proposal.id)
+                .await
+                .unwrap()
+                .expect("staged proposal readable in its own scope");
+            assert_eq!(
+                detail.staged_by_actor_user.as_deref(),
+                Some(expected_bucket.as_str()),
+                "the subject claim is the operator, not `None`: {}",
+                detail.detail.summary.target_path.as_str()
+            );
+            let json = serde_json::to_value(&detail).unwrap();
+            assert_eq!(json["staged_by_actor_user"], expected_bucket);
+            assert!(json.get("summary").is_some(), "detail fields stay flat");
+            assert!(
+                json.get("detail").is_none(),
+                "no nested compatibility wrapper"
+            );
+        }
+    }
+
+    /// The admin report must name the proposals the store refused to stage.
+    /// Returning only the staged ids hands the operator a successful run of
+    /// N-1 proposals with no trace of the Nth — the silent drop the
+    /// per-proposal skip was introduced to end.
+    #[tokio::test]
+    async fn auto_improve_report_names_the_proposal_a_collision_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["proposals"].as_array().unwrap().len(),
+            1,
+            "the sibling proposal still stages",
+        );
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(skipped.len(), 1, "the collided proposal must be reported");
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
+        assert!(
+            skipped[0]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty()),
+            "a skipped proposal must say why: {}",
+            skipped[0]
+        );
+    }
+
+    /// `[auth].root_username` alone does not make a server multi-operator: the
+    /// scheduler and the report handlers stage unattributed, so bucketing this
+    /// call by its actor would leave TWO pending proposals for one page on a
+    /// single-operator server — the collision V42 promises cannot happen.
+    #[tokio::test]
+    async fn single_operator_admin_auto_improve_shares_the_unattributed_bucket() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let (ws, proj, _pending) = stage_pending_write(
+            &store,
+            "default",
+            "scratch",
+            "notes/new-auto-improve.md",
+            "# New Auto Improve Lesson\n\nstaged earlier",
+        )
+        .await;
+
+        wiki.write_page(WritePageRequest {
+            workspace_id: ws,
+            project_id: proj,
+            path: PagePath::new("_slots/current-focus.md").unwrap(),
+            frontmatter: serde_json::json!({"kind":"slot"}),
+            body: "# Current Focus\n\nold focus".into(),
+            tier: Tier::Working,
+            pinned: false,
+            title: Some("Current Focus".into()),
+            admission_ctx: None,
+            author_id: None,
+            actor: ai_memory_core::ActorContext::anonymous(),
+            evidence: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+
+        // The root actor `[auth].root_username` produces, as the auth
+        // middleware would stamp it.
+        let router = admin_router(admin_state_for_store_with_llm(
+            &tmp,
+            &store,
+            wiki,
+            Some(Arc::new(FakeAutoImproveLlm)),
+        ))
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(ai_memory_core::ActorContext {
+                    user: Some("the-operator".into()),
+                    ..ai_memory_core::ActorContext::default()
+                });
+                next.run(req).await
+            },
+        ));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let skipped = json["skipped"].as_array().expect("skipped array");
+        assert_eq!(
+            skipped.len(),
+            1,
+            "a named root operator must not open a second pending bucket for the same page"
+        );
+        assert_eq!(skipped[0]["target_path"], "notes/new-auto-improve.md");
+    }
+
+    #[tokio::test]
+    async fn auto_improve_admin_omitted_eval_inherits_server_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "scratch", None)
+            .await
+            .unwrap();
+        let session_id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                id: session_id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        store
+            .writer
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "focus changed and durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
+            .await
+            .unwrap();
+        let mut state =
+            admin_state_for_store_with_llm(&tmp, &store, wiki, Some(Arc::new(FakeAutoImproveLlm)));
+        state.auto_improve_review_config.eval = ai_memory_consolidate::AutoImproveEvalConfig {
+            enabled: true,
+            command: String::new(),
+            timeout_secs: 1,
+            targets: vec!["notes".into()],
+            min_delta: 0.0,
+        };
+        let router = admin_router(state);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/auto-improve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "default",
+                            "project": "scratch",
+                            "session_id": session_id.to_string(),
+                            "min_observations": 1,
+                            "min_session_duration_secs": 0,
+                            "min_confidence": 0.75,
+                            "max_proposals_per_run": 5
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["rejected_candidates_count"], 1);
+        let proposals = json["proposals"].as_array().unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            store
+                .reader
+                .list_auto_improve_proposals(ws, proj, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn auto_improve_require_approval_keeps_proposals_pending() {
         let tmp = TempDir::new().unwrap();
@@ -5839,22 +10820,26 @@ mod tests {
                 project_id: proj,
                 agent_kind: AgentKind::Other,
                 cwd: None,
+                actor_user: None,
             })
             .await
             .unwrap();
         store
             .writer
-            .insert_observation(NewObservation {
-                session_id,
-                workspace_id: ws,
-                project_id: proj,
-                kind: ObservationKind::UserPrompt,
-                extension: None,
-                source_event: None,
-                title: "prompt".into(),
-                body: "durable lesson".into(),
-                importance: 5,
-            })
+            .insert_observation(Sanitized::new(
+                NewObservation {
+                    session_id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    kind: ObservationKind::UserPrompt,
+                    extension: None,
+                    source_event: None,
+                    title: "prompt".into(),
+                    body: "durable lesson".into(),
+                    importance: 5,
+                },
+                &Sanitizer::builtin(),
+            ))
             .await
             .unwrap();
         let mut state =
@@ -6378,11 +11363,13 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6393,7 +11380,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6485,11 +11473,13 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6500,7 +11490,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6585,11 +11576,13 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6600,7 +11593,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page(&router, "default", "doomed", "notes/x.md", "bye").await;
@@ -6691,11 +11685,13 @@ mod tests {
             .with_admission_chain(chain)
             .with_store_reader(store.reader.clone());
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6706,7 +11702,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
 
         post_write_page_with_actor(
@@ -6763,6 +11760,466 @@ mod tests {
         assert_eq!(json["source_purged"], true);
     }
 
+    #[tokio::test]
+    async fn move_project_guard_and_true_move_retarget_keyed_active_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "live", "notes/source.md", "source body").await;
+        let src_ws = store
+            .reader
+            .find_workspace("src".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let src_proj = store
+            .reader
+            .find_project(src_ws, "live".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, src_ws, src_proj, false);
+        active.set(WorkspaceId::new(), ProjectId::new());
+
+        let move_body = serde_json::json!({
+            "from_workspace": "src",
+            "project": "live",
+            "to_workspace": "dst",
+            "confirm": true,
+        });
+        let guarded = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&move_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(guarded.status(), StatusCode::CONFLICT);
+
+        let forced_body = serde_json::json!({
+            "from_workspace": "src",
+            "project": "live",
+            "to_workspace": "dst",
+            "confirm": true,
+            "force": true,
+        });
+        let moved = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&forced_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.status(), StatusCode::OK);
+        let dst_ws = store
+            .reader
+            .find_workspace("dst".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.get_for(&actor), Some((dst_ws, src_proj)));
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_clears_single_and_keyed_active_entries() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        let router = admin_router(state);
+
+        post_write_page(&router, "doomed-ws", "p", "notes/x.md", "bye").await;
+        let ws = store
+            .reader
+            .find_workspace("doomed-ws".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let proj = store
+            .reader
+            .find_project(ws, "p".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, ws, proj, false);
+        active.set(ws, proj);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "doomed-ws",
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(active.get().is_none());
+        assert!(active.get_for(&actor).is_none());
+        assert!(!active.contains_workspace(ws));
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_folds_projects_and_deletes_empty_source() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // Two fresh projects in the source; the destination has neither.
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+        post_write_page(&router, "src", "beta", "notes/b.md", "beta body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        // A fresh destination → each project is a lossless true-move.
+        assert!(merged.iter().all(|r| r["moved_via"] == "true-move"));
+
+        // The source workspace is gone; both projects now live under dst.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let dst_ws = store
+            .reader
+            .find_workspace("dst".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "alpha".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .reader
+                .find_project(dst_ws, "beta".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_requires_confirm() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "alpha", "notes/a.md", "alpha body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Nothing moved: the source workspace + project are untouched.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_workspace_merges_colliding_project_by_content() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let state = admin_state_for_store(&tmp, &store, wiki);
+        let router = admin_router(state);
+
+        // `shared` exists in BOTH workspaces (different page paths) → the move
+        // for that project takes the copy-purge merge path, not a true-move.
+        // `solo` exists only in the source → lossless true-move.
+        post_write_page(&router, "dst", "shared", "notes/dst.md", "dst body").await;
+        post_write_page(&router, "src", "shared", "notes/src.md", "src body").await;
+        post_write_page(&router, "src", "solo", "notes/solo.md", "solo body").await;
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/merge-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from": "src",
+                            "to": "dst",
+                            "confirm": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["source_workspace_deleted"], true);
+        let merged = json["projects_merged"].as_array().unwrap();
+        assert_eq!(merged.len(), 2);
+        let vias: std::collections::HashSet<&str> = merged
+            .iter()
+            .filter_map(|r| r["moved_via"].as_str())
+            .collect();
+        assert!(
+            vias.contains("copy-purge"),
+            "the colliding project merged by copy-purge"
+        );
+        assert!(
+            vias.contains("true-move"),
+            "the solo project was a true-move"
+        );
+
+        // Source is gone; the merged `shared` project holds BOTH pages.
+        assert!(
+            store
+                .reader
+                .find_workspace("src".to_string())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let pages = store.reader.list_pages("dst", "shared").await.unwrap();
+        let paths: std::collections::HashSet<String> = pages.into_iter().map(|p| p.path).collect();
+        assert!(paths.contains("notes/dst.md"));
+        assert!(paths.contains("notes/src.md"));
+    }
+
+    fn recording_scope_invalidator(
+        seen: Arc<std::sync::Mutex<Vec<ScopeInvalidation>>>,
+    ) -> ScopeInvalidator {
+        Arc::new(move |target| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                // Prove admin handlers await the invalidator before returning;
+                // constructing and dropping this future would not record.
+                tokio::task::yield_now().await;
+                seen.lock().unwrap().push(target);
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_awaits_workspace_cache_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.scope_invalidator = Some(recording_scope_invalidator(seen.clone()));
+        let router = admin_router(state);
+
+        post_write_page(&router, "doomed-ws", "p", "notes/x.md", "bye").await;
+        let ws = store
+            .reader
+            .find_workspace("doomed-ws".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/delete-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "workspace": "doomed-ws",
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![ScopeInvalidation::Workspace(ws)]
+        );
+    }
+
+    #[tokio::test]
+    async fn copy_purge_move_clears_keyed_active_entries_and_awaits_project_invalidation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone())
+            .unwrap()
+            .with_store_reader(store.reader.clone());
+        let active =
+            ai_memory_core::ActiveProject::with_mode(ai_memory_core::ActiveProjectMode::PerActor);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut state = admin_state_for_store(&tmp, &store, wiki);
+        state.active_project = active.clone();
+        state.scope_invalidator = Some(recording_scope_invalidator(seen.clone()));
+        let router = admin_router(state);
+
+        post_write_page(&router, "src", "merged", "notes/source.md", "source body").await;
+        post_write_page(
+            &router,
+            "dst",
+            "merged",
+            "notes/existing.md",
+            "existing body",
+        )
+        .await;
+        let src_ws = store
+            .reader
+            .find_workspace("src".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let src_proj = store
+            .reader
+            .find_project(src_ws, "merged".to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let actor = ai_memory_core::ActorKey {
+            user: Some("alice".into()),
+            session_id: Some("session-1".into()),
+        };
+        active.set_for(&actor, src_ws, src_proj, false);
+        active.set(src_ws, src_proj);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/move-project")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "from_workspace": "src",
+                            "project": "merged",
+                            "to_workspace": "dst",
+                            "confirm": true,
+                            "force": true,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(active.get().is_none());
+        assert!(active.get_for(&actor).is_none());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![ScopeInvalidation::Project(src_proj)]
+        );
+    }
+
     // ── user-management endpoints (P1.4) ──────────────────────────
 
     /// Test router that has a token pepper configured (so user-management
@@ -6776,11 +12233,13 @@ mod tests {
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -6791,7 +12250,8 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: Some(pepper),
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
         // Wrap in a middleware that stamps the AuthLevel ourselves —
         // the real auth middleware lives in ai-memory-cli, and this
@@ -6819,6 +12279,91 @@ mod tests {
         (tmp, router)
     }
 
+    /// Same AdminState as [`user_admin_test_router`], but AuthLevel comes from
+    /// the production dual-auth Bearer lookup (`authenticate_bearer` +
+    /// `api_credentials` hash), not a stub that stamps Root/User by string
+    /// compare. Configured `root_token` is AuthLevel::Root; a DB native key
+    /// authenticates as AuthLevel::User even when `users.role` is root.
+    fn user_admin_dual_auth_router(root_token: &'static str) -> (TempDir, Router) {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let pepper = ai_memory_store::TokenPepper::new("test-pepper-admin");
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(pepper.clone()),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        });
+        let auth_state = Arc::new(
+            crate::auth::AuthState::new(Some(root_token.to_string())).with_multiuser(
+                pepper,
+                store.reader.clone(),
+                store.writer.clone(),
+            ),
+        );
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::human_auth::require_dual_auth,
+        ));
+        (tmp, router)
+    }
+
+    async fn post_disable_user(
+        router: &Router,
+        root_token: &str,
+        username: &str,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/admin/users/{username}/disable"))
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn patch_user(
+        router: &Router,
+        root_token: &str,
+        username: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/admin/users/{username}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn post_create_user(
         router: &Router,
         root_token: &str,
@@ -6839,9 +12384,49 @@ mod tests {
             .unwrap()
     }
 
+    async fn post_create_human_user(
+        router: &Router,
+        root_token: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/human-users")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {root_token}"))
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn user_token_admin_status(router: &Router, token: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     fn admin_route_samples() -> Vec<(&'static str, &'static str, serde_json::Value)> {
         vec![
             ("POST", "/admin/backup", serde_json::Value::Null),
+            (
+                "POST",
+                "/admin/export-okf?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
             (
                 "POST",
                 "/admin/bootstrap",
@@ -6862,8 +12447,24 @@ mod tests {
                     "dry_run": true
                 }),
             ),
+            (
+                "POST",
+                "/admin/auto-improve/report",
+                serde_json::json!({"workspace": "default", "project": "scratch"}),
+            ),
             ("GET", "/admin/status", serde_json::Value::Null),
+            (
+                "GET",
+                "/admin/sessions/by-agent?workspace=default&project=scratch",
+                serde_json::Value::Null,
+            ),
+            (
+                "GET",
+                "/admin/activity/by-client?since_days=7",
+                serde_json::Value::Null,
+            ),
             ("GET", "/admin/audit-contamination", serde_json::Value::Null),
+            ("GET", "/admin/audit-log", serde_json::Value::Null),
             ("GET", "/admin/search?q=test", serde_json::Value::Null),
             (
                 "GET",
@@ -6954,6 +12555,16 @@ mod tests {
             ),
             (
                 "POST",
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "default", "force": true}),
+            ),
+            (
+                "POST",
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "default", "to": "renamed"}),
+            ),
+            (
+                "POST",
                 "/admin/write-page",
                 serde_json::json!({
                     "workspace": "default",
@@ -6977,6 +12588,11 @@ mod tests {
                 "/admin/users",
                 serde_json::json!({"username": "alice"}),
             ),
+            (
+                "POST",
+                "/admin/human-users",
+                serde_json::json!({"username": "human"}),
+            ),
             ("POST", "/admin/users/alice/expire", serde_json::Value::Null),
             ("POST", "/admin/users/alice/revive", serde_json::Value::Null),
             (
@@ -6984,12 +12600,25 @@ mod tests {
                 "/admin/users/alice/rotate-token",
                 serde_json::Value::Null,
             ),
+            (
+                "POST",
+                "/admin/users/alice/disable",
+                serde_json::Value::Null,
+            ),
+            ("POST", "/admin/users/alice/enable", serde_json::Value::Null),
+            ("GET", "/admin/api-credentials", serde_json::Value::Null),
         ]
     }
 
     #[tokio::test]
     async fn multiuser_admin_routes_reject_db_user_tier() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
 
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder()
@@ -7018,6 +12647,12 @@ mod tests {
     #[tokio::test]
     async fn multiuser_admin_routes_reject_anonymous() {
         let (_tmp, router) = user_admin_test_router("root-token");
+        post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
         for (method, uri, payload) in admin_route_samples() {
             let mut builder = Request::builder().method(method).uri(uri);
             let body = if payload.is_null() {
@@ -7043,6 +12678,7 @@ mod tests {
     async fn multiuser_operational_admin_routes_allow_root() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin/status")
@@ -7053,6 +12689,255 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/activity/by-client?since_days=7")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The scope does not exist in this fixture, so reaching the handler
+        // produces 404. A rejected root request would instead be 401/403.
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/sessions/by-agent?workspace=default&project=scratch")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_topology_gates_admin_without_db_users() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: store.reader.clone(),
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: true,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let level = match req
+                    .headers()
+                    .get("x-test-auth-level")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    Some("root") => ai_memory_core::AuthLevel::Root,
+                    Some("user") => ai_memory_core::AuthLevel::User,
+                    _ => ai_memory_core::AuthLevel::Anonymous,
+                };
+                req.extensions_mut().insert(level);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        for (level, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("user"), StatusCode::FORBIDDEN),
+            (Some("root"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(level) = level {
+                request = request.header("x-test-auth-level", level);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "level={level:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_mode_switches_after_first_user_without_restart() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+
+        let anonymous_before = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_before.status(), StatusCode::OK);
+
+        let create = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::OK);
+
+        for (token, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("db-user-token"), StatusCode::FORBIDDEN),
+            (Some("root-token"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/admin/status");
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "token {token:?}");
+        }
+
+        let expire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/disable")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expire.status(), StatusCode::OK);
+
+        let anonymous_after_expire = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_after_expire.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_mode_store_read_failure_fails_closed() {
+        use ai_memory_core::ActorContext;
+
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let missing_db_reader =
+            ai_memory_store::ReaderPool::new(&tmp.path().join("missing.sqlite"), 1).unwrap();
+        let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
+            writer: store.writer.clone(),
+            reader: missing_db_reader,
+            wiki,
+            llm: None,
+            auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
+            embedder: None,
+            provider_health: ProviderHealth::default(),
+            decay_params: DecayParams::default(),
+            data_dir: tmp.path().to_path_buf(),
+            db_path: store.db_path().to_path_buf(),
+            bind: "127.0.0.1:49374".to_string(),
+            home_dir: None,
+            bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_pepper: Some(ai_memory_store::TokenPepper::new("test-pepper-admin")),
+            active_project: ai_memory_core::ActiveProject::new(),
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
+        })
+        .layer(axum::middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(ai_memory_core::AuthLevel::Anonymous);
+                req.extensions_mut().insert(ActorContext::anonymous());
+                next.run(req).await
+            },
+        ));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("could not verify user configuration"));
+    }
+
+    #[tokio::test]
+    async fn multiuser_workspace_admin_routes_reach_handler_for_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for (uri, payload) in [
+            (
+                "/admin/delete-workspace",
+                serde_json::json!({"workspace": "missing", "force": true}),
+            ),
+            (
+                "/admin/rename-workspace",
+                serde_json::json!({"from": "missing", "to": "renamed"}),
+            ),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", "Bearer root-token")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} rejected root auth"
+            );
+            assert_ne!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{uri} rejected root auth"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7075,10 +12960,114 @@ mod tests {
         // Email was normalised to lowercase by NewUser::validate.
         assert_eq!(json["user"]["email"], "alice@example.com");
         assert_eq!(json["user"]["name"], "Alice Smith");
-        // Plaintext token is surfaced exactly once — 43 chars (32 bytes
-        // URL-safe-base64).
+        // Plaintext token is surfaced exactly once.
         let token = json["token"].as_str().unwrap();
         assert_eq!(token.len(), 43);
+        assert!(json["user"]["token_expired_at"].is_null());
+        assert!(json.get("temporary_password").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_human_user_is_additive_and_returns_temporary_password_once() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let resp = post_create_human_user(
+            &router,
+            "root-token",
+            serde_json::json!({
+                "username": "alice",
+                "role": "root"
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["temporary_password"].as_str().unwrap().len() >= 12);
+        assert_eq!(json["user"]["role"], "root");
+        assert!(json["user"]["must_change_password"].as_bool().unwrap());
+        assert!(json.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn deprecated_user_token_routes_drive_the_legacy_api_credential() {
+        let (_tmp, router) = user_admin_dual_auth_router("root-token");
+        let create = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "alice"}),
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::OK);
+        let body = to_bytes(create.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original = json["token"].as_str().unwrap().to_string();
+        assert_eq!(
+            user_token_admin_status(&router, &original).await,
+            StatusCode::FORBIDDEN,
+            "active legacy token must authenticate as a non-root DB user"
+        );
+
+        let expire = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/expire")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expire.status(), StatusCode::OK);
+        assert_eq!(
+            user_token_admin_status(&router, &original).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let revive = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/revive")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revive.status(), StatusCode::OK);
+        assert_eq!(
+            user_token_admin_status(&router, &original).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let rotate = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/users/alice/rotate-token")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotate.status(), StatusCode::OK);
+        let body = to_bytes(rotate.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rotated = json["token"].as_str().unwrap();
+        assert_ne!(rotated, original);
+        assert_eq!(
+            user_token_admin_status(&router, &original).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            user_token_admin_status(&router, rotated).await,
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]
@@ -7170,12 +13159,15 @@ mod tests {
         assert_eq!(users[2]["username"], "carol");
         // Tokens are NEVER surfaced by the list endpoint.
         for u in users {
-            assert!(u.get("token").is_none(), "list must not leak tokens");
+            assert!(
+                u.get("token").is_none() && u.get("temporary_password").is_none(),
+                "list must not leak secrets"
+            );
         }
     }
 
     #[tokio::test]
-    async fn expire_then_revive_round_trips() {
+    async fn disable_then_enable_round_trips() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let _ = post_create_user(
             &router,
@@ -7184,13 +13176,12 @@ mod tests {
         )
         .await;
 
-        // Expire.
         let resp = router
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/expire")
+                    .uri("/admin/users/alice/disable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -7200,14 +13191,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["user"]["token_expired_at"].is_i64());
+        assert!(json["user"]["disabled_at"].is_i64());
 
-        // Revive.
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/revive")
+                    .uri("/admin/users/alice/enable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -7217,17 +13207,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["user"]["token_expired_at"].is_null());
+        assert!(json["user"]["disabled_at"].is_null());
     }
 
     #[tokio::test]
-    async fn expire_unknown_user_returns_404() {
+    async fn disable_unknown_user_returns_404() {
         let (_tmp, router) = user_admin_test_router("root-token");
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/ghost/expire")
+                    .uri("/admin/users/ghost/disable")
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -7238,25 +13228,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_token_issues_a_distinct_token() {
+    async fn rotate_api_credential_issues_a_distinct_secret() {
         let (_tmp, router) = user_admin_test_router("root-token");
-        let create_resp = post_create_user(
+        let _ = post_create_user(
             &router,
             "root-token",
             serde_json::json!({"username": "alice"}),
         )
         .await;
+        let create_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("authorization", "Bearer root-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "alice",
+                            "label": "laptop"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
         let body = to_bytes(create_resp.into_body(), usize::MAX).await.unwrap();
-        let original_token = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let original_token = created["token"].as_str().unwrap().to_string();
+        let id = created["credential"]["id"].as_str().unwrap();
+        assert!(original_token.starts_with("aim_"));
 
         let resp = router
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users/alice/rotate-token")
+                    .uri(format!("/admin/api-credentials/{id}/rotate"))
                     .header("authorization", "Bearer root-token")
                     .body(Body::empty())
                     .unwrap(),
@@ -7267,24 +13277,25 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let new_token = json["token"].as_str().unwrap();
-        assert_eq!(new_token.len(), 43);
-        assert_ne!(new_token, original_token, "rotate must change the token");
+        assert!(new_token.starts_with("aim_"));
+        assert_ne!(new_token, original_token, "rotate must change the secret");
     }
 
     #[tokio::test]
-    async fn create_user_returns_503_when_pepper_not_configured() {
-        // Same as user_admin_test_router but with token_pepper = None,
-        // covering the "rung 1-only" backward-compat install.
+    async fn create_human_user_works_without_pepper_but_api_keys_return_503() {
+        // Humans do not need a pepper. Native API keys still do.
         use ai_memory_core::ActorContext;
         let tmp = TempDir::new().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
         let router = admin_router(AdminState {
+            ingest_metrics: std::sync::Arc::new(ai_memory_core::IngestMetrics::default()),
             writer: store.writer.clone(),
             reader: store.reader.clone(),
             wiki,
             llm: None,
             auto_improve_require_approval: false,
+            auto_improve_review_config: Default::default(),
             embedder: None,
             provider_health: ProviderHealth::default(),
             decay_params: DecayParams::default(),
@@ -7295,10 +13306,11 @@ mod tests {
             bootstrap_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_pepper: None,
             active_project: ai_memory_core::ActiveProject::new(),
-            on_project_moved: None,
+            scope_invalidator: None,
+            trusted_proxy_identity: false,
         });
-        // Inject a Root level so we're past the require_root gate;
-        // the 503 must come from require_pepper.
+        // Inject Root so the human create reaches its handler; only native
+        // API credentials require the pepper.
         let router = router.layer(axum::middleware::from_fn(
             |mut req: Request<Body>, next: axum::middleware::Next| async move {
                 req.extensions_mut().insert(ai_memory_core::AuthLevel::Root);
@@ -7307,11 +13319,12 @@ mod tests {
             },
         ));
 
-        let resp = router
+        let created = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/admin/users")
+                    .uri("/admin/human-users")
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({"username": "alice"})).unwrap(),
@@ -7320,8 +13333,235 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "alice",
+                            "label": "cli"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let _ = tmp;
+    }
+
+    #[tokio::test]
+    async fn patch_demotion_of_last_recoverable_root_returns_409() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "keeper", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["role"], "root");
+        assert_eq!(json["user"]["has_password"].as_bool(), Some(true));
+
+        let resp = patch_user(
+            &router,
+            "root-token",
+            "keeper",
+            serde_json::json!({"role": "user"}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("last recoverable root"),
+            "409 body must surface the store InvalidState mapping; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_of_last_recoverable_root_returns_409() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "keeper", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let resp = post_disable_user(&router, "root-token", "keeper").await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("last recoverable root"),
+            "409 body must surface the store InvalidState mapping; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_removals_leave_one_recoverable_root() {
+        let (_tmp, router) = user_admin_test_router("root-token");
+        for name in ["alice", "bob"] {
+            let created = post_create_user(
+                &router,
+                "root-token",
+                serde_json::json!({"username": name, "role": "root"}),
+            )
+            .await;
+            assert_eq!(created.status(), StatusCode::OK, "setup {name}");
+        }
+
+        let (demote, disable) = tokio::join!(
+            patch_user(
+                &router,
+                "root-token",
+                "alice",
+                serde_json::json!({"role": "user"}),
+            ),
+            post_disable_user(&router, "root-token", "bob"),
+        );
+        let statuses = [demote.status(), disable.status()];
+        let ok = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        assert!(
+            ok <= 1,
+            "at most one concurrent root-removal may succeed; got {statuses:?}"
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|s| *s == StatusCode::OK || *s == StatusCode::CONFLICT),
+            "root-removal must be 200 or 409; got {statuses:?}"
+        );
+
+        let listed = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let recoverable = json["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|u| {
+                u["role"] == "root"
+                    && u["disabled_at"].is_null()
+                    && u["has_password"].as_bool() == Some(true)
+            })
+            .count();
+        assert!(
+            recoverable >= 1,
+            "a recoverable root must remain after concurrent removals; got {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_api_token_for_root_role_user_cannot_manage_users() {
+        let (_tmp, router) = user_admin_dual_auth_router("root-token");
+        let created = post_create_user(
+            &router,
+            "root-token",
+            serde_json::json!({"username": "boss", "role": "root"}),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = to_bytes(created.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["user"]["role"], "root");
+
+        let issued = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api-credentials")
+                    .header("authorization", "Bearer root-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "username": "boss",
+                            "label": "legacy-user-token"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let body = to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let native_token = json["token"].as_str().unwrap();
+        assert!(native_token.starts_with("aim_"));
+
+        let as_native = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", format!("Bearer {native_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            as_native.status(),
+            StatusCode::FORBIDDEN,
+            "role=root must not elevate a looked-up native API credential"
+        );
+
+        let unknown = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer aim_not-a-stored-credential")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status(),
+            StatusCode::UNAUTHORIZED,
+            "unknown bearer must 401 through real lookup, not a User stub"
+        );
+
+        let as_root = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/users")
+                    .header("authorization", "Bearer root-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(as_root.status(), StatusCode::OK);
     }
 
     // ---------------------------------------------------------------------

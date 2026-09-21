@@ -10,8 +10,27 @@
 
 pub mod actor;
 pub mod admin;
+pub mod auth;
+pub mod human_auth;
 mod server;
 
 pub use actor::actor_from_headers;
-pub use admin::{AdminState, admin_router};
+pub use admin::{
+    AdminState, ScopeInvalidation, ScopeInvalidator, admin_router, admin_router_with_decay_breadth,
+    admin_router_with_sweep_tuning,
+};
+pub use human_auth::{
+    HumanAuthRuntime, expire_legacy_cookie_mw, internal_auth_router, public_auth_router,
+    require_dual_auth, session_auth_router,
+};
 pub use server::{AiMemoryServer, MEMORY_INSTRUCTIONS};
+
+// Integration tests compile into this crate's test harness instead of a
+// separate binary: every test binary is another link and, on macOS and
+// Windows, another first-run malware scan. They still exercise only the
+// public API; `extern crate self` lets them keep addressing it by crate name.
+#[cfg(test)]
+extern crate self as ai_memory_mcp;
+#[cfg(test)]
+#[path = "../tests/suite/mod.rs"]
+mod integration;

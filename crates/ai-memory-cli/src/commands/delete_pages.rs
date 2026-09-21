@@ -72,7 +72,7 @@ pub async fn run(config: &Config, args: DeletePagesArgs) -> Result<()> {
 
     let project = super::resolve_project_name(config, args.project.as_deref())?;
 
-    let endpoint = ServerEndpoint::from_config(config);
+    let endpoint = ServerEndpoint::from_config_resolving_auth(config).await;
     let resp: DeletePagesResponseBody = post_json(
         &endpoint,
         "/admin/delete-pages",

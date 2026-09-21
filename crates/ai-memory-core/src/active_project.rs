@@ -5,15 +5,17 @@
 //! The MCP protocol carries no working-directory context: a `memory_query`
 //! call arrives with its arguments and nothing else, so a tool handler has
 //! no way to know which project the agent is sitting in. The lifecycle hooks
-//! *do* know — every `/hook` event carries the agent's `cwd`, and the hook
+//! *do* know — lifecycle `/hook` events carry the agent's `cwd`, and the hook
 //! router resolves it to the correct per-cwd `(workspace_id, project_id)`.
 //!
 //! In HTTP mode the `/hook` ingress and the `/mcp` endpoint live in the same
 //! process, so the hook router can publish "the project the user is currently
-//! active in" to this shared pointer, and the MCP tools can read it as their
-//! default instead of falling back to the server's static `--project` (which
-//! defaults to `scratch` and made the read tools return empty memory even
-//! when the hooks were correctly populating a real project).
+//! active in" to this shared pointer when work starts or advances, and the MCP
+//! tools can read it as their default instead of falling back to the server's
+//! static `--project` (which defaults to `scratch` and made the read tools
+//! return empty memory even when the hooks were correctly populating a real
+//! project). Completion events refresh exact actor-scoped entries only; a
+//! delayed tail from an older session must not redirect a shared fallback.
 //!
 //! ## Isolation modes
 //!
@@ -61,6 +63,7 @@
 //! plain `std::sync::RwLock` is the right primitive (no async lock needed).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -75,41 +78,128 @@ pub const DEFAULT_PER_KEY_TTL: Duration = Duration::from_secs(60 * 60);
 pub const DEFAULT_MAX_ENTRIES: usize = 4096;
 
 /// Selects how the hook router and the MCP tools share the "currently active
-/// project" pointer. `Single` is the legacy behaviour and remains the default
-/// — the other modes are opt-in via the CLI's `[auto_scope]` config block.
+/// project" pointer.
+///
+/// `PerActor` is the default: it keys the pointer by whatever coordinate the
+/// caller actually has, so parallel harnesses and multiple operators stay
+/// separated without configuration. A caller carrying no coordinate at all
+/// still reads the shared slot, which is what keeps a single-harness install
+/// behaving exactly as it always has.
+///
+/// `Single` remains available for installs that want the historical
+/// process-wide slot explicitly.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActiveProjectMode {
-    /// Process-wide slot, last-write-wins. Backward-compatible default.
-    #[default]
+    /// Process-wide slot, last-write-wins. The historical behaviour, now opt-in.
     Single,
     /// Keyed by `session_id`. Isolates concurrent agent runs of the same
     /// operator from each other.
     PerSession,
-    /// Keyed by `(user, session_id)`. Isolates across operators as well,
-    /// for installs with multi-user mode enabled.
+    /// Keyed by `(user, session_id)`, with an identity-only slot alongside.
+    /// Isolates parallel harnesses and separate operators. The default.
+    #[default]
     PerActor,
 }
 
+/// Selects how the hook router attributes MID-SESSION events whose cwd has
+/// moved since the session started. Set under `[routing] mid_session`.
+///
+/// Distinct from [`ActiveProjectMode`], which namespaces the in-process
+/// "current project" pointer: this decides the DURABLE project written on
+/// observations, and it never affects session-CREATING events — opening a
+/// session always resolves from its own cwd.
+///
+/// `FollowCwd` is the default and preserves the historical behavior exactly:
+/// every mid-session event re-resolves from its own cwd, so `cd`-ing into a
+/// sibling checkout routes those observations to that checkout's project.
+///
+/// `Sticky` treats mid-session navigation as navigation: the session's project
+/// stays the source of truth wherever the agent wanders. This matches the
+/// product's own model — `sessions.project_id` holds exactly one value, and
+/// consolidation writes one page in the session's project — so following the
+/// cwd splits a session's raw record across projects while its page lands in
+/// only one. A `.ai-memory.toml` marker still wins in both modes: naming a
+/// project is a deliberate rescope, not drift (#394).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MidSessionRouting {
+    /// Re-resolve every mid-session event from its own cwd. Historical
+    /// behavior, and the default.
+    #[default]
+    #[serde(alias = "follow_cwd")]
+    FollowCwd,
+    /// Inherit the session's project for every mid-session event, overruling
+    /// a host-derived repo-root override but never a marker-declared one.
+    Sticky,
+}
+
+impl MidSessionRouting {
+    /// Whether this mode lets an established session overrule a
+    /// non-deliberate (host-derived) project override.
+    #[must_use]
+    pub const fn overrules_derived_override(self) -> bool {
+        matches!(self, Self::Sticky)
+    }
+
+    /// Stable config/log representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FollowCwd => "follow-cwd",
+            Self::Sticky => "sticky",
+        }
+    }
+}
+
 /// Composite identity used to key per-actor entries.
+/// This cache key namespaces active-project pointers only; it does not
+/// namespace durable hook `SessionId` records.
 ///
 /// - `PerSession` mode populates only `session_id`.
-/// - `PerActor` mode populates both (`user` is the username row from
-///   `users`, or the configured `root_username` for rung 1 callers).
+/// - `PerActor` mode populates both (`user` holds the qualified identity key:
+///   `user:<name>` or an issuer-qualified OIDC subject).
 ///
 /// An [`ActorKey`] with both fields `None` is treated the same as "no actor"
 /// — the request falls back to the single slot. That keeps anonymous /
 /// pre-identity callers working without a special branch at every call site.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ActorKey {
-    /// Stable username when the request was authenticated as a known user
-    /// (rung 1 root with `root_username`, or rung 2 DB user). `None` for
-    /// anonymous calls.
+    /// Qualified stable identity when the request was authenticated as a known
+    /// user. The field name is retained for API compatibility; values are
+    /// produced by `ActorContext::identity_key`, not copied from raw headers.
     pub user: Option<String>,
     /// Per-agent-run session identifier published by the lifecycle hooks
     /// (Claude Code, Codex, OpenCode, …). `None` when the call site has no
     /// session context (e.g. an ad-hoc MCP probe with no hook history).
     pub session_id: Option<String>,
+}
+
+/// Outcome of resolving the active-project pointer for one actor.
+///
+/// Distinguishes the two cases [`ActiveProject::get_for`] returns `None` for,
+/// which callers that *write* need to tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveProjectLookup {
+    /// The pointer resolved to a concrete workspace/project.
+    Resolved(WorkspaceId, ProjectId),
+    /// The actor carries a coordinate, this install's pointer is live, and
+    /// nothing matched it. Answering from the shared slot or the server default
+    /// would route the call somewhere the caller did not mean.
+    Mismatch,
+    /// No pointer information exists anywhere for this caller — an anonymous or
+    /// legacy call site, or an install with no lifecycle hooks feeding the
+    /// pointer. The configured default is the best and only answer.
+    Unset,
+}
+
+impl ActiveProjectLookup {
+    fn from_single(slot: Option<(WorkspaceId, ProjectId)>) -> Self {
+        match slot {
+            Some((workspace_id, project_id)) => Self::Resolved(workspace_id, project_id),
+            None => Self::Unset,
+        }
+    }
 }
 
 impl ActorKey {
@@ -121,9 +211,19 @@ impl ActorKey {
     }
 }
 
+/// One per-actor slot: the resolved project plus the actor's opted-in
+/// `default_global` recall preference and the insertion time (for TTL).
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    ws: WorkspaceId,
+    proj: ProjectId,
+    default_global: bool,
+    inserted: Instant,
+}
+
 #[derive(Debug)]
 struct PerActorMap {
-    entries: HashMap<ActorKey, (WorkspaceId, ProjectId, Instant)>,
+    entries: HashMap<ActorKey, Entry>,
     ttl: Duration,
     max_entries: usize,
 }
@@ -145,7 +245,7 @@ impl PerActorMap {
     /// surfaces to a tool handler and the cap below sees an accurate size.
     fn purge_expired(&mut self, now: Instant) {
         self.entries
-            .retain(|_, (_, _, inserted)| now.saturating_duration_since(*inserted) < self.ttl);
+            .retain(|_, e| now.saturating_duration_since(e.inserted) < self.ttl);
     }
 
     /// Cap the map at `max_entries`, dropping the oldest insertions first.
@@ -156,23 +256,77 @@ impl PerActorMap {
             return;
         }
         let excess = self.entries.len() - self.max_entries;
-        let mut by_age: Vec<(ActorKey, Instant)> =
-            self.entries.iter().map(|(k, v)| (k.clone(), v.2)).collect();
+        let mut by_age: Vec<(ActorKey, Instant)> = self
+            .entries
+            .iter()
+            .map(|(k, e)| (k.clone(), e.inserted))
+            .collect();
         by_age.sort_by_key(|(_, inserted)| *inserted);
         for (k, _) in by_age.into_iter().take(excess) {
             self.entries.remove(&k);
         }
     }
 
-    fn insert(&mut self, key: ActorKey, ws: WorkspaceId, proj: ProjectId, now: Instant) {
+    fn insert(
+        &mut self,
+        key: ActorKey,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        default_global: bool,
+        now: Instant,
+    ) {
         self.purge_expired(now);
-        self.entries.insert(key, (ws, proj, now));
+        self.entries.insert(
+            key,
+            Entry {
+                ws,
+                proj,
+                default_global,
+                inserted: now,
+            },
+        );
         self.enforce_cap();
     }
 
     fn get(&mut self, key: &ActorKey, now: Instant) -> Option<(WorkspaceId, ProjectId)> {
         self.purge_expired(now);
-        self.entries.get(key).map(|(ws, proj, _)| (*ws, *proj))
+        self.entries.get(key).map(|e| (e.ws, e.proj))
+    }
+
+    /// The actor's opted-in `default_global` preference, or `false` when no
+    /// live entry exists for the key.
+    fn get_default_global(&mut self, key: &ActorKey, now: Instant) -> bool {
+        self.purge_expired(now);
+        self.entries.get(key).is_some_and(|e| e.default_global)
+    }
+
+    fn retarget_project(&mut self, project_id: ProjectId, workspace_id: WorkspaceId, now: Instant) {
+        self.purge_expired(now);
+        for e in self.entries.values_mut() {
+            if e.proj == project_id {
+                e.ws = workspace_id;
+            }
+        }
+    }
+
+    fn clear_project(&mut self, project_id: ProjectId, now: Instant) {
+        self.purge_expired(now);
+        self.entries.retain(|_, e| e.proj != project_id);
+    }
+
+    fn clear_workspace(&mut self, workspace_id: WorkspaceId, now: Instant) {
+        self.purge_expired(now);
+        self.entries.retain(|_, e| e.ws != workspace_id);
+    }
+
+    fn contains_project(&mut self, project_id: ProjectId, now: Instant) -> bool {
+        self.purge_expired(now);
+        self.entries.values().any(|e| e.proj == project_id)
+    }
+
+    fn contains_workspace(&mut self, workspace_id: WorkspaceId, now: Instant) -> bool {
+        self.purge_expired(now);
+        self.entries.values().any(|e| e.ws == workspace_id)
     }
 
     /// Test-only: live row count in the backing HashMap. Counts all
@@ -194,13 +348,46 @@ impl PerActorMap {
 pub struct ActiveProject {
     mode: ActiveProjectMode,
     single: Arc<RwLock<Option<(WorkspaceId, ProjectId)>>>,
+    /// `default_global` for the single/fallback slot (Single mode or an actor
+    /// with no usable coordinate). Kept beside `single` rather than inside the
+    /// tuple so the legacy `set`/`get` API and every existing caller stay
+    /// byte-for-byte unchanged.
+    single_default_global: Arc<RwLock<bool>>,
     per_actor: Arc<RwLock<PerActorMap>>,
+    /// Whether any keyed entry has ever been published on this process.
+    ///
+    /// Distinguishes "this install has no lifecycle hooks, so nothing was ever
+    /// keyed" from "hooks are running and this key simply does not match".
+    /// The first deserves the shared fallback — there is no better information
+    /// anywhere — while the second is a mismatch that must fail closed rather
+    /// than answer for whichever project published last.
+    ///
+    /// Never reset: an install that once had hook activity is not hookless
+    /// again just because entries aged out of the TTL map.
+    ever_keyed: Arc<AtomicBool>,
+    /// A startup reconstruction of the shared slot, consulted by READS only.
+    ///
+    /// The pointer is process memory, so a restart mid-session empties it and
+    /// unscoped reads answered for the baked default scope — zero counts for a
+    /// project full of observations, through the success path (#678). `serve`
+    /// fills this slot at startup from the most recently active project on
+    /// disk so those reads degrade to real data instead.
+    ///
+    /// It is deliberately NOT the single slot. A seeded value is a
+    /// reconstruction, not an observed publish: writing it to `single` would
+    /// make [`Self::lookup_for`] answer `Resolved` for every caller until the
+    /// first hook event lands, including one whose coordinate matches nothing
+    /// — and an unscoped write would then be attributed to a project the
+    /// caller never named, possibly another operator's. That is exactly the
+    /// misfiling the `Mismatch`/`Unset` split exists to prevent, so the write
+    /// path never sees this slot.
+    seeded: Arc<RwLock<Option<(WorkspaceId, ProjectId)>>>,
 }
 
 impl Default for ActiveProject {
     fn default() -> Self {
         Self::with_config(
-            ActiveProjectMode::Single,
+            ActiveProjectMode::default(),
             DEFAULT_PER_KEY_TTL,
             DEFAULT_MAX_ENTRIES,
         )
@@ -208,7 +395,11 @@ impl Default for ActiveProject {
 }
 
 impl ActiveProject {
-    /// Create an empty `Single`-mode pointer — the legacy default.
+    /// Create an empty pointer in the shipped default mode
+    /// ([`ActiveProjectMode::PerActor`]).
+    ///
+    /// Was `Single` before v1.39. Call [`Self::with_mode`] explicitly for the
+    /// historical process-wide slot.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -228,7 +419,10 @@ impl ActiveProject {
         Self {
             mode,
             single: Arc::new(RwLock::new(None)),
+            single_default_global: Arc::new(RwLock::new(false)),
             per_actor: Arc::new(RwLock::new(PerActorMap::new(ttl, max_entries))),
+            ever_keyed: Arc::new(AtomicBool::new(false)),
+            seeded: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -237,6 +431,18 @@ impl ActiveProject {
     #[must_use]
     pub fn mode(&self) -> ActiveProjectMode {
         self.mode
+    }
+
+    /// The effective TTL of a per-key entry, after the zero-means-default
+    /// normalization the backing map applies.
+    ///
+    /// `serve` uses it as the recency bound when it seeds the single-slot
+    /// fallback from disk at startup (#678): activity older than this would
+    /// have aged out of the live pointer anyway, so it must not come back
+    /// through the restart path either.
+    #[must_use]
+    pub fn per_key_ttl(&self) -> Duration {
+        self.per_actor.read().unwrap_or_else(|e| e.into_inner()).ttl
     }
 
     /// Publish the project the agent is currently active in. Called by the
@@ -251,8 +457,15 @@ impl ActiveProject {
     /// - In `PerActor`, a user-only entry is also set when `user` is present.
     ///   Requests that carry that user but no session id can still resolve to
     ///   the user's latest project without falling through to the global slot.
-    pub fn set_for(&self, actor: &ActorKey, workspace_id: WorkspaceId, project_id: ProjectId) {
+    pub fn set_for(
+        &self,
+        actor: &ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        default_global: bool,
+    ) {
         self.write_single(workspace_id, project_id);
+        self.write_single_default_global(default_global);
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
             return;
         }
@@ -261,6 +474,7 @@ impl ActiveProject {
             return;
         }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        self.ever_keyed.store(true, Ordering::Relaxed);
         if self.mode == ActiveProjectMode::PerActor
             && actor.user.is_some()
             && actor.session_id.is_some()
@@ -272,10 +486,49 @@ impl ActiveProject {
                 },
                 workspace_id,
                 project_id,
+                default_global,
                 Instant::now(),
             );
         }
-        guard.insert(scoped, workspace_id, project_id, Instant::now());
+        guard.insert(
+            scoped,
+            workspace_id,
+            project_id,
+            default_global,
+            Instant::now(),
+        );
+    }
+
+    /// Refresh only the exact actor-scoped entry without advancing either
+    /// fallback slot.
+    ///
+    /// Hook completion events use this path so an exact `per_session` or
+    /// `per_actor` caller keeps a fresh mapping, while a delayed tail from an
+    /// older session cannot redirect the process-wide single slot or the
+    /// identity-only fallback used by a caller with no session coordinate.
+    /// `Single` mode and actors without a usable coordinate are no-ops.
+    pub fn set_scoped_for(
+        &self,
+        actor: &ActorKey,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        default_global: bool,
+    ) {
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return;
+        }
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return;
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.insert(
+            scoped,
+            workspace_id,
+            project_id,
+            default_global,
+            Instant::now(),
+        );
     }
 
     /// Read the currently active project for the given actor, if any has
@@ -289,17 +542,108 @@ impl ActiveProject {
     /// whichever project published hook activity last.
     #[must_use]
     pub fn get_for(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
+        match self.lookup_for(actor) {
+            ActiveProjectLookup::Resolved(workspace_id, project_id) => {
+                Some((workspace_id, project_id))
+            }
+            ActiveProjectLookup::Mismatch | ActiveProjectLookup::Unset => None,
+        }
+    }
+
+    /// Read-path resolution: [`Self::get_for`], plus the startup seed for a
+    /// caller the pointer holds no information about.
+    ///
+    /// Only [`ActiveProjectLookup::Unset`] consults the seed — the state a
+    /// fresh process is in before the first hook event lands, which is
+    /// precisely the restart window that made `memory_status` answer an empty
+    /// default (#678). A [`ActiveProjectLookup::Mismatch`] still resolves to
+    /// nothing: hooks are live there and this coordinate matched none of them,
+    /// so the caller's own default is the honest answer.
+    ///
+    /// Reads only. The write path stays on [`Self::lookup_for`] so an unscoped
+    /// write from an unrecognized caller keeps failing closed instead of being
+    /// attributed to a project reconstructed from someone else's history.
+    #[must_use]
+    pub fn get_for_read(&self, actor: &ActorKey) -> Option<(WorkspaceId, ProjectId)> {
+        match self.lookup_for(actor) {
+            ActiveProjectLookup::Resolved(workspace_id, project_id) => {
+                Some((workspace_id, project_id))
+            }
+            ActiveProjectLookup::Unset => self.read_seeded(),
+            ActiveProjectLookup::Mismatch => None,
+        }
+    }
+
+    /// Same resolution as [`Self::get_for`], but says *why* it failed.
+    ///
+    /// `get_for` collapses two very different outcomes into `None`, which is fine
+    /// for a read (both mean "use your configured default") and wrong for a write.
+    /// A [`ActiveProjectLookup::Mismatch`] is a caller that carries a coordinate on
+    /// an install whose pointer is live — writing it to the default silently misfiles
+    /// a real page. [`ActiveProjectLookup::Unset`] is an install with no pointer
+    /// information at all, which has always used the default and must keep doing so.
+    #[must_use]
+    pub fn lookup_for(&self, actor: &ActorKey) -> ActiveProjectLookup {
         if self.mode == ActiveProjectMode::Single || actor.is_empty() {
-            return self.read_single();
+            return ActiveProjectLookup::from_single(self.read_single());
         }
 
         let scoped = self.scoped_key(actor);
         if scoped.is_empty() {
-            return self.read_single();
+            return ActiveProjectLookup::from_single(self.read_single());
         }
 
+        let now = Instant::now();
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
-        guard.get(&scoped, Instant::now())
+        if let Some((workspace_id, project_id)) = guard.get(&scoped, now) {
+            return ActiveProjectLookup::Resolved(workspace_id, project_id);
+        }
+
+        // A keyed miss means one of two very different things.
+        //
+        // If this identity has published before — or anything on this process
+        // has — then hooks are running and this coordinate simply does not
+        // match one. That is a mismatch, and answering from the shared slot
+        // would route the request into whichever project published last,
+        // possibly another operator's. Fail closed and let the caller fall
+        // back to its configured default.
+        //
+        // If nothing has *ever* been keyed, this install has no lifecycle
+        // hooks feeding the pointer at all (MCP-only). There is no better
+        // information anywhere, and the shared slot is exactly what such an
+        // install has always used, so keep answering from it.
+        if self.mode == ActiveProjectMode::PerActor && actor.user.is_some() {
+            let identity_only = ActorKey {
+                user: actor.user.clone(),
+                session_id: None,
+            };
+            if guard.get(&identity_only, now).is_some() {
+                return ActiveProjectLookup::Mismatch;
+            }
+        }
+        drop(guard);
+        if self.ever_keyed.load(Ordering::Relaxed) {
+            return ActiveProjectLookup::Mismatch;
+        }
+        ActiveProjectLookup::from_single(self.read_single())
+    }
+
+    /// Whether the actor opted this session into `default_global` recall (via
+    /// the repo's `[recall] default_global` marker, published by the hook).
+    /// Uses the SAME slot-selection as [`Self::get_for`], so the flag tracks
+    /// the project pointer it was published alongside. Defaults to `false`
+    /// (unchanged behaviour) for any actor/slot that never opted in.
+    #[must_use]
+    pub fn default_global_for(&self, actor: &ActorKey) -> bool {
+        if self.mode == ActiveProjectMode::Single || actor.is_empty() {
+            return self.read_single_default_global();
+        }
+        let scoped = self.scoped_key(actor);
+        if scoped.is_empty() {
+            return self.read_single_default_global();
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.get_default_global(&scoped, Instant::now())
     }
 
     /// Project the actor's identity onto only the coordinates the current
@@ -328,6 +672,27 @@ impl ActiveProject {
         *guard
     }
 
+    fn read_seeded(&self) -> Option<(WorkspaceId, ProjectId)> {
+        let guard = self.seeded.read().unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
+    fn write_single_default_global(&self, value: bool) {
+        let mut guard = self
+            .single_default_global
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = value;
+    }
+
+    fn read_single_default_global(&self) -> bool {
+        let guard = self
+            .single_default_global
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
+    }
+
     /// Legacy single-slot setter — used by tests and by call sites that
     /// have no actor context yet. Touches the single slot only; the per-key
     /// map is untouched.
@@ -341,6 +706,24 @@ impl ActiveProject {
         self.read_single()
     }
 
+    /// Publish the read-side startup seed (#678). Called once by `serve`,
+    /// from the project the database says was active most recently.
+    ///
+    /// Touches neither the single slot nor the per-key map, so it cannot make
+    /// an unscoped write resolve anywhere new; see the `seeded` field for why
+    /// that separation is load-bearing. A real publish supersedes it for every
+    /// caller the moment the first hook event arrives.
+    pub fn seed_read_fallback(&self, workspace_id: WorkspaceId, project_id: ProjectId) {
+        let mut guard = self.seeded.write().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((workspace_id, project_id));
+    }
+
+    /// The startup seed, if one was published.
+    #[must_use]
+    pub fn seeded(&self) -> Option<(WorkspaceId, ProjectId)> {
+        self.read_seeded()
+    }
+
     /// Forget the active project. Called after an admin operation invalidates
     /// the published pointer (e.g. a `move-project` whose copy-purge path
     /// gives the project a NEW id, so the old pointer no longer resolves).
@@ -351,8 +734,76 @@ impl ActiveProject {
             let mut guard = self.single.write().unwrap_or_else(|e| e.into_inner());
             *guard = None;
         }
+        {
+            let mut guard = self.seeded.write().unwrap_or_else(|e| e.into_inner());
+            *guard = None;
+        }
         let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
         guard.entries.clear();
+    }
+
+    /// Retarget every active entry for `project_id` to `workspace_id`, preserving
+    /// the project id. Used after a lossless cross-workspace move where the
+    /// project row survives and only its workspace changes.
+    pub fn retarget_project_workspace(&self, project_id: ProjectId, workspace_id: WorkspaceId) {
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
+            if let Some((ws, proj)) = guard.as_mut()
+                && *proj == project_id
+            {
+                *ws = workspace_id;
+            }
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.retarget_project(project_id, workspace_id, Instant::now());
+    }
+
+    /// Clear every active entry whose project id matches `project_id`.
+    pub fn clear_project(&self, project_id: ProjectId) {
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
+            if guard.map(|(_, proj)| proj) == Some(project_id) {
+                *guard = None;
+            }
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.clear_project(project_id, Instant::now());
+    }
+
+    /// Clear every active entry whose workspace id matches `workspace_id`.
+    pub fn clear_workspace(&self, workspace_id: WorkspaceId) {
+        for slot in [&self.single, &self.seeded] {
+            let mut guard = slot.write().unwrap_or_else(|e| e.into_inner());
+            if guard.map(|(ws, _)| ws) == Some(workspace_id) {
+                *guard = None;
+            }
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.clear_workspace(workspace_id, Instant::now());
+    }
+
+    /// Whether any live active entry references `project_id`.
+    #[must_use]
+    pub fn contains_project(&self, project_id: ProjectId) -> bool {
+        if self.read_single().map(|(_, proj)| proj) == Some(project_id)
+            || self.read_seeded().map(|(_, proj)| proj) == Some(project_id)
+        {
+            return true;
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.contains_project(project_id, Instant::now())
+    }
+
+    /// Whether any live active entry references `workspace_id`.
+    #[must_use]
+    pub fn contains_workspace(&self, workspace_id: WorkspaceId) -> bool {
+        if self.read_single().map(|(ws, _)| ws) == Some(workspace_id)
+            || self.read_seeded().map(|(ws, _)| ws) == Some(workspace_id)
+        {
+            return true;
+        }
+        let mut guard = self.per_actor.write().unwrap_or_else(|e| e.into_inner());
+        guard.contains_workspace(workspace_id, Instant::now())
     }
 
     /// Test-only: look up only the per-key backing store. Used to prove
@@ -409,6 +860,227 @@ mod tests {
         }
     }
 
+    fn per_actor() -> ActiveProject {
+        ActiveProject::with_config(
+            ActiveProjectMode::PerActor,
+            DEFAULT_PER_KEY_TTL,
+            DEFAULT_MAX_ENTRIES,
+        )
+    }
+
+    fn ids(_n: u8) -> (WorkspaceId, ProjectId) {
+        (WorkspaceId::new(), ProjectId::new())
+    }
+
+    /// #678: the startup seed serves reads, and ONLY reads.
+    ///
+    /// Seeding the single slot instead would make this same lookup answer
+    /// `Resolved` for an actor that never published — `ever_keyed` is false for
+    /// the whole window between a restart and the first hook event — and
+    /// `resolve_write_args` consumes `Resolved` directly. A foreign caller's
+    /// unscoped write would then be attributed to whichever project the
+    /// database remembered, which is the misfiling #564 closed.
+    #[test]
+    fn a_seeded_fallback_serves_reads_without_placing_a_foreign_actor() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.seed_read_fallback(ws, proj);
+        let stranger = key_actor("bob", "s-bob-never-published");
+
+        assert_eq!(
+            ap.lookup_for(&stranger),
+            ActiveProjectLookup::Unset,
+            "the write path must still see no pointer for this caller"
+        );
+        assert_eq!(
+            ap.get_for(&stranger),
+            None,
+            "the seed is not a publish, so `get_for` must not report one"
+        );
+        assert_eq!(
+            ap.get_for_read(&stranger),
+            Some((ws, proj)),
+            "the read path degrades to the seed instead of an empty default"
+        );
+        assert_eq!(
+            ap.get(),
+            None,
+            "the shared publish slot stays empty until a hook fills it"
+        );
+    }
+
+    /// A keyed hit outranks the seed, and a real publish supersedes it for
+    /// every caller — the seed is only ever the answer of last resort.
+    #[test]
+    fn a_published_pointer_outranks_the_seed() {
+        let ap = per_actor();
+        let (ws, seeded_proj) = ids(1);
+        let (_, own_proj) = ids(2);
+        ap.seed_read_fallback(ws, seeded_proj);
+
+        let alice = key_actor("alice", "s-alice");
+        ap.set_for(&alice, ws, own_proj, false);
+        assert_eq!(ap.get_for_read(&alice), Some((ws, own_proj)));
+
+        // And once anything is keyed, a stranger is a mismatch again: hooks are
+        // live, so the honest answer is the caller's own default, not the seed.
+        let stranger = key_actor("bob", "s-bob");
+        assert_eq!(ap.lookup_for(&stranger), ActiveProjectLookup::Mismatch);
+        assert_eq!(ap.get_for_read(&stranger), None);
+    }
+
+    /// An admin op that invalidates the pointer must reach the seed too, or a
+    /// purged project keeps answering reads from a slot nothing can clear.
+    #[test]
+    fn invalidations_reach_the_seed() {
+        let (ws, proj) = ids(1);
+        let (other_ws, _) = ids(2);
+        let stranger = key_actor("bob", "s-bob");
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        assert!(ap.contains_project(proj));
+        assert!(ap.contains_workspace(ws));
+        ap.clear_project(proj);
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.clear_workspace(ws);
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.clear();
+        assert_eq!(ap.get_for_read(&stranger), None);
+
+        // A lossless cross-workspace move keeps the project and moves it.
+        let ap = per_actor();
+        ap.seed_read_fallback(ws, proj);
+        ap.retarget_project_workspace(proj, other_ws);
+        assert_eq!(ap.get_for_read(&stranger), Some((other_ws, proj)));
+    }
+
+    /// The scenario the default must not break: one operator, one harness, and
+    /// an MCP-only install with no lifecycle hooks feeding the pointer.
+    ///
+    /// Nothing is ever keyed, so a request carrying a session id has no keyed
+    /// entry to match. That is not a mismatch — there is no better information
+    /// anywhere — so it must keep reading the shared slot, exactly as it did
+    /// before `PerActor` became the default.
+    #[test]
+    fn a_hookless_install_still_reads_the_shared_slot() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.set(ws, proj);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "session-never-published")),
+            Some((ws, proj)),
+            "with no keyed activity anywhere, the shared slot is the only answer"
+        );
+    }
+
+    /// Once hooks *are* publishing, a session id that matches nothing is a
+    /// mismatch rather than a hookless install. Answering from the shared slot
+    /// would hand back whichever project published last — on a shared server,
+    /// somebody else's. Fail closed instead.
+    #[test]
+    fn a_session_mismatch_fails_closed_once_anything_has_been_keyed() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        ap.set_for(&key_actor("alice", "s-alice"), ws_a, proj_a, false);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "some-other-session")),
+            None,
+            "alice has published, so an unmatched session of hers is a mismatch"
+        );
+        assert_eq!(
+            ap.get_for(&key_actor("carol", "s-carol")),
+            None,
+            "and another operator must not inherit alice's pointer"
+        );
+    }
+
+    /// Scenario: one user, two harnesses open in the same project at once.
+    /// Each must keep its own pointer; neither may overwrite the other.
+    #[test]
+    fn parallel_harnesses_of_one_user_keep_separate_pointers() {
+        let ap = per_actor();
+        let (ws_1, proj_1) = ids(1);
+        let (ws_2, proj_2) = ids(2);
+
+        ap.set_for(&key_actor("alice", "harness-a"), ws_1, proj_1, false);
+        ap.set_for(&key_actor("alice", "harness-b"), ws_2, proj_2, false);
+
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "harness-a")),
+            Some((ws_1, proj_1))
+        );
+        assert_eq!(
+            ap.get_for(&key_actor("alice", "harness-b")),
+            Some((ws_2, proj_2)),
+            "the second harness must not have clobbered the first"
+        );
+    }
+
+    /// Scenario: two operators on one server. Neither may read the other's
+    /// pointer, in either direction.
+    #[test]
+    fn two_operators_never_read_each_others_pointer() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        let (ws_c, proj_c) = ids(2);
+
+        ap.set_for(&key_actor("alice", "s-a"), ws_a, proj_a, false);
+        ap.set_for(&key_actor("carol", "s-c"), ws_c, proj_c, false);
+
+        assert_eq!(ap.get_for(&key_actor("alice", "s-a")), Some((ws_a, proj_a)));
+        assert_eq!(ap.get_for(&key_actor("carol", "s-c")), Some((ws_c, proj_c)));
+    }
+
+    /// The commonest authenticated upgrade path: lifecycle hooks publish with
+    /// both a user and a session, while a *static* MCP client (no session-aware
+    /// bridge) sends only its bearer.
+    ///
+    /// That client keys to the identity-only slot, which `set_for` publishes
+    /// alongside the session slot precisely so this works. Without it, every
+    /// static MCP client on an authenticated install would fail closed after
+    /// the default changed — which would be a broken upgrade, not a safer one.
+    #[test]
+    fn a_static_mcp_client_reads_the_identity_only_slot() {
+        let ap = per_actor();
+        let (ws, proj) = ids(1);
+        ap.set_for(&key_actor("alice", "hook-session"), ws, proj, false);
+
+        let static_client = ActorKey {
+            user: Some("alice".to_string()),
+            session_id: None,
+        };
+        assert_eq!(
+            ap.get_for(&static_client),
+            Some((ws, proj)),
+            "a bearer with no session must still resolve to that user's project"
+        );
+    }
+
+    /// A caller with no coordinate at all — an anonymous probe, or a client
+    /// that cannot forward identity — still reads the shared slot. This is what
+    /// keeps the single-harness install unchanged under the new default.
+    #[test]
+    fn an_actorless_caller_still_reads_the_shared_slot_after_keying() {
+        let ap = per_actor();
+        let (ws_a, proj_a) = ids(1);
+        ap.set_for(&key_actor("alice", "s-a"), ws_a, proj_a, false);
+
+        assert_eq!(
+            ap.get_for(&empty_actor()),
+            Some((ws_a, proj_a)),
+            "an empty actor has no coordinate to mismatch on"
+        );
+    }
+
     #[test]
     fn starts_empty() {
         assert!(ActiveProject::new().get().is_none());
@@ -449,7 +1121,7 @@ mod tests {
         let alice = key_actor("alice", "sA");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&alice, ws, proj);
+        ap.set_for(&alice, ws, proj, false);
         assert_eq!(ap.get_for(&alice), Some((ws, proj)));
 
         ap.clear();
@@ -458,15 +1130,85 @@ mod tests {
     }
 
     #[test]
+    fn retarget_project_workspace_updates_single_and_keyed_entries() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let alice = key_actor("alice", "sA");
+        let bob = key_actor("bob", "sB");
+        let old_ws = WorkspaceId::new();
+        let new_ws = WorkspaceId::new();
+        let moved = ProjectId::new();
+        let other = ProjectId::new();
+
+        ap.set_for(&alice, old_ws, moved, false);
+        ap.set_for(&bob, old_ws, other, false);
+        ap.set(old_ws, moved);
+
+        ap.retarget_project_workspace(moved, new_ws);
+
+        assert_eq!(ap.get(), Some((new_ws, moved)));
+        assert_eq!(ap.get_for(&alice), Some((new_ws, moved)));
+        assert_eq!(ap.get_for(&bob), Some((old_ws, other)));
+        assert!(ap.contains_project(moved));
+        assert!(ap.contains_workspace(new_ws));
+    }
+
+    #[test]
+    fn clear_project_drops_matching_single_and_keyed_entries_only() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let alice = key_actor("alice", "sA");
+        let bob = key_actor("bob", "sB");
+        let ws = WorkspaceId::new();
+        let doomed = ProjectId::new();
+        let kept = ProjectId::new();
+
+        ap.set_for(&alice, ws, doomed, false);
+        ap.set_for(&bob, ws, kept, false);
+        ap.set(ws, doomed);
+
+        ap.clear_project(doomed);
+
+        assert!(ap.get().is_none());
+        assert!(ap.get_for(&alice).is_none());
+        assert_eq!(ap.get_for(&bob), Some((ws, kept)));
+        assert!(!ap.contains_project(doomed));
+        assert!(ap.contains_project(kept));
+    }
+
+    #[test]
+    fn clear_workspace_drops_matching_single_and_keyed_entries_only() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let alice = key_actor("alice", "sA");
+        let bob = key_actor("bob", "sB");
+        let doomed_ws = WorkspaceId::new();
+        let kept_ws = WorkspaceId::new();
+        let p1 = ProjectId::new();
+        let p2 = ProjectId::new();
+
+        ap.set_for(&alice, doomed_ws, p1, false);
+        ap.set_for(&bob, kept_ws, p2, false);
+        ap.set(doomed_ws, p1);
+
+        ap.clear_workspace(doomed_ws);
+
+        assert!(ap.get().is_none());
+        assert!(ap.get_for(&alice).is_none());
+        assert_eq!(ap.get_for(&bob), Some((kept_ws, p2)));
+        assert!(!ap.contains_workspace(doomed_ws));
+        assert!(ap.contains_workspace(kept_ws));
+    }
+
+    #[test]
     fn single_mode_ignores_actor_coordinates() {
-        let ap = ActiveProject::new();
+        // Explicit: `Single` is opt-in since v1.39, so this pins the mode
+        // rather than relying on whatever the default happens to be.
+        let ap = ActiveProject::with_mode(ActiveProjectMode::Single);
         let alice = key_actor("alice", "sA");
         let bob = key_actor("bob", "sB");
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice, ws, p_alice);
-        ap.set_for(&bob, ws, p_bob);
+        ap.set_for(&alice, ws, p_alice, false);
+        ap.set_for(&bob, ws, p_bob, false);
         // Both reads see the last write; that's the legacy contract.
         assert_eq!(ap.get_for(&alice), Some((ws, p_bob)));
         assert_eq!(ap.get_for(&bob), Some((ws, p_bob)));
@@ -481,10 +1223,52 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_a = ProjectId::new();
         let p_b = ProjectId::new();
-        ap.set_for(&sess_a, ws, p_a);
-        ap.set_for(&sess_b, ws, p_b);
+        ap.set_for(&sess_a, ws, p_a, false);
+        ap.set_for(&sess_b, ws, p_b, false);
         assert_eq!(ap.get_for(&sess_a), Some((ws, p_a)));
         assert_eq!(ap.get_for(&sess_b), Some((ws, p_b)));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_single_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerSession);
+        let ws = WorkspaceId::new();
+        let foreground = key_session("foreground");
+        let stale = key_session("stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&foreground), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&foreground));
+        assert!(!ap.default_global_for(&stale));
+    }
+
+    #[test]
+    fn scoped_refresh_does_not_advance_per_actor_identity_fallback() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let ws = WorkspaceId::new();
+        let foreground = key_actor("alice", "foreground");
+        let stale = key_actor("alice", "stale");
+        let foreground_project = ProjectId::new();
+        let stale_project = ProjectId::new();
+
+        ap.set_for(&foreground, ws, foreground_project, true);
+        ap.set_scoped_for(&stale, ws, stale_project, false);
+
+        let identity_only = ActorKey {
+            user: Some("alice".to_string()),
+            session_id: None,
+        };
+        assert_eq!(ap.get(), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&identity_only), Some((ws, foreground_project)));
+        assert_eq!(ap.get_for(&stale), Some((ws, stale_project)));
+        assert!(ap.default_global_for(&identity_only));
+        assert!(!ap.default_global_for(&stale));
     }
 
     #[test]
@@ -494,9 +1278,9 @@ mod tests {
         let p = ProjectId::new();
         let alice = key_actor("alice", "shared-session");
         let bob = key_actor("bob", "shared-session");
-        ap.set_for(&alice, ws, p);
+        ap.set_for(&alice, ws, p, false);
         let p_bob = ProjectId::new();
-        ap.set_for(&bob, ws, p_bob);
+        ap.set_for(&bob, ws, p_bob, false);
         // Same session_id, different users → still collapses to one entry
         // (intentional: per_session is the right mode for single-operator,
         // multi-cwd installs; per_actor is the mode for multi-operator).
@@ -513,9 +1297,9 @@ mod tests {
         let p1 = ProjectId::new();
         let p2 = ProjectId::new();
         let p3 = ProjectId::new();
-        ap.set_for(&alice_a, ws, p1);
-        ap.set_for(&alice_b, ws, p2);
-        ap.set_for(&bob_a, ws, p3);
+        ap.set_for(&alice_a, ws, p1, false);
+        ap.set_for(&alice_b, ws, p2, false);
+        ap.set_for(&bob_a, ws, p3, false);
         assert_eq!(ap.get_for(&alice_a), Some((ws, p1)));
         assert_eq!(ap.get_for(&alice_b), Some((ws, p2)));
         assert_eq!(ap.get_for(&bob_a), Some((ws, p3)));
@@ -529,8 +1313,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice_a, ws, p_alice);
-        ap.set_for(&bob_a, ws, p_bob);
+        ap.set_for(&alice_a, ws, p_alice, false);
+        ap.set_for(&bob_a, ws, p_bob, false);
 
         assert_eq!(
             ap.get_for(&ActorKey {
@@ -550,8 +1334,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let p_alice = ProjectId::new();
         let p_bob = ProjectId::new();
-        ap.set_for(&alice_a, ws, p_alice);
-        ap.set_for(&bob_a, ws, p_bob);
+        ap.set_for(&alice_a, ws, p_alice, false);
+        ap.set_for(&bob_a, ws, p_bob, false);
 
         assert_eq!(
             ap.get_for(&ActorKey {
@@ -585,8 +1369,41 @@ mod tests {
         let alice = key_actor("alice", "sA");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&alice, ws, proj);
+        ap.set_for(&alice, ws, proj, false);
         assert_eq!(ap.get(), Some((ws, proj)));
+    }
+
+    #[test]
+    fn default_global_round_trips_per_actor_and_defaults_false() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::PerActor);
+        let alice = key_actor("alice", "sA");
+        let bob = key_actor("bob", "sB");
+        let ws = WorkspaceId::new();
+        let (pa, pb) = (ProjectId::new(), ProjectId::new());
+
+        ap.set_for(&alice, ws, pa, true); // alice opted in
+        ap.set_for(&bob, ws, pb, false); // bob did not
+
+        assert!(ap.default_global_for(&alice), "alice opted in");
+        assert!(!ap.default_global_for(&bob), "bob did not");
+        // The project-pointer resolution is unaffected by the recall flag.
+        assert_eq!(ap.get_for(&alice), Some((ws, pa)));
+        assert_eq!(ap.get_for(&bob), Some((ws, pb)));
+        // An actor that never published defaults to false (unchanged behaviour).
+        assert!(!ap.default_global_for(&key_actor("carol", "sC")));
+    }
+
+    #[test]
+    fn default_global_single_slot_tracks_last_publish() {
+        let ap = ActiveProject::with_mode(ActiveProjectMode::Single);
+        let ws = WorkspaceId::new();
+        let proj = ProjectId::new();
+        ap.set_for(&empty_actor(), ws, proj, true);
+        assert!(ap.default_global_for(&empty_actor()));
+        // A later publish without the flag clears it — the pointer and its
+        // preference move together.
+        ap.set_for(&empty_actor(), ws, proj, false);
+        assert!(!ap.default_global_for(&empty_actor()));
     }
 
     #[test]
@@ -599,11 +1416,11 @@ mod tests {
         let k1 = key_session("s1");
         let k2 = key_session("s2");
         let k3 = key_session("s3");
-        ap.set_for(&k1, ws, p1);
+        ap.set_for(&k1, ws, p1, false);
         std::thread::sleep(Duration::from_millis(2));
-        ap.set_for(&k2, ws, p2);
+        ap.set_for(&k2, ws, p2, false);
         std::thread::sleep(Duration::from_millis(2));
-        ap.set_for(&k3, ws, p3);
+        ap.set_for(&k3, ws, p3, false);
         // Use the test-only keyed-only getter so the cap assertion targets
         // the backing map directly.
         assert!(ap.keyed_only_get(&k1).is_none(), "k1 must be evicted");
@@ -621,7 +1438,7 @@ mod tests {
         let k = key_session("s");
         let ws = WorkspaceId::new();
         let proj = ProjectId::new();
-        ap.set_for(&k, ws, proj);
+        ap.set_for(&k, ws, proj, false);
         assert_eq!(ap.get_for(&k), Some((ws, proj)));
         std::thread::sleep(Duration::from_millis(40));
         // The per-actor entry must be gone; identified callers with expired
@@ -715,7 +1532,7 @@ mod tests {
             match op {
                 Op::Set(i) => {
                     let proj = ProjectId::new();
-                    ap.set_for(&actors[i], ws, proj);
+                    ap.set_for(&actors[i], ws, proj, false);
                 }
                 Op::Get(i) => {
                     let _ = ap.get_for(&actors[i]);
@@ -790,7 +1607,7 @@ mod tests {
             for step in 0..1_000 {
                 let i = (rng.next() as usize) % pool_size;
                 let proj = ProjectId::new();
-                ap.set_for(&actors[i], ws, proj);
+                ap.set_for(&actors[i], ws, proj, false);
                 let got = ap.keyed_only_get(&actors[i]);
                 assert_eq!(
                     got,
@@ -854,7 +1671,7 @@ mod tests {
             // Pre-populate every actor; record the write time relative
             // to the run start.
             for actor in &actors {
-                ap.set_for(actor, ws, ProjectId::new());
+                ap.set_for(actor, ws, ProjectId::new(), false);
             }
 
             // Wait for TTL plus a margin so every pre-populated entry
@@ -874,7 +1691,7 @@ mod tests {
             // the map shouldn't go into an unrecoverable state.
             let i = (rng.next() as usize) % actors.len();
             let proj = ProjectId::new();
-            ap.set_for(&actors[i], ws, proj);
+            ap.set_for(&actors[i], ws, proj, false);
             assert_eq!(
                 ap.keyed_only_get(&actors[i]),
                 Some((ws, proj)),

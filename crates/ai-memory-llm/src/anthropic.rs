@@ -11,7 +11,7 @@ use tracing::debug;
 use crate::error::{LlmError, LlmResult};
 use crate::provider::LlmProvider;
 use crate::response::{provider_error_body, response_json_limited};
-use crate::types::{ChatRequest, ChatResponse, Role, Usage};
+use crate::types::{ChatRequest, ChatResponse, ExtraHeaders, ReasoningEffort, Usage};
 
 /// Default Anthropic API base.
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -45,6 +45,9 @@ pub struct AnthropicProvider {
     auth: AnthropicAuth,
     base_url: String,
     model: String,
+    timeout: Duration,
+    reasoning_effort: Option<ReasoningEffort>,
+    extra_headers: ExtraHeaders,
 }
 
 impl AnthropicProvider {
@@ -54,17 +57,15 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new(api_key: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        // 300s matches the OpenAI/openai-compat client — same reason:
-        // first request after a model swap on a local inference server
-        // (Ollama, llama-swap, vLLM) can take 30-90s of cold-load.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::ApiKey(api_key),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -78,14 +79,15 @@ impl AnthropicProvider {
     /// Returns a `reqwest::Error` if the underlying HTTP client cannot
     /// be built.
     pub fn new_oauth(token: SecretString, model: impl Into<String>) -> LlmResult<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = reqwest::Client::builder().build()?;
         Ok(Self {
             client,
             auth: AnthropicAuth::OAuth(token),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.into(),
+            timeout: Duration::from_secs(crate::DEFAULT_REQUEST_TIMEOUT_SECS),
+            reasoning_effort: None,
+            extra_headers: ExtraHeaders::default(),
         })
     }
 
@@ -93,6 +95,31 @@ impl AnthropicProvider {
     #[must_use]
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self
+    }
+
+    /// Override the per-request timeout (default
+    /// [`crate::DEFAULT_REQUEST_TIMEOUT_SECS`]).
+    #[must_use]
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout = Duration::from_secs(secs);
+        self
+    }
+
+    /// Set Claude effort / thinking. `None` omits both fields so the model
+    /// default applies. On models that accept `output_config.effort`, a
+    /// configured value is mapped onto that field; `none` disables thinking.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Attach operator-configured headers to every chat request. The factory
+    /// calls this with `ProviderConfig::extra_headers`.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.extra_headers = headers;
         self
     }
 }
@@ -110,6 +137,22 @@ struct AnthropicRequest<'a> {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<AnthropicToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: ReasoningEffort,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicThinking {
+    Adaptive,
+    Disabled,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,26 +206,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn complete(&self, request: ChatRequest) -> LlmResult<ChatResponse> {
-        let messages: Vec<AnthropicMsg<'_>> = request
-            .messages
-            .iter()
-            .map(|m| AnthropicMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: &m.content,
-            })
-            .collect();
-        let body = AnthropicRequest {
-            model: &self.model,
-            max_tokens: request.max_tokens,
-            system: request.system.as_deref(),
-            messages,
-            temperature: request.temperature,
-            tools: None,
-            tool_choice: None,
-        };
+        let body = self.build_request(&request, None);
         let response: AnthropicResponse = self.post(&body).await?;
         let text = response
             .content
@@ -208,33 +232,7 @@ impl LlmProvider for AnthropicProvider {
         request: ChatRequest,
         schema: serde_json::Value,
     ) -> LlmResult<serde_json::Value> {
-        let tool = AnthropicTool {
-            name: "result".into(),
-            description: "Emit the structured result.".into(),
-            input_schema: schema,
-        };
-        let messages: Vec<AnthropicMsg<'_>> = request
-            .messages
-            .iter()
-            .map(|m| AnthropicMsg {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: &m.content,
-            })
-            .collect();
-        let body = AnthropicRequest {
-            model: &self.model,
-            max_tokens: request.max_tokens,
-            system: request.system.as_deref(),
-            messages,
-            temperature: request.temperature,
-            tools: Some(vec![tool]),
-            tool_choice: Some(AnthropicToolChoice::Tool {
-                name: "result".into(),
-            }),
-        };
+        let body = self.build_request(&request, Some(schema));
         let response: AnthropicResponse = self.post(&body).await?;
         for c in response.content {
             if let AnthropicContent::ToolUse { input, .. } = c {
@@ -248,12 +246,65 @@ impl LlmProvider for AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// Build the `/v1/messages` body shared by `complete` and
+    /// `complete_structured_raw`. Passing a schema turns the call into the
+    /// forced-tool structured-output shape. Both paths go through here so the
+    /// temperature rule below can't apply to one and silently miss the other.
+    fn build_request<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        schema: Option<serde_json::Value>,
+    ) -> AnthropicRequest<'a> {
+        let messages: Vec<AnthropicMsg<'a>> = request
+            .messages
+            .iter()
+            .map(|m| AnthropicMsg {
+                role: m.role.as_str(),
+                content: &m.content,
+            })
+            .collect();
+        let (tools, tool_choice) = match schema {
+            Some(input_schema) => (
+                Some(vec![AnthropicTool {
+                    name: "result".into(),
+                    description: "Emit the structured result.".into(),
+                    input_schema,
+                }]),
+                Some(AnthropicToolChoice::Tool {
+                    name: "result".into(),
+                }),
+            ),
+            None => (None, None),
+        };
+        let claude = ClaudeId::parse(&self.model);
+        let temperature = request
+            .temperature
+            .filter(|_| !claude.is_some_and(ClaudeId::rejects_temperature));
+        let (output_config, thinking) = self
+            .reasoning_effort
+            .zip(claude)
+            .map(|(effort, claude)| claude.reasoning_fields(effort))
+            .unwrap_or((None, None));
+        AnthropicRequest {
+            model: &self.model,
+            max_tokens: request.max_tokens,
+            system: request.system.as_deref(),
+            messages,
+            temperature,
+            tools,
+            tool_choice,
+            output_config,
+            thinking,
+        }
+    }
+
     async fn post<B: Serialize, R: DeserializeOwned>(&self, body: &B) -> LlmResult<R> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         debug!(url, "POST anthropic");
         let mut builder = self
             .client
             .post(&url)
+            .timeout(self.timeout)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json");
         // Apply the auth headers through the same helper the tests assert on,
@@ -261,7 +312,7 @@ impl AnthropicProvider {
         for (name, value) in self.auth_headers() {
             builder = builder.header(name, value);
         }
-        let resp = builder.json(body).send().await?;
+        let resp = self.extra_headers.apply(builder).json(body).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = provider_error_body(resp).await;
@@ -289,9 +340,200 @@ impl AnthropicProvider {
     }
 }
 
+/// Modern `claude-<family>-<major>[-<minor>]` id, or dateless Mythos Preview.
+///
+/// Legacy family-last ids (`claude-3-5-sonnet-…`) and unversioned aliases
+/// (`claude-opus-latest`) stay `None` so we leave those requests alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeId {
+    Released {
+        family: ClaudeFamily,
+        major: u32,
+        minor: u32,
+    },
+    MythosPreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+    Fable,
+    Mythos,
+}
+
+impl ClaudeFamily {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+            Self::Fable => "fable",
+            Self::Mythos => "mythos",
+        }
+    }
+
+    fn effort_since(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Opus => Some((4, 5)),
+            Self::Sonnet => Some((4, 6)),
+            Self::Fable | Self::Mythos => Some((5, 0)),
+            Self::Haiku => None,
+        }
+    }
+
+    fn adaptive_since(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Opus | Self::Sonnet => Some((4, 6)),
+            Self::Fable | Self::Mythos => Some((5, 0)),
+            Self::Haiku => None,
+        }
+    }
+}
+
+impl std::str::FromStr for ClaudeFamily {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        for family in [
+            Self::Opus,
+            Self::Sonnet,
+            Self::Haiku,
+            Self::Fable,
+            Self::Mythos,
+        ] {
+            if s == family.as_str() {
+                return Ok(family);
+            }
+        }
+        Err(())
+    }
+}
+
+impl ClaudeId {
+    fn parse(model: &str) -> Option<Self> {
+        let lower = model.to_ascii_lowercase();
+        // Bedrock/Vertex wrap the same `claude-<family>-…` core in a prefix
+        // and snapshot suffix.
+        let rest = lower.split_once("claude-")?.1;
+        let mut parts = rest.split(|c: char| !c.is_ascii_alphanumeric());
+        let family = parts.next()?.parse().ok()?;
+        match parts.next()? {
+            "preview" if family == ClaudeFamily::Mythos => Some(Self::MythosPreview),
+            major => Some(Self::Released {
+                family,
+                major: version_segment(major)?,
+                minor: parts.next().and_then(version_segment).unwrap_or(0),
+            }),
+        }
+    }
+
+    fn family(self) -> ClaudeFamily {
+        match self {
+            Self::MythosPreview => ClaudeFamily::Mythos,
+            Self::Released { family, .. } => family,
+        }
+    }
+
+    fn meets(self, floor: Option<(u32, u32)>) -> bool {
+        match self {
+            Self::MythosPreview => true,
+            Self::Released { major, minor, .. } => floor.is_some_and(|min| (major, minor) >= min),
+        }
+    }
+
+    /// Claude 4.7+ and Mythos Preview 400 if we send a non-default
+    /// `temperature`. Unparsed ids keep the caller's value.
+    fn rejects_temperature(self) -> bool {
+        self.meets(Some((4, 7)))
+    }
+
+    fn supports_effort(self) -> bool {
+        self.meets(self.family().effort_since())
+    }
+
+    fn uses_adaptive_thinking(self) -> bool {
+        self.meets(self.family().adaptive_since())
+    }
+
+    /// Fable 5, Mythos 5, and Mythos Preview reject `thinking.type=disabled`.
+    fn thinking_always_on(self) -> bool {
+        match self {
+            Self::MythosPreview => true,
+            Self::Released {
+                family: ClaudeFamily::Fable | ClaudeFamily::Mythos,
+                major,
+                ..
+            } => major >= 5,
+            _ => false,
+        }
+    }
+
+    fn accepts_thinking_disabled(self) -> bool {
+        self.supports_effort() && !self.thinking_always_on()
+    }
+
+    /// Official effort availability: Opus 4.5 is `high` and below; Opus/Sonnet
+    /// 4.6 and Mythos Preview accept `max` but not `xhigh`; later models take
+    /// the full set.
+    fn clamp_output_effort(self, effort: ReasoningEffort) -> Option<ReasoningEffort> {
+        let mapped = effort.anthropic_output_effort()?;
+        Some(match (self, mapped) {
+            (
+                Self::Released {
+                    family: ClaudeFamily::Opus,
+                    major: 4,
+                    minor: 5,
+                },
+                ReasoningEffort::XHigh | ReasoningEffort::Max,
+            ) => ReasoningEffort::High,
+            (
+                Self::MythosPreview
+                | Self::Released {
+                    family: ClaudeFamily::Opus | ClaudeFamily::Sonnet,
+                    major: 4,
+                    minor: 6,
+                },
+                ReasoningEffort::XHigh,
+            ) => ReasoningEffort::Max,
+            (_, mapped) => mapped,
+        })
+    }
+
+    fn reasoning_fields(
+        self,
+        effort: ReasoningEffort,
+    ) -> (Option<AnthropicOutputConfig>, Option<AnthropicThinking>) {
+        match effort {
+            ReasoningEffort::None => (
+                None,
+                self.accepts_thinking_disabled()
+                    .then_some(AnthropicThinking::Disabled),
+            ),
+            effort if self.supports_effort() => (
+                self.clamp_output_effort(effort)
+                    .map(|effort| AnthropicOutputConfig { effort }),
+                self.uses_adaptive_thinking()
+                    .then_some(AnthropicThinking::Adaptive),
+            ),
+            _ => (None, None),
+        }
+    }
+}
+
+/// One or two digits. Longer runs are date snapshots (`…-4-20250514`).
+fn version_segment(s: &str) -> Option<u32> {
+    s.parse().ok().filter(|_| (1..=2).contains(&s.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use secrecy::SecretString;
+    use serde_json::json;
+
+    use crate::types::{ChatMessage, ReasoningEffort};
+    use rstest::rstest;
 
     use super::*;
 
@@ -352,6 +594,147 @@ mod tests {
             beta_val.contains("oauth-2025-04-20"),
             "anthropic-beta must contain oauth-2025-04-20"
         );
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            system: None,
+            messages: vec![ChatMessage::user("x")],
+            max_tokens: 256,
+            temperature: Some(0.2),
+        }
+    }
+
+    /// Serialized `/v1/messages` body for `model`, with the caller's
+    /// temperature set to 0.2 — what bootstrap / consolidation actually send.
+    fn body_for(model: &str, schema: Option<serde_json::Value>) -> serde_json::Value {
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model).unwrap();
+        let request = chat_request();
+        serde_json::to_value(provider.build_request(&request, schema)).unwrap()
+    }
+
+    #[test]
+    fn build_request_omits_temperature_for_models_that_deprecated_it() {
+        // The structured path is the one that actually broke in the field:
+        // bootstrap sends temperature 0.2 and Anthropic answers 400
+        // "`temperature` is deprecated for this model".
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "anthropic.claude-mythos-preview-v1:0",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "anthropic.claude-opus-5-v1:0",
+        ] {
+            let body = body_for(model, Some(json!({})));
+            assert!(
+                body.get("temperature").is_none(),
+                "temperature must be omitted for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_keeps_temperature_for_models_that_still_accept_it() {
+        // Determinism matters for consolidation output, so the models that
+        // still honour sampling params must keep the caller's 0.2.
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-20250514",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            let body = body_for(model, None);
+            let temp = body["temperature"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("temperature must be forwarded for {model}, got {body}"));
+            assert!((temp - 0.2).abs() < 1e-6, "{model}: got {temp}");
+        }
+    }
+
+    #[test]
+    fn build_request_keeps_the_structured_tool_shape() {
+        // The temperature rule must not disturb the forced-tool wiring the
+        // structured path depends on.
+        let body = body_for("claude-opus-5", Some(json!({"type": "object"})));
+        assert_eq!(body["tools"][0]["name"], json!("result"));
+        assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "tool", "name": "result"})
+        );
+
+        let plain = body_for("claude-opus-5", None);
+        assert!(plain.get("tools").is_none());
+        assert!(plain.get("tool_choice").is_none());
+        assert!(plain.get("output_config").is_none());
+        assert!(plain.get("thinking").is_none());
+    }
+
+    fn body_for_effort(model: &str, effort: ReasoningEffort) -> serde_json::Value {
+        let provider = AnthropicProvider::new(SecretString::from("sk-ant-test"), model)
+            .unwrap()
+            .with_reasoning_effort(Some(effort));
+        serde_json::to_value(provider.build_request(&chat_request(), None)).unwrap()
+    }
+
+    #[rstest]
+    #[case::sonnet_46_adaptive(
+        "claude-sonnet-4-6",
+        ReasoningEffort::Low,
+        Some("low"),
+        Some("adaptive")
+    )]
+    #[case::opus_5_disabled("claude-opus-5", ReasoningEffort::None, None, Some("disabled"))]
+    #[case::haiku_45_omits("claude-haiku-4-5", ReasoningEffort::Low, None, None)]
+    #[case::opus_45_effort_only("claude-opus-4-5", ReasoningEffort::High, Some("high"), None)]
+    #[case::mythos_preview_none_omits_disabled(
+        "claude-mythos-preview",
+        ReasoningEffort::None,
+        None,
+        None
+    )]
+    #[case::fable_5_none_omits_disabled("claude-fable-5", ReasoningEffort::None, None, None)]
+    #[case::sonnet_46_xhigh_clamps_max(
+        "claude-sonnet-4-6",
+        ReasoningEffort::XHigh,
+        Some("max"),
+        Some("adaptive")
+    )]
+    #[case::opus_45_max_clamps_high("claude-opus-4-5", ReasoningEffort::Max, Some("high"), None)]
+    fn maps_effort_to_native_thinking_fields(
+        #[case] model: &str,
+        #[case] effort: ReasoningEffort,
+        #[case] output_effort: Option<&str>,
+        #[case] thinking: Option<&str>,
+    ) {
+        let body = body_for_effort(model, effort);
+        match output_effort {
+            Some(expected) => assert_eq!(body["output_config"]["effort"], json!(expected)),
+            None => assert!(body.get("output_config").is_none()),
+        }
+        match thinking {
+            Some(expected) => assert_eq!(body["thinking"]["type"], json!(expected)),
+            None => assert!(body.get("thinking").is_none()),
+        }
+    }
+
+    #[test]
+    fn claude_family_parses_lowercase_labels() {
+        for family in [
+            ClaudeFamily::Opus,
+            ClaudeFamily::Sonnet,
+            ClaudeFamily::Haiku,
+            ClaudeFamily::Fable,
+            ClaudeFamily::Mythos,
+        ] {
+            assert_eq!(family.as_str().parse::<ClaudeFamily>().unwrap(), family);
+        }
+        assert!("unknown".parse::<ClaudeFamily>().is_err());
     }
 
     #[test]
